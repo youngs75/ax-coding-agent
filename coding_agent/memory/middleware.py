@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from typing import Any
 
 import structlog
@@ -12,6 +13,8 @@ from coding_agent.memory.schema import MemoryRecord
 from coding_agent.memory.store import MemoryStore
 
 log = structlog.get_logger(__name__)
+
+_TOPIC_SIMILARITY_THRESHOLD = 0.6  # below this → topic changed, re-search domain
 
 
 def _format_records(records: list[MemoryRecord]) -> str:
@@ -27,44 +30,56 @@ def _format_records(records: list[MemoryRecord]) -> str:
 class MemoryMiddleware:
     """Provides LangGraph node functions for injecting and extracting memories.
 
-    Usage in graph construction::
-
-        middleware = MemoryMiddleware(store, extractor)
-        graph.add_node("inject_memory", middleware.inject)
-        graph.add_node("extract_memory", middleware.extract_and_store)
+    Includes session-level caching:
+    - user/project memories are cached and only refreshed after extraction
+    - domain memories are re-searched only when the user topic changes
     """
 
     def __init__(self, store: MemoryStore, extractor: MemoryExtractor) -> None:
         self._store = store
         self._extractor = extractor
 
+        # Session-level caches
+        self._user_cache: list[MemoryRecord] | None = None
+        self._project_cache: dict[str, list[MemoryRecord]] = {}
+        self._domain_cache: list[MemoryRecord] = []
+        self._last_domain_query: str = ""
+        self._dirty = False  # set True after extract_and_store → invalidate caches
+
     # ── LangGraph node: inject ───────────────────────────────────────────
 
     def inject(self, state: AgentState) -> dict[str, Any]:
         """Load relevant memories and return them as an XML context block.
 
-        This function is designed to be used as a LangGraph node.  It reads
-        user and project memories from the store, searches for domain memories
-        relevant to the latest user message, and assembles them into a single
-        XML string stored under ``memory_context``.
+        Uses session-level caching to avoid redundant SQLite queries:
+        - user/project: cached until new memories are extracted
+        - domain: re-searched only when the topic similarity drops below threshold
         """
         try:
-            project_id = state.get("project_id")
+            project_id = state.get("project_id") or ""
 
-            # User-layer memories (global — not project-scoped).
-            user_memories = self._store.get_by_layer("user")
+            # Invalidate caches if new memories were extracted since last inject
+            if self._dirty:
+                self._user_cache = None
+                self._project_cache.pop(project_id, None)
+                self._dirty = False
 
-            # Project-layer memories (scoped to current project when available).
-            project_memories = self._store.get_by_layer("project", project_id=project_id)
+            # User-layer memories (global)
+            if self._user_cache is None:
+                self._user_cache = self._store.get_by_layer("user")
+            user_memories = self._user_cache
 
-            # Domain-layer: search for terms relevant to the last user message.
-            domain_memories: list[MemoryRecord] = []
+            # Project-layer memories (scoped)
+            if project_id not in self._project_cache:
+                self._project_cache[project_id] = self._store.get_by_layer(
+                    "project", project_id=project_id
+                )
+            project_memories = self._project_cache[project_id]
+
+            # Domain-layer: only re-search when topic changes
             messages = state.get("messages") or []
             last_user_text = self._last_user_text(messages)
-            if last_user_text:
-                domain_memories = self._store.search(
-                    last_user_text, layer="domain", limit=10
-                )
+            domain_memories = self._get_domain_cached(last_user_text)
 
             block = self._build_xml(user_memories, project_memories, domain_memories)
             log.info(
@@ -72,11 +87,30 @@ class MemoryMiddleware:
                 user=len(user_memories),
                 project=len(project_memories),
                 domain=len(domain_memories),
+                cache_hit=last_user_text == self._last_domain_query,
             )
             return {"memory_context": block}
         except Exception:
             log.exception("memory_middleware.inject_failed")
             return {"memory_context": ""}
+
+    def _get_domain_cached(self, query: str) -> list[MemoryRecord]:
+        """Return domain memories, re-searching only when topic changes."""
+        if not query:
+            return self._domain_cache
+
+        # Check topic similarity with the last query
+        if self._last_domain_query:
+            similarity = SequenceMatcher(
+                None, self._last_domain_query[:200], query[:200]
+            ).ratio()
+            if similarity >= _TOPIC_SIMILARITY_THRESHOLD:
+                return self._domain_cache
+
+        # Topic changed — perform a new search
+        self._domain_cache = self._store.search(query, layer="domain", limit=10)
+        self._last_domain_query = query
+        return self._domain_cache
 
     # ── LangGraph node: extract_and_store ────────────────────────────────
 
@@ -104,6 +138,8 @@ class MemoryMiddleware:
                     record.project_id = project_id
                 self._store.upsert(record)
 
+            if new_records:
+                self._dirty = True
             log.info("memory_middleware.extracted_and_stored", count=len(new_records))
             return {}
         except Exception:

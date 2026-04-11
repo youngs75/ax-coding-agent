@@ -99,12 +99,21 @@ def _strip_provider_prefix(model_name: str) -> str:
     return model_name
 
 
+# Cache model instances by (tier, temperature) to avoid recreating
+# HTTP connections for every SubAgent call.
+_model_instance_cache: dict[tuple[str, float], ChatOpenAI] = {}
+
+
 def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenAI:
     """지정된 티어의 LLM 인스턴스를 반환한다.
 
-    LangChain ChatOpenAI를 사용하여 OpenRouter/DashScope 프로바이더를 통합 지원.
-    모델 이름에서 프로바이더 접두사(openrouter/, dashscope/)는 자동 제거된다.
+    동일한 (tier, temperature) 조합은 캐시된 인스턴스를 재사용하여
+    HTTP 커넥션 재생성 오버헤드를 제거한다.
     """
+    cache_key = (tier, temperature)
+    if cache_key in _model_instance_cache:
+        return _model_instance_cache[cache_key]
+
     cfg = get_config()
     model_tier = cfg.model_tier
     raw_model_name = getattr(model_tier, tier)
@@ -112,22 +121,21 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
     # LiteLLM Proxy 모드: Docker 하니스로 LLM Gateway 경유
     # → 모든 호출이 LiteLLM을 거치며 Langfuse로 자동 트레이싱됨
     if cfg.litellm_proxy_url:
-        # LiteLLM Proxy에서는 환경변수로 지정된 모델명을 그대로 사용
-        # (예: STRONG_MODEL=dashscope/qwen3-coder-next → 그대로 전달)
-        # 접두사 제거하지 않음 — LiteLLM이 라우팅 처리
         model_name = raw_model_name
         api_key = cfg.litellm_master_key or "sk-harness-local-dev"
         base_url = cfg.litellm_proxy_url
 
         log.debug("models.get_model.litellm_proxy", tier=tier, model=model_name, proxy=base_url)
 
-        return ChatOpenAI(
+        instance = ChatOpenAI(
             model=model_name,
             api_key=api_key,
             base_url=base_url,
             temperature=temperature,
             timeout=cfg.llm_timeout,
         )
+        _model_instance_cache[cache_key] = instance
+        return instance
 
     # 직접 프로바이더 모드 (기본)
     model_name = _strip_provider_prefix(raw_model_name)
@@ -143,13 +151,15 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
 
     log.debug("models.get_model", tier=tier, model=model_name, provider=cfg.provider)
 
-    return ChatOpenAI(
+    instance = ChatOpenAI(
         model=model_name,
         api_key=api_key,
         base_url=base_url,
         temperature=temperature,
         timeout=cfg.llm_timeout,
     )
+    _model_instance_cache[cache_key] = instance
+    return instance
 
 
 def get_model_name(tier: TierName = "default") -> str:

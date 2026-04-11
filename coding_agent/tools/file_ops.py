@@ -10,11 +10,67 @@ import fnmatch
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+
+# ── Tool result cache ────────────────────────────────────────────────
+# Cache read-only tool results within a session.  Write operations
+# invalidate entries for the affected file path.
+
+class _ToolCache:
+    """Thread-safe LRU-ish cache for read-only tool results."""
+
+    def __init__(self, max_size: int = 256) -> None:
+        self._data: dict[str, str] = {}
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> str | None:
+        with self._lock:
+            val = self._data.get(key)
+            if val is not None:
+                self.hits += 1
+            else:
+                self.misses += 1
+            return val
+
+    def put(self, key: str, value: str) -> None:
+        with self._lock:
+            if len(self._data) >= self._max_size:
+                # Evict oldest quarter
+                keys = list(self._data.keys())[: self._max_size // 4]
+                for k in keys:
+                    del self._data[k]
+            self._data[key] = value
+
+    def invalidate_path(self, path: str) -> None:
+        """Remove all cache entries whose key contains *path*."""
+        resolved = str(Path(path).resolve())
+        with self._lock:
+            to_del = [k for k in self._data if resolved in k]
+            for k in to_del:
+                del self._data[k]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+_cache = _ToolCache()
+
+
+def get_tool_cache() -> _ToolCache:
+    """Return the global tool cache instance (for testing/monitoring)."""
+    return _cache
+
+
+# ── Tool implementations ────────────────────────────────────────────
 
 class ReadFileInput(BaseModel):
     path: str = Field(description="읽을 파일의 절대 또는 상대 경로")
@@ -30,13 +86,26 @@ def read_file(path: str, offset: int = 0, limit: int = 200) -> str:
         return f"Error: 파일이 존재하지 않습니다: {p}"
     if not p.is_file():
         return f"Error: 디렉토리입니다. read_file은 파일만 읽을 수 있습니다: {p}"
+
+    # Check mtime for cache validity
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0
+    cache_key = f"read:{p}:{offset}:{limit}:{mtime}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
         total = len(lines)
         selected = lines[offset : offset + limit]
         numbered = [f"{i + offset + 1:4d} | {line}" for i, line in enumerate(selected)]
         header = f"# {p} (lines {offset + 1}-{offset + len(selected)} of {total})"
-        return header + "\n" + "\n".join(numbered)
+        result = header + "\n" + "\n".join(numbered)
+        _cache.put(cache_key, result)
+        return result
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -53,6 +122,7 @@ def write_file(path: str, content: str) -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+        _cache.invalidate_path(str(p))
         return f"파일 작성 완료: {p} ({len(content)} bytes)"
     except Exception as e:
         return f"Error writing file: {e}"
@@ -79,6 +149,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
             return f"Error: old_string이 {count}번 발견되었습니다. 더 구체적인 문자열을 사용하세요."
         new_text = text.replace(old_string, new_string, 1)
         p.write_text(new_text, encoding="utf-8")
+        _cache.invalidate_path(str(p))
         return f"편집 완료: {p}"
     except Exception as e:
         return f"Error editing file: {e}"
@@ -95,12 +166,20 @@ def glob_files(pattern: str, path: str = ".") -> str:
     base = Path(path).resolve()
     if not base.exists():
         return f"Error: 디렉토리가 존재하지 않습니다: {base}"
+
+    cache_key = f"glob:{base}:{pattern}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         matches = sorted(base.glob(pattern))[:100]  # 최대 100개
         if not matches:
             return f"패턴 '{pattern}'에 일치하는 파일이 없습니다."
-        result = [str(m.relative_to(base)) for m in matches if m.is_file()]
-        return f"# {len(result)} files found\n" + "\n".join(result)
+        result_lines = [str(m.relative_to(base)) for m in matches if m.is_file()]
+        result = f"# {len(result_lines)} files found\n" + "\n".join(result_lines)
+        _cache.put(cache_key, result)
+        return result
     except Exception as e:
         return f"Error: {e}"
 
@@ -117,6 +196,11 @@ def grep(pattern: str, path: str = ".", include: str = "") -> str:
     base = Path(path).resolve()
     if not base.exists():
         return f"Error: 경로가 존재하지 않습니다: {base}"
+
+    cache_key = f"grep:{base}:{pattern}:{include}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     results: list[str] = []
     max_results = 50
@@ -147,8 +231,12 @@ def grep(pattern: str, path: str = ".", include: str = "") -> str:
                 break
 
     if not results:
-        return f"패턴 '{pattern}'에 일치하는 결과가 없습니다."
-    return f"# {len(results)} matches\n" + "\n".join(results)
+        output = f"패턴 '{pattern}'에 일치하는 결과가 없습니다."
+    else:
+        output = f"# {len(results)} matches\n" + "\n".join(results)
+
+    _cache.put(cache_key, output)
+    return output
 
 
 # 전체 도구 목록

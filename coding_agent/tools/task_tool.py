@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING
 
 from langchain_core.tools import StructuredTool
@@ -28,27 +29,67 @@ class TaskToolInput(BaseModel):
     )
 
 
+class ParallelTasksInput(BaseModel):
+    """Input schema for the ``parallel_tasks`` tool."""
+
+    tasks: str = Field(
+        description=(
+            'JSON array of task objects. Each object must have "description" (str) '
+            'and optionally "agent_type" (str). '
+            'Example: [{"description": "Create models.py", "agent_type": "coder"}, '
+            '{"description": "Create views.py", "agent_type": "coder"}]'
+        ),
+    )
+
+
+import concurrent.futures
+
+# Reuse a single thread pool across all task tool invocations to avoid
+# the overhead of creating a new thread + event loop for every SubAgent call.
+_shared_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync context, handling running loop."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        future = _shared_pool.submit(asyncio.run, coro)
+        return future.result(timeout=600)
+    else:
+        return asyncio.run(coro)
+
+
 def build_task_tool(manager: SubAgentManager) -> StructuredTool:
     """Build a task delegation tool that captures manager via closure."""
+    import time as _time
+    import structlog as _structlog
+    _log = _structlog.get_logger("task_tool")
 
     def _run_task(description: str, agent_type: str = "auto") -> str:
         """Spawn a SubAgent to handle the described task and return its output."""
         try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+            t0 = _time.monotonic()
+            _log.info(
+                "timing.task_tool.start",
+                agent_type=agent_type,
+                desc=description[:80],
+            )
 
-            if loop is not None and loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(
-                        asyncio.run,
-                        manager.spawn(description, agent_type=agent_type),
-                    )
-                    result = future.result(timeout=300)
-            else:
-                result = asyncio.run(manager.spawn(description, agent_type=agent_type))
+            result = _run_async(manager.spawn(description, agent_type=agent_type))
+            elapsed = _time.monotonic() - t0
+
+            _log.info(
+                "timing.task_tool.done",
+                success=result.success,
+                duration_s=round(result.duration_s, 1),
+                roundtrip_s=round(elapsed, 1),
+                overhead_s=round(elapsed - result.duration_s, 1),
+                files=len(result.written_files),
+            )
 
             if result.success:
                 parts = [result.output]
@@ -71,4 +112,67 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
             "with its own tool access and reasoning loop."
         ),
         args_schema=TaskToolInput,
+    )
+
+
+def build_parallel_tasks_tool(manager: SubAgentManager) -> StructuredTool:
+    """Build a parallel task delegation tool that runs multiple SubAgents concurrently."""
+
+    def _run_parallel_tasks(tasks: str) -> str:
+        """Spawn multiple SubAgents in parallel and return combined results."""
+        try:
+            task_list = json.loads(tasks)
+            if not isinstance(task_list, list) or len(task_list) == 0:
+                return "Error: tasks must be a non-empty JSON array."
+            if len(task_list) == 1:
+                # Single task — just use normal spawn
+                t = task_list[0]
+                return _run_async(
+                    manager.spawn(t["description"], agent_type=t.get("agent_type", "auto"))
+                ).__str__()
+
+            results = _run_async(manager.spawn_parallel(task_list))
+
+            parts: list[str] = []
+            total_duration = 0.0
+            all_files: list[str] = []
+            failures = 0
+            for i, r in enumerate(results):
+                header = f"## Task {i + 1}: {task_list[i]['description'][:60]}"
+                if r.success:
+                    parts.append(f"{header}\nStatus: SUCCESS ({r.duration_s:.1f}s)")
+                    if r.written_files:
+                        all_files.extend(r.written_files)
+                        parts.append(f"Files: {', '.join(r.written_files)}")
+                    parts.append(r.output)
+                else:
+                    failures += 1
+                    parts.append(f"{header}\nStatus: FAILED — {r.error}")
+                total_duration = max(total_duration, r.duration_s)
+
+            summary = (
+                f"\n---\nParallel execution: {len(results)} tasks, "
+                f"{len(results) - failures} succeeded, {failures} failed, "
+                f"wall time {total_duration:.1f}s"
+            )
+            if all_files:
+                summary += f"\nAll files written: {', '.join(all_files)}"
+            parts.append(summary)
+            return "\n\n".join(parts)
+
+        except json.JSONDecodeError as e:
+            return f"Error: invalid JSON in tasks parameter — {e}"
+        except Exception as exc:
+            return f"Error running parallel tasks: {exc}"
+
+    return StructuredTool.from_function(
+        func=_run_parallel_tasks,
+        name="parallel_tasks",
+        description=(
+            "Run multiple independent SubAgent tasks in parallel. "
+            "Use this when you have several tasks that don't depend on each other "
+            "(e.g., creating separate files). Much faster than sequential task calls. "
+            "Tasks that modify the same file should NOT be parallelized."
+        ),
+        args_schema=ParallelTasksInput,
     )

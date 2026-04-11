@@ -199,11 +199,17 @@ class SubAgentManager:
 
     async def _run_agent(self, instance: SubAgentInstance) -> SubAgentResult:
         """Build and invoke the LangGraph for a single attempt."""
+        t_total = time.monotonic()
+
+        t0 = time.monotonic()
         system_prompt = self._factory.build_system_prompt(instance)
         tools = _resolve_tools(instance.tools)
         model = get_model(instance.model_tier, temperature=0.0)  # type: ignore[arg-type]
+        setup_elapsed = time.monotonic() - t0
 
+        t0 = time.monotonic()
         graph = self._build_subagent_graph(instance, system_prompt, tools, model)
+        graph_elapsed = time.monotonic() - t0
 
         initial_state: dict[str, Any] = {
             "messages": [
@@ -212,12 +218,39 @@ class SubAgentManager:
             ],
         }
 
+        log.info(
+            "timing.subagent.setup",
+            agent_id=instance.agent_id,
+            role=instance.role,
+            model_tier=instance.model_tier,
+            tools=instance.tools,
+            setup_s=round(setup_elapsed, 3),
+            graph_build_s=round(graph_elapsed, 3),
+        )
+
         try:
+            t0 = time.monotonic()
             final_state = await graph.ainvoke(
                 initial_state,
                 config={"recursion_limit": 500},
             )
+            invoke_elapsed = time.monotonic() - t0
+
+            log.info(
+                "timing.subagent.invoke",
+                agent_id=instance.agent_id,
+                role=instance.role,
+                invoke_s=round(invoke_elapsed, 3),
+                total_s=round(time.monotonic() - t_total, 3),
+                msg_count=len(final_state.get("messages", [])),
+            )
         except Exception as exc:
+            log.error(
+                "timing.subagent.invoke_error",
+                agent_id=instance.agent_id,
+                elapsed_s=round(time.monotonic() - t_total, 3),
+                error=str(exc)[:200],
+            )
             return SubAgentResult(success=False, output="", error=str(exc))
 
         # Extract the final assistant message
@@ -256,9 +289,13 @@ class SubAgentManager:
     ):
         """Build a simple ReAct-style LangGraph for a SubAgent.
 
-        Flow: agent (LLM call) <-> tools, with a recursion limit.
+        Flow: agent (LLM call) <-> tools, with early termination detection.
         """
         model_with_tools = model.bind_tools(tools) if tools else model
+
+        # Track recent tool calls for repetition detection
+        _recent_calls: list[tuple[str, str]] = []
+        _MAX_REPEAT = 3  # stop after 3 identical consecutive calls
 
         def agent_node(state: dict[str, Any]) -> dict[str, Any]:
             """Call the LLM with the current message history."""
@@ -267,12 +304,32 @@ class SubAgentManager:
             return {"messages": [response]}
 
         def should_continue(state: dict[str, Any]) -> str:
-            """Decide whether to call tools or finish."""
+            """Decide whether to call tools or finish, with early termination."""
             messages = state["messages"]
             last = messages[-1]
-            if hasattr(last, "tool_calls") and last.tool_calls:
-                return "tools"
-            return END
+            if not (hasattr(last, "tool_calls") and last.tool_calls):
+                return END
+
+            # Detect repeated identical tool calls → likely stuck
+            for tc in last.tool_calls:
+                call_sig = (tc.get("name", ""), str(tc.get("args", {})))
+                _recent_calls.append(call_sig)
+
+            # Keep only the last _MAX_REPEAT * 2 entries
+            while len(_recent_calls) > _MAX_REPEAT * 2:
+                _recent_calls.pop(0)
+
+            if len(_recent_calls) >= _MAX_REPEAT:
+                tail = _recent_calls[-_MAX_REPEAT:]
+                if all(c == tail[0] for c in tail):
+                    log.warning(
+                        "subagent.early_stop.repeated_calls",
+                        agent_id=instance.agent_id,
+                        call=tail[0][0],
+                    )
+                    return END
+
+            return "tools"
 
         # Build the graph
         builder = StateGraph(AgentState)
@@ -288,9 +345,40 @@ class SubAgentManager:
 
         builder.set_entry_point("agent")
 
-        return builder.compile(
-            # recursion_limit controls max number of supersteps
-        )
+        return builder.compile()
+
+    # ── Parallel spawn ───────────────────────────────────────
+
+    async def spawn_parallel(
+        self,
+        tasks: list[dict[str, str]],
+    ) -> list[SubAgentResult]:
+        """Spawn multiple independent SubAgents concurrently.
+
+        Each item in *tasks* should have 'description' and optionally 'agent_type'.
+        Returns results in the same order as input tasks.
+        """
+        coros = [
+            self.spawn(
+                task_description=t["description"],
+                agent_type=t.get("agent_type", "auto"),
+            )
+            for t in tasks
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        final: list[SubAgentResult] = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                log.error(
+                    "subagent.parallel.task_error",
+                    task_index=i,
+                    error=str(r),
+                )
+                final.append(SubAgentResult(success=False, output="", error=str(r)))
+            else:
+                final.append(r)
+        return final
 
     # ── Cancel ────────────────────────────────────────────────
 

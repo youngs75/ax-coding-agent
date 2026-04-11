@@ -72,6 +72,11 @@ def setup_logging(workspace: str | None = None) -> Path | None:
         root_logger.addHandler(file_handler)
 
     # ── structlog 설정 ──
+    # structlog의 필터 레벨:
+    #   - 파일이 있으면 DEBUG (모든 timing/info 로그를 파일에 기록)
+    #   - 파일이 없으면 콘솔 모드에 따라 결정
+    structlog_level = logging.DEBUG if log_file else (logging.DEBUG if debug_mode else logging.WARNING)
+
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -83,9 +88,7 @@ def setup_logging(workspace: str | None = None) -> Path | None:
                 key_order=["event", "timestamp", "level"],
             ),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.DEBUG if debug_mode else logging.WARNING
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(structlog_level),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(
             file=open(str(log_file), "a", encoding="utf-8", buffering=1) if log_file else sys.stderr

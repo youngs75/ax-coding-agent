@@ -28,7 +28,7 @@ class _RoleTemplate:
 
 _PLANNER_PROMPT = """\
 You are a planning agent. Your job is to analyze the task, explore the codebase,
-and produce a clear, actionable plan with numbered steps.
+and produce clear, actionable plans and documents.
 
 Task: {task_summary}
 
@@ -36,7 +36,8 @@ Guidelines:
 - Read relevant files to understand the current architecture.
 - Identify affected modules, interfaces, and tests.
 - Output a numbered step-by-step plan. Be specific about file paths and changes.
-- Do NOT write code — only plan.
+- Use write_file to save planning documents (PRD, SPEC, etc.) to the requested path.
+- Do NOT write application code — only plans and specification documents.
 """
 
 _CODER_PROMPT = """\
@@ -91,7 +92,7 @@ Guidelines:
 ROLE_TEMPLATES: dict[str, _RoleTemplate] = {
     "planner": _RoleTemplate(
         system_prompt_template=_PLANNER_PROMPT,
-        default_tools=["read_file", "glob_files", "grep"],
+        default_tools=["read_file", "write_file", "glob_files", "grep"],
         model_tier="reasoning",
     ),
     "coder": _RoleTemplate(
@@ -185,8 +186,54 @@ class SubAgentFactory:
 
     # ── Internal helpers ──────────────────────────────────────
 
+    # Keyword-based fast classification — avoids an LLM round-trip for
+    # the vast majority of tasks.  Only falls through to LLM if no
+    # keywords match.
+    _ROLE_KEYWORDS: dict[str, list[str]] = {
+        "planner": [
+            "설계", "계획", "분석", "아키텍처", "PRD", "SPEC", "요구사항",
+            "plan", "design", "architect", "analyze", "requirement",
+        ],
+        "coder": [
+            "구현", "작성", "생성", "코드", "코딩", "만들", "설치",
+            "implement", "create", "write", "code", "build", "install", "setup",
+        ],
+        "reviewer": [
+            "리뷰", "검토", "검증", "확인", "review", "audit", "check", "verify",
+        ],
+        "fixer": [
+            "수정", "fix", "bug", "오류", "에러", "디버그", "debug", "repair", "실패",
+        ],
+        "researcher": [
+            "조사", "탐색", "찾", "search", "research", "find", "explore",
+        ],
+    }
+
     def _analyze_task(self, task_description: str) -> str:
-        """Use a fast-tier LLM to classify *task_description* into a role name."""
+        """Classify task into a role — keyword match first, LLM only as fallback."""
+        import time as _time
+        t0 = _time.monotonic()
+        desc_lower = task_description.lower()
+
+        # Fast path: keyword matching (0ms, no API call)
+        scores: dict[str, int] = {}
+        for role, keywords in self._ROLE_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw in desc_lower)
+            if score > 0:
+                scores[role] = score
+
+        if scores:
+            role = max(scores, key=scores.get)  # type: ignore[arg-type]
+            log.info(
+                "timing.classify_fast",
+                task=task_description[:80],
+                role=role,
+                score=scores[role],
+                elapsed_s=round(_time.monotonic() - t0, 4),
+            )
+            return role
+
+        # Slow path: LLM classification (only when keywords don't match)
         try:
             fast_llm = get_model("fast", temperature=0.0)
             prompt = _CLASSIFY_PROMPT.format(task_description=task_description)
@@ -201,7 +248,12 @@ class SubAgentFactory:
                 )
                 role = "coder"
 
-            log.info("subagent.factory.classified", task=task_description[:80], role=role)
+            log.info(
+                "timing.classify_llm",
+                task=task_description[:80],
+                role=role,
+                elapsed_s=round(_time.monotonic() - t0, 3),
+            )
             return role
         except Exception as exc:
             log.error("subagent.factory.classify_error", error=str(exc), fallback="coder")

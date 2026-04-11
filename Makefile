@@ -1,5 +1,5 @@
-.PHONY: setup install test test-memory test-subagents test-resilience lint demo clean \
-       docker-build docker-run docker-up docker-down docker-logs
+.PHONY: setup install test test-memory test-subagents test-resilience test-performance \
+       lint demo clean docker-build docker-run docker-up docker-down docker-logs
 
 # ── 로컬 개발 ──
 
@@ -21,6 +21,9 @@ test-subagents:
 test-resilience:
 	python -m pytest tests/test_resilience.py -v
 
+test-performance:
+	python -m pytest tests/test_performance.py -v
+
 lint:
 	ruff check coding_agent/ tests/
 	ruff format --check coding_agent/ tests/
@@ -37,28 +40,34 @@ clean:
 docker-build:
 	docker build -t ax-coding-agent .
 
-docker-run:
-	@echo "Usage: make docker-run WORKSPACE=/path/to/project"
-	docker run -it --rm \
-		-v $${WORKSPACE:-$$(pwd)}:/workspace \
-		--env-file .env \
-		ax-coding-agent
-
 docker-up:
-	docker compose up -d
+	docker compose up -d litellm-db litellm
 	@echo ""
 	@echo "=== AX Coding Agent Stack ==="
-	@echo "LiteLLM Proxy: http://localhost:4000"
+	@echo "LiteLLM Proxy: http://localhost:4001"
 	@echo "Langfuse:      https://cloud.langfuse.com"
 	@echo ""
-	@echo "에이전트 실행:"
-	@echo "  docker compose run --rm agent"
+	@echo "헬스 체크 (약 30-60초 후):"
+	@echo "  curl http://localhost:4001/health/liveliness"
 	@echo ""
-	@echo "특정 프로젝트에서 작업:"
-	@echo "  WORKSPACE_DIR=/path/to/project docker compose run --rm agent"
+	@echo "에이전트 실행:"
+	@echo "  ./ax-agent.sh [workspace_path]"
+
+docker-run:
+	@echo "Usage: ./ax-agent.sh [workspace_path]"
+	./ax-agent.sh
 
 docker-down:
 	docker compose down
 
 docker-logs:
 	docker compose logs -f litellm
+
+# ── Langfuse 트레이스 ──
+
+traces:
+	python -m coding_agent.utils.langfuse_trace_exporter --list-traces 10
+
+trace:
+	@echo "Usage: make trace ID=<trace-id>"
+	python -m coding_agent.utils.langfuse_trace_exporter --trace $(ID) -v

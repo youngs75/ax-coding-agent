@@ -2,34 +2,78 @@
 # AX Coding Agent — 풀스택 Docker Compose
 #
 # 구성:
-#   1. ax-agent     : AI Coding Agent (대화형 CLI)
+#   1. litellm-db   : PostgreSQL (LiteLLM 내부 DB)
 #   2. litellm      : LLM Gateway (모델 라우팅 + Langfuse 트레이싱)
+#   3. agent        : AI Coding Agent (대화형 CLI)
 #
 # 사용법:
-#   # 풀스택 기동 (에이전트 + LLM Gateway)
-#   docker compose run --rm agent
-#
-#   # LLM Gateway만 기동 (로컬 에이전트에서 접속)
+#   # LLM Gateway 기동
 #   docker compose up -d litellm
 #
-#   # 특정 프로젝트 디렉토리에서 작업
-#   docker compose run --rm -v /path/to/project:/workspace agent
+#   # 에이전트 실행 (풀스택)
+#   docker compose run --rm agent
 #
 #   # 종료
 #   docker compose down
 # ═══════════════════════════════════════════════════════════════
 
 services:
+  # ── PostgreSQL (LiteLLM 내부 DB) ──
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: ax-litellm-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=litellm
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=litellm
+    volumes:
+      - litellm_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - agent-net
+
+  # ── LLM Gateway (LiteLLM Proxy + DB + Langfuse) ──
+  litellm:
+    image: ghcr.io/berriai/litellm-database:main-latest
+    container_name: ax-litellm-proxy
+    restart: unless-stopped
+    ports:
+      - "4001:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    env_file:
+      - .env
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-harness-local-dev}
+      - DATABASE_URL=postgresql://litellm:litellm@litellm-db:5432/litellm
+      - LANGFUSE_HOST=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
+    command: ["--config", "/app/config.yaml"]
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as r; r.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - agent-net
+
   # ── AI Coding Agent ──
   agent:
     build: .
     container_name: ax-coding-agent
-    stdin_open: true     # 대화형 CLI용
+    stdin_open: true
     tty: true
     volumes:
-      # 작업 디렉토리 마운트 — 에이전트가 여기에 코드를 생성
       - ${WORKSPACE_DIR:-.}:/workspace
-      # 메모리 영속화 — 컨테이너 재시작해도 메모리 유지
       - agent-memory:/app/memory_store
     environment:
       - LLM_PROVIDER=litellm
@@ -37,45 +81,21 @@ services:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-harness-local-dev}
       - MEMORY_DB_PATH=/app/memory_store/memory.db
       - MAX_ITERATIONS=${MAX_ITERATIONS:-50}
-      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-120}
+      # 모델 설정은 .env에서 주입
+      - REASONING_MODEL=${REASONING_MODEL}
+      - STRONG_MODEL=${STRONG_MODEL}
+      - DEFAULT_MODEL=${DEFAULT_MODEL}
+      - FAST_MODEL=${FAST_MODEL}
     depends_on:
       litellm:
         condition: service_healthy
     networks:
       - agent-net
 
-  # ── LLM Gateway (LiteLLM Proxy) ──
-  litellm:
-    image: ghcr.io/berriai/litellm:main-latest
-    container_name: ax-litellm-proxy
-    ports:
-      - "4000:4000"
-    volumes:
-      - ./litellm_config.yaml:/app/config.yaml
-    environment:
-      # LiteLLM
-      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-harness-local-dev}
-
-      # 프로바이더 API 키
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-
-      # Langfuse 관측성 (자동 트레이싱)
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
-      - LANGFUSE_HOST=${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
-      - LITELLM_CALLBACKS=langfuse
-    command: ["--config", "/app/config.yaml", "--port", "4000"]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    networks:
-      - agent-net
-
 volumes:
+  litellm_db_data:
+    name: ax-litellm-db-data
   agent-memory:
     name: ax-agent-memory
 

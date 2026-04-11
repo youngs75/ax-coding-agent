@@ -14,6 +14,8 @@ DeepAgents의 middleware 패턴 + Claude Code의 compaction + Codex의 상태 �
 from __future__ import annotations
 
 import asyncio
+import time
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -47,7 +49,7 @@ from coding_agent.subagents import (
 )
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
-from coding_agent.tools.task_tool import build_task_tool
+from coding_agent.tools.task_tool import build_task_tool, build_parallel_tasks_tool
 
 log = structlog.get_logger(__name__)
 
@@ -134,6 +136,9 @@ class AgentLoop:
 
         # 도구
         task_tool = build_task_tool(self._manager)
+        # parallel_tool은 구현은 유지하되, Orchestrator가 의존성을 정확히
+        # 판단하기 어려운 현재 단계에서는 비활성화.  의존성 분석이 추가되면 재활성화.
+        # parallel_tool = build_parallel_tasks_tool(self._manager)
         self._tools = FILE_TOOLS + SHELL_TOOLS + [task_tool]
 
         # 그래프
@@ -165,7 +170,19 @@ class AgentLoop:
         # ── 노드 정의 ──
 
         def inject_memory(state: AgentState) -> dict[str, Any]:
-            """메모리 주입 노드."""
+            """메모리 주입 + 사용자 입력에서 메모리 추출 노드.
+
+            메모리 추출은 사용자 입력이 있는 이 시점에서만 수행한다.
+            루프 중간(도구 실행 후)에는 추출하지 않는다 — 거기에는
+            사용자 정보가 아닌 에이전트의 자체 결정만 있기 때문이다.
+            """
+            t0 = time.monotonic()
+
+            # 1) 사용자 입력에서 메모리 추출 (첫 진입 시에만)
+            if "iteration" not in state or state.get("iteration") is None:
+                self._memory_mw.extract_and_store(state)
+
+            # 2) 메모리 주입
             result = self._memory_mw.inject(state)
             updates: dict[str, Any] = {
                 "memory_context": result.get("memory_context", ""),
@@ -175,6 +192,7 @@ class AgentLoop:
                 updates["max_iterations"] = get_config().max_iterations
                 updates["current_tier"] = "strong"
                 updates["stall_count"] = 0
+            log.debug("timing.inject_memory", elapsed_s=round(time.monotonic() - t0, 3))
             return updates
 
         def agent_node(state: AgentState) -> dict[str, Any]:
@@ -186,7 +204,9 @@ class AgentLoop:
                텍스트 응답에서 tool_call JSON 블록 파싱
             3. 메시지 전처리: 고아 tool_call 정리, DashScope 직렬화 보장
             """
+            t0 = time.monotonic()
             tier = state.get("current_tier", "strong")
+            iteration = (state.get("iteration") or 0) + 1
             model, use_prompt_tools = get_bound_model(tier)
 
             messages = list(state.get("messages", []))
@@ -206,10 +226,13 @@ class AgentLoop:
                 messages[0] = SystemMessage(content=sys_prompt)
 
             # 메시지 전처리 (고아 정리, 직렬화 보장)
+            t_prep = time.monotonic()
             messages = prepare_messages_for_llm(messages)
+            prep_elapsed = time.monotonic() - t_prep
 
             try:
                 model_name = get_model_name(tier)
+                t_llm = time.monotonic()
                 response = invoke_with_tool_fallback(
                     model=model,
                     messages=messages,
@@ -217,25 +240,50 @@ class AgentLoop:
                     model_name=model_name,
                     use_prompt_tools=use_prompt_tools,
                 )
+                llm_elapsed = time.monotonic() - t_llm
+
+                # tool call 요약
+                tool_names = []
+                if hasattr(response, "tool_calls") and response.tool_calls:
+                    tool_names = [tc.get("name", "?") for tc in response.tool_calls]
+
+                log.info(
+                    "timing.agent_node",
+                    iteration=iteration,
+                    tier=tier,
+                    prep_s=round(prep_elapsed, 3),
+                    llm_s=round(llm_elapsed, 3),
+                    total_s=round(time.monotonic() - t0, 3),
+                    msg_count=len(messages),
+                    tool_calls=tool_names or None,
+                )
 
                 return {
                     "messages": [response],
-                    "iteration": (state.get("iteration") or 0) + 1,
+                    "iteration": iteration,
                 }
             except Exception as e:
-                log.error("agent_node.error", error=str(e), tier=tier)
+                log.error(
+                    "agent_node.error",
+                    error=str(e),
+                    tier=tier,
+                    elapsed_s=round(time.monotonic() - t0, 3),
+                )
                 return {
                     "error_info": {
                         "error": str(e),
                         "exception": e,
                         "step": "agent_node",
                     },
-                    "iteration": (state.get("iteration") or 0) + 1,
+                    "iteration": iteration,
                 }
 
         def extract_memory(state: AgentState) -> dict[str, Any]:
             """턴 종료 후 메모리 추출 노드."""
-            return self._memory_mw.extract_and_store(state)
+            t0 = time.monotonic()
+            result = self._memory_mw.extract_and_store(state)
+            log.debug("timing.extract_memory", elapsed_s=round(time.monotonic() - t0, 3))
+            return result
 
         def check_progress(state: AgentState) -> dict[str, Any]:
             """진전 감시 노드."""
@@ -386,7 +434,6 @@ class AgentLoop:
         builder.add_node("inject_memory", inject_memory)
         builder.add_node("agent", agent_node)
         builder.add_node("tools", tool_node)
-        builder.add_node("extract_memory", extract_memory)
         builder.add_node("extract_memory_final", extract_memory)
         builder.add_node("check_progress", check_progress)
         builder.add_node("handle_error", handle_error)
@@ -407,8 +454,8 @@ class AgentLoop:
             },
         )
 
-        builder.add_edge("tools", "extract_memory")
-        builder.add_edge("extract_memory", "check_progress")
+        # 루프 중간에는 메모리 추출 없이 바로 진전 확인
+        builder.add_edge("tools", "check_progress")
 
         builder.add_conditional_edges(
             "check_progress",

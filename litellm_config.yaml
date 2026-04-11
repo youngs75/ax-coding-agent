@@ -1,55 +1,96 @@
 # ═══════════════════════════════════════════════════════════════
-# LiteLLM Proxy 설정 — 4-Tier 모델 라우팅
+# AX Coding Agent — LiteLLM Proxy 설정
 #
-# LiteLLM이 LLM Gateway 역할을 수행하며:
-# 1. 다양한 프로바이더 (OpenRouter, DashScope)를 통합
+# 모든 LLM 요청이 이 프록시를 경유하며:
+# 1. 다양한 프로바이더 (OpenRouter, DashScope, Anthropic) 통합
 # 2. Langfuse로 모든 호출을 자동 트레이싱
 # 3. 레이트 리밋 및 폴백 관리
 # ═══════════════════════════════════════════════════════════════
 
 model_list:
-  # ── REASONING 티어 (계획, 아키텍처) ──
-  - model_name: reasoning
+  # ═══════════════════════════════════════════════
+  #  Anthropic (Claude) — via OpenRouter
+  # ═══════════════════════════════════════════════
+
+  - model_name: openrouter/anthropic/claude-sonnet-4
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-4
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: openrouter/anthropic/claude-haiku-4.5
+    litellm_params:
+      model: openrouter/anthropic/claude-haiku-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Anthropic 직접 호출 (API 키 있을 때)
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: claude-sonnet-4-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # ═══════════════════════════════════════════════
+  #  DashScope (Qwen 공식 API)
+  # ═══════════════════════════════════════════════
+
+  - model_name: dashscope/qwen3-max
+    litellm_params:
+      model: dashscope/qwen3-max
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: os.environ/DASHSCOPE_BASE_URL
+
+  - model_name: dashscope/qwen3.5-plus
+    litellm_params:
+      model: dashscope/qwen3.5-plus
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: os.environ/DASHSCOPE_BASE_URL
+
+  - model_name: dashscope/qwen3.5-flash
+    litellm_params:
+      model: dashscope/qwen3.5-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: os.environ/DASHSCOPE_BASE_URL
+
+  - model_name: dashscope/qwen3-coder-next
+    litellm_params:
+      model: dashscope/qwen3-coder-next
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: os.environ/DASHSCOPE_BASE_URL
+
+  # ═══════════════════════════════════════════════
+  #  OpenRouter (다중 모델 라우터)
+  # ═══════════════════════════════════════════════
+
+  - model_name: openrouter/z-ai/glm-5
+    litellm_params:
+      model: openrouter/z-ai/glm-5
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: openrouter/qwen/qwen3-max
     litellm_params:
       model: openrouter/qwen/qwen3-max
       api_key: os.environ/OPENROUTER_API_KEY
 
-  # ── STRONG 티어 (코드 생성 — GLM-5.1) ──
-  - model_name: strong
-    litellm_params:
-      model: openrouter/z-ai/glm-5.1
-      api_key: os.environ/OPENROUTER_API_KEY
-
-  # ── DEFAULT 티어 (분석, 검증) ──
-  - model_name: default
+  - model_name: openrouter/qwen/qwen3-coder-next
     litellm_params:
       model: openrouter/qwen/qwen3-coder-next
       api_key: os.environ/OPENROUTER_API_KEY
 
-  # ── FAST 티어 (파싱, 분류, 메모리 추출) ──
-  - model_name: fast
+  - model_name: openrouter/qwen/qwen3.5-flash-02-23
     litellm_params:
       model: openrouter/qwen/qwen3.5-flash-02-23
       api_key: os.environ/OPENROUTER_API_KEY
+      drop_params: true
 
-  # ── DashScope 대체 (폴백) ──
-  - model_name: strong-dashscope
+  - model_name: openrouter/deepseek/deepseek-v3.2
     litellm_params:
-      model: dashscope/qwen3-coder-next
-      api_key: os.environ/DASHSCOPE_API_KEY
-      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+      model: openrouter/deepseek/deepseek-v3.2
+      api_key: os.environ/OPENROUTER_API_KEY
 
-  - model_name: fast-dashscope
-    litellm_params:
-      model: dashscope/qwen3.5-flash
-      api_key: os.environ/DASHSCOPE_API_KEY
-      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-
-# Langfuse 콜백 (환경변수로 키 주입)
+# ── Langfuse 자동 트레이싱 ──
 litellm_settings:
-  success_callback: ["langfuse"]
-  failure_callback: ["langfuse"]
-  set_verbose: false
+  callbacks: ["langfuse"]
+  drop_params: true
 
+# ── 프록시 설정 ──
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
