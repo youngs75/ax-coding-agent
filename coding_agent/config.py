@@ -8,9 +8,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# .env 로드 (프로젝트 루트)
+# .env 로드 (프로젝트 루트 또는 Docker /app/.env)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
+# Docker 내부에서는 /app/.env도 시도
+if (Path("/app/.env")).exists():
+    load_dotenv(Path("/app/.env"), override=False)
 
 
 @dataclass(frozen=True)
