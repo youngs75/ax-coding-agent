@@ -112,9 +112,10 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
     # LiteLLM Proxy 모드: Docker 하니스로 LLM Gateway 경유
     # → 모든 호출이 LiteLLM을 거치며 Langfuse로 자동 트레이싱됨
     if cfg.litellm_proxy_url:
-        # LiteLLM Proxy에서는 티어 이름(reasoning/strong/default/fast)을
-        # 모델 이름으로 사용하거나, litellm_config.yaml의 model_name 사용
-        model_name = tier  # litellm_config.yaml에 정의된 model_name
+        # LiteLLM Proxy에서는 환경변수로 지정된 모델명을 그대로 사용
+        # (예: STRONG_MODEL=dashscope/qwen3-coder-next → 그대로 전달)
+        # 접두사 제거하지 않음 — LiteLLM이 라우팅 처리
+        model_name = raw_model_name
         api_key = cfg.litellm_master_key or "sk-harness-local-dev"
         base_url = cfg.litellm_proxy_url
 

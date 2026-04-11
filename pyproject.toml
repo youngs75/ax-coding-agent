@@ -23,6 +23,7 @@ dependencies = [
     "structlog>=24.0",
     "rich>=13.0",
     "prompt-toolkit>=3.0",
+    "langfuse>=2.0",
 ]
 
 [project.scripts]
