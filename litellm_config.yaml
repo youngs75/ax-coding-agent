@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════
+# LiteLLM Proxy 설정 — 4-Tier 모델 라우팅
+#
+# LiteLLM이 LLM Gateway 역할을 수행하며:
+# 1. 다양한 프로바이더 (OpenRouter, DashScope)를 통합
+# 2. Langfuse로 모든 호출을 자동 트레이싱
+# 3. 레이트 리밋 및 폴백 관리
+# ═══════════════════════════════════════════════════════════════
+
+model_list:
+  # ── REASONING 티어 (계획, 아키텍처) ──
+  - model_name: reasoning
+    litellm_params:
+      model: openrouter/qwen/qwen3-max
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ── STRONG 티어 (코드 생성 — GLM-5.1) ──
+  - model_name: strong
+    litellm_params:
+      model: openrouter/z-ai/glm-5.1
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ── DEFAULT 티어 (분석, 검증) ──
+  - model_name: default
+    litellm_params:
+      model: openrouter/qwen/qwen3-coder-next
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ── FAST 티어 (파싱, 분류, 메모리 추출) ──
+  - model_name: fast
+    litellm_params:
+      model: openrouter/qwen/qwen3.5-flash-02-23
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ── DashScope 대체 (폴백) ──
+  - model_name: strong-dashscope
+    litellm_params:
+      model: dashscope/qwen3-coder-next
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+  - model_name: fast-dashscope
+    litellm_params:
+      model: dashscope/qwen3.5-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+# Langfuse 콜백 (환경변수로 키 주입)
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

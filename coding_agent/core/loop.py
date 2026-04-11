@@ -1,0 +1,449 @@
+"""메인 Agentic Loop — LangGraph StateGraph 기반 에이전트 실행 루프.
+
+전체 흐름:
+    START → inject_memory → agent → route_after_agent
+        ├→ tools → extract_memory → check_progress → agent (루프)
+        ├→ extract_memory → END (완료)
+        └→ handle_error → route_after_error
+            ├→ agent (재시도/폴백)
+            └→ safe_stop → END (중단)
+
+DeepAgents의 middleware 패턴 + Claude Code의 compaction + Codex의 상태 관리를 결합.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import structlog
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import ToolNode
+
+from coding_agent.config import get_config
+from coding_agent.core.orchestrator import should_delegate
+from coding_agent.core.state import AgentState
+from coding_agent.core.tool_adapter import (
+    bind_tools_adaptive,
+    build_tool_prompt,
+    convert_text_response_to_tool_calls,
+    invoke_with_tool_fallback,
+)
+from coding_agent.core.tool_call_utils import prepare_messages_for_llm
+from coding_agent.memory import MemoryExtractor, MemoryMiddleware, MemoryStore
+from coding_agent.models import get_model, get_fallback_model, get_model_name, TierName
+from coding_agent.resilience import (
+    ErrorHandler,
+    GuardVerdict,
+    ProgressGuard,
+    SafeStop,
+    Watchdog,
+)
+from coding_agent.subagents import (
+    SubAgentFactory,
+    SubAgentManager,
+    SubAgentRegistry,
+)
+from coding_agent.tools.file_ops import FILE_TOOLS
+from coding_agent.tools.shell import SHELL_TOOLS
+from coding_agent.tools.task_tool import build_task_tool
+
+log = structlog.get_logger(__name__)
+
+SYSTEM_PROMPT = """당신은 숙련된 AI Coding Agent입니다.
+사용자의 요청에 따라 소프트웨어 프로젝트를 설계, 구현, 테스트합니다.
+
+## 사용 가능한 도구
+- read_file: 파일 내용 읽기 (offset/limit으로 부분 읽기 가능)
+- write_file: 새 파일 생성
+- edit_file: 기존 파일 수정 (old_string → new_string 치환)
+- glob_files: 파일 패턴 검색 (예: **/*.py)
+- grep: 코드 내 텍스트 검색 (정규식 지원)
+- execute: 셸 명령 실행 (빌드, 테스트, 패키지 설치 등)
+- task: 복잡한 하위 작업을 SubAgent에 위임
+
+## 작업 규칙
+1. 코드 수정 전에 반드시 파일을 먼저 읽으세요
+2. 한 번에 하나의 변경만 수행하세요
+3. 위험한 작업(삭제, 시스템 명령)은 신중하게 판단하세요
+4. 복잡한 작업은 task 도구로 SubAgent에 위임하세요
+
+## 복잡한 개발 요청을 받았을 때의 작업 프로세스
+
+큰 규모의 프로젝트 요청을 받으면 다음 순서로 진행하세요:
+
+### Phase 1: 요구사항 분석 & PRD 작성
+- 요구사항을 분석하고 PRD(Product Requirements Document)를 마크다운으로 작성
+- write_file로 docs/PRD.md에 저장
+
+### Phase 2: 작업 분해 & 개발 명세
+- PRD를 원자 단위 작업(task)으로 분해
+- 각 작업에 대해 구체적이고 명확한 개발 명세를 작성 (추상적 문구 배제)
+- Spec Driven Development 방식으로 API 계약, 데이터 모델, 인터페이스를 먼저 정의
+- write_file로 docs/SPEC.md에 저장
+
+### Phase 3: TDD 기반 구현
+- 각 작업에 대해 테스트를 먼저 작성 (Test Driven Development)
+- 테스트가 실패하는 것을 확인
+- 테스트를 통과하는 최소한의 구현 작성
+- execute로 테스트 실행하여 통과 확인
+- 리팩토링
+
+### Phase 4: 통합 & 검증
+- 전체 프로젝트 빌드 및 테스트 실행
+- 누락된 기능이 없는지 확인
+
+## 프로젝트 생성 규칙
+- 프로젝트 파일은 현재 작업 디렉토리에 생성합니다
+- 디렉토리 구조를 먼저 설계하고, 핵심 파일부터 순서대로 생성하세요
+- 설정 파일(package.json, pyproject.toml 등)을 먼저 만들고 의존성을 설치하세요
+
+{memory_context}
+"""
+
+
+class AgentLoop:
+    """메인 에이전트 루프를 구성하고 실행한다."""
+
+    def __init__(self) -> None:
+        cfg = get_config()
+
+        # 메모리 시스템
+        self._store = MemoryStore(cfg.memory_db_path)
+        self._extractor = MemoryExtractor(get_model("fast"))
+        self._memory_mw = MemoryMiddleware(self._store, self._extractor)
+
+        # SubAgent 시스템
+        self._registry = SubAgentRegistry()
+        self._factory = SubAgentFactory(self._registry, get_model("fast"))
+        self._manager = SubAgentManager(self._registry, self._factory)
+
+        # 복원력 시스템
+        self._watchdog = Watchdog(timeout_sec=cfg.llm_timeout)
+        self._progress_guard = ProgressGuard(max_iterations=cfg.max_iterations)
+        self._safe_stop = SafeStop()
+        self._error_handler = ErrorHandler(fallback_enabled=True)
+
+        # 도구
+        task_tool = build_task_tool(self._manager)
+        self._tools = FILE_TOOLS + SHELL_TOOLS + [task_tool]
+
+        # 그래프
+        self._graph = self._build_graph()
+
+    def _build_graph(self):
+        """LangGraph StateGraph를 구성한다."""
+        tools = self._tools
+        tool_node = ToolNode(tools)
+        tool_prompt_block = build_tool_prompt(tools)
+
+        # 모델 적응적 바인딩 캐시
+        _model_cache: dict[str, tuple] = {}
+
+        def get_bound_model(tier: str = "strong"):
+            """모델의 tool calling 지원 여부에 따라 적응적으로 바인딩.
+
+            Returns: (model, use_prompt_tools: bool)
+            """
+            if tier in _model_cache:
+                return _model_cache[tier]
+
+            model = get_model(tier, temperature=0.0)
+            model_name = get_model_name(tier)
+            bound, use_prompt = bind_tools_adaptive(model, tools, model_name)
+            _model_cache[tier] = (bound, use_prompt)
+            return bound, use_prompt
+
+        # ── 노드 정의 ──
+
+        def inject_memory(state: AgentState) -> dict[str, Any]:
+            """메모리 주입 노드."""
+            result = self._memory_mw.inject(state)
+            updates: dict[str, Any] = {
+                "memory_context": result.get("memory_context", ""),
+            }
+            if "iteration" not in state or state.get("iteration") is None:
+                updates["iteration"] = 0
+                updates["max_iterations"] = get_config().max_iterations
+                updates["current_tier"] = "strong"
+                updates["stall_count"] = 0
+            return updates
+
+        def agent_node(state: AgentState) -> dict[str, Any]:
+            """LLM 호출 노드.
+
+            오픈소스 모델 호환성:
+            1. native tool calling 지원 → bind_tools 사용
+            2. 미지원 (GLM, MiniMax 등) → 프롬프트에 도구 스키마 주입,
+               텍스트 응답에서 tool_call JSON 블록 파싱
+            3. 메시지 전처리: 고아 tool_call 정리, DashScope 직렬화 보장
+            """
+            tier = state.get("current_tier", "strong")
+            model, use_prompt_tools = get_bound_model(tier)
+
+            messages = list(state.get("messages", []))
+
+            # 시스템 프롬프트 구성
+            memory_ctx = state.get("memory_context", "")
+            sys_prompt = SYSTEM_PROMPT.format(memory_context=memory_ctx)
+
+            # 프롬프트 기반 도구 호출 모드면 도구 스키마를 시스템 프롬프트에 추가
+            if use_prompt_tools:
+                sys_prompt += "\n" + tool_prompt_block
+
+            # 시스템 메시지 설정
+            if not messages or not isinstance(messages[0], SystemMessage):
+                messages.insert(0, SystemMessage(content=sys_prompt))
+            else:
+                messages[0] = SystemMessage(content=sys_prompt)
+
+            # 메시지 전처리 (고아 정리, 직렬화 보장)
+            messages = prepare_messages_for_llm(messages)
+
+            try:
+                model_name = get_model_name(tier)
+                response = invoke_with_tool_fallback(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    model_name=model_name,
+                    use_prompt_tools=use_prompt_tools,
+                )
+
+                return {
+                    "messages": [response],
+                    "iteration": (state.get("iteration") or 0) + 1,
+                }
+            except Exception as e:
+                log.error("agent_node.error", error=str(e), tier=tier)
+                return {
+                    "error_info": {
+                        "error": str(e),
+                        "exception": e,
+                        "step": "agent_node",
+                    },
+                    "iteration": (state.get("iteration") or 0) + 1,
+                }
+
+        def extract_memory(state: AgentState) -> dict[str, Any]:
+            """턴 종료 후 메모리 추출 노드."""
+            return self._memory_mw.extract_and_store(state)
+
+        def check_progress(state: AgentState) -> dict[str, Any]:
+            """진전 감시 노드."""
+            messages = state.get("messages", [])
+            iteration = state.get("iteration", 0)
+
+            # 마지막 도구 호출 기록
+            if messages:
+                last_msg = messages[-1]
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    for tc in last_msg.tool_calls:
+                        self._progress_guard.record_action(
+                            tc.get("name", "unknown"),
+                            tc.get("args", {}),
+                        )
+
+            verdict = self._progress_guard.check(iteration)
+
+            if verdict == GuardVerdict.STOP:
+                return {
+                    "exit_reason": "progress_guard_stop",
+                    "stall_count": (state.get("stall_count") or 0) + 1,
+                }
+            elif verdict == GuardVerdict.WARN:
+                log.warning("progress_guard.stall_detected", iteration=iteration)
+                return {"stall_count": (state.get("stall_count") or 0) + 1}
+
+            return {}
+
+        def handle_error(state: AgentState) -> dict[str, Any]:
+            """에러 처리 노드."""
+            error_info = state.get("error_info", {})
+            error = error_info.get("exception") or Exception(
+                error_info.get("error", "unknown")
+            )
+            resolution = self._error_handler.handle(error, state)
+
+            log.info(
+                "error_handler.resolution",
+                action=resolution.action,
+                status=resolution.status_message,
+            )
+
+            result: dict[str, Any] = {"error_info": {}}
+
+            if resolution.action == "retry":
+                result["retry_count_for_this_error"] = resolution.metadata.get(
+                    "retry_count", 0
+                )
+            elif resolution.action == "fallback":
+                next_tier = resolution.metadata.get("next_tier")
+                if next_tier:
+                    result["current_tier"] = next_tier
+                    result["retry_count_for_this_error"] = 0
+                else:
+                    result["exit_reason"] = "all_models_exhausted"
+            elif resolution.action == "abort":
+                result["exit_reason"] = "error_abort"
+
+            return result
+
+        def safe_stop_node(state: AgentState) -> dict[str, Any]:
+            """안전 중단 노드."""
+            exit_reason = state.get("exit_reason", "safe_stop")
+            log.info("safe_stop", reason=exit_reason)
+
+            # Resume metadata 저장
+            resume = {
+                "last_step": "safe_stop",
+                "iteration": state.get("iteration", 0),
+                "exit_reason": exit_reason,
+                "stall_summary": self._progress_guard.get_stall_summary(),
+            }
+            return {
+                "exit_reason": exit_reason,
+                "resume_metadata": resume,
+            }
+
+        # ── 라우팅 함수 ──
+
+        def route_after_agent(state: AgentState) -> str:
+            """agent 노드 후 라우팅."""
+            # 에러 발생 시
+            if state.get("error_info"):
+                return "handle_error"
+
+            # 안전 중단 체크
+            should_stop, reason = self._safe_stop.evaluate(state)
+            if should_stop:
+                return "safe_stop"
+
+            # 도구 호출 여부 확인
+            messages = state.get("messages", [])
+            if messages:
+                last_msg = messages[-1]
+                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    return "tools"
+
+            # 도구 호출 없음 = 응답 완료
+            return "extract_memory_final"
+
+        def route_after_check(state: AgentState) -> str:
+            """check_progress 후 라우팅."""
+            if state.get("exit_reason"):
+                return "safe_stop"
+            return "agent"
+
+        def route_after_error(state: AgentState) -> str:
+            """handle_error 후 라우팅."""
+            if state.get("exit_reason"):
+                return "safe_stop"
+            return "agent"
+
+        # ── 그래프 구성 ──
+
+        builder = StateGraph(AgentState)
+
+        builder.add_node("inject_memory", inject_memory)
+        builder.add_node("agent", agent_node)
+        builder.add_node("tools", tool_node)
+        builder.add_node("extract_memory", extract_memory)
+        builder.add_node("extract_memory_final", extract_memory)
+        builder.add_node("check_progress", check_progress)
+        builder.add_node("handle_error", handle_error)
+        builder.add_node("safe_stop", safe_stop_node)
+
+        # 엣지
+        builder.set_entry_point("inject_memory")
+        builder.add_edge("inject_memory", "agent")
+
+        builder.add_conditional_edges(
+            "agent",
+            route_after_agent,
+            {
+                "tools": "tools",
+                "extract_memory_final": "extract_memory_final",
+                "handle_error": "handle_error",
+                "safe_stop": "safe_stop",
+            },
+        )
+
+        builder.add_edge("tools", "extract_memory")
+        builder.add_edge("extract_memory", "check_progress")
+
+        builder.add_conditional_edges(
+            "check_progress",
+            route_after_check,
+            {"agent": "agent", "safe_stop": "safe_stop"},
+        )
+
+        builder.add_conditional_edges(
+            "handle_error",
+            route_after_error,
+            {"agent": "agent", "safe_stop": "safe_stop"},
+        )
+
+        builder.add_edge("extract_memory_final", END)
+        builder.add_edge("safe_stop", END)
+
+        return builder.compile().with_config({"recursion_limit": 200})
+
+    async def run(self, user_message: str, project_id: str | None = None) -> dict[str, Any]:
+        """사용자 메시지를 처리하고 최종 상태를 반환한다."""
+        self._progress_guard.reset()
+
+        initial_state: dict[str, Any] = {
+            "messages": [HumanMessage(content=user_message)],
+            "project_id": project_id or "",
+            "working_directory": get_config().project_root.as_posix(),
+        }
+
+        log.info("agent_loop.start", message_length=len(user_message))
+
+        try:
+            final_state = await self._graph.ainvoke(initial_state)
+        except Exception as e:
+            log.error("agent_loop.fatal_error", error=str(e))
+            final_state = {
+                "exit_reason": "fatal_error",
+                "error_info": {"error": str(e)},
+                "messages": [
+                    HumanMessage(content=user_message),
+                    AIMessage(content=f"치명적 오류가 발생했습니다: {e}"),
+                ],
+            }
+
+        # 최종 응답 추출
+        messages = final_state.get("messages", [])
+        final_response = ""
+        if messages:
+            last = messages[-1]
+            if hasattr(last, "content"):
+                final_response = last.content if isinstance(last.content, str) else str(last.content)
+
+        final_state["final_response"] = final_response
+
+        log.info(
+            "agent_loop.complete",
+            iterations=final_state.get("iteration", 0),
+            exit_reason=final_state.get("exit_reason", "completed"),
+        )
+
+        # SubAgent 정리
+        self._manager.cleanup()
+
+        return final_state
+
+    def get_memory_store(self) -> MemoryStore:
+        """메모리 스토어 인스턴스 반환 (CLI 용)."""
+        return self._store
+
+    def get_registry(self) -> SubAgentRegistry:
+        """SubAgent 레지스트리 반환 (CLI 용)."""
+        return self._registry
+
+    def close(self) -> None:
+        """리소스 정리."""
+        self._store.close()
