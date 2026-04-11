@@ -287,7 +287,7 @@ class SubAgentManager:
 
         return builder.compile(
             # recursion_limit controls max number of supersteps
-        ).with_config({"recursion_limit": 100})
+        ).with_config({"recursion_limit": 500})
 
     # ── Cancel ────────────────────────────────────────────────
 
