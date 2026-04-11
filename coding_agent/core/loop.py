@@ -325,17 +325,20 @@ class AgentLoop:
             return result
 
         def safe_stop_node(state: AgentState) -> dict[str, Any]:
-            """안전 중단 노드."""
+            """안전 중단 노드. 진행 상태를 파일로 저장하여 이어서 작업 가능."""
             exit_reason = state.get("exit_reason", "safe_stop")
             log.info("safe_stop", reason=exit_reason)
 
-            # Resume metadata 저장
             resume = {
                 "last_step": "safe_stop",
                 "iteration": state.get("iteration", 0),
                 "exit_reason": exit_reason,
                 "stall_summary": self._progress_guard.get_stall_summary(),
             }
+
+            # 진행 상태를 .ax-agent/resume.json에 저장
+            self._save_resume_state(state, exit_reason)
+
             return {
                 "exit_reason": exit_reason,
                 "resume_metadata": resume,
@@ -480,6 +483,93 @@ class AgentLoop:
     def get_registry(self) -> SubAgentRegistry:
         """SubAgent 레지스트리 반환 (CLI 용)."""
         return self._registry
+
+    # ── Resume 기능 ──
+
+    @staticmethod
+    def _resume_path() -> Path:
+        return Path.cwd() / ".ax-agent" / "resume.json"
+
+    def _save_resume_state(self, state: dict, exit_reason: str) -> None:
+        """중단 시 진행 상태를 .ax-agent/resume.json에 저장."""
+        import json
+        from langchain_core.messages import messages_to_dict
+
+        path = self._resume_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        messages = state.get("messages", [])
+        # 마지막 사용자 메시지 추출
+        original_request = ""
+        for msg in messages:
+            if hasattr(msg, "type") and msg.type == "human":
+                original_request = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+
+        # AI가 지금까지 한 작업 요약 (마지막 AI 메시지)
+        last_ai_content = ""
+        for msg in reversed(messages):
+            if hasattr(msg, "type") and msg.type == "ai" and hasattr(msg, "content") and msg.content:
+                last_ai_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+
+        resume_data = {
+            "original_request": original_request,
+            "progress_summary": last_ai_content[:2000],
+            "iteration": state.get("iteration", 0),
+            "exit_reason": exit_reason,
+            "current_tier": state.get("current_tier", "strong"),
+            "project_id": state.get("project_id", ""),
+        }
+
+        path.write_text(json.dumps(resume_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("resume_state.saved", path=str(path))
+
+    def has_resume_state(self) -> bool:
+        """이어서 할 작업이 있는지 확인."""
+        return self._resume_path().exists()
+
+    def get_resume_info(self) -> dict | None:
+        """저장된 resume 정보를 반환."""
+        import json
+        path = self._resume_path()
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    async def run_resume(self) -> dict[str, Any]:
+        """중단된 작업을 이어서 실행.
+
+        저장된 원본 요청 + 진행 상황을 새 프롬프트로 구성하여 실행.
+        """
+        import json
+        path = self._resume_path()
+        if not path.exists():
+            return {"final_response": "이어서 할 작업이 없습니다.", "exit_reason": "no_resume"}
+
+        resume = json.loads(path.read_text(encoding="utf-8"))
+
+        # resume 파일 삭제 (한 번만 사용)
+        path.unlink(missing_ok=True)
+
+        # 이어서 할 프롬프트 구성
+        resume_prompt = f"""이전 작업을 이어서 진행해주세요.
+
+## 원본 요청
+{resume['original_request']}
+
+## 이전 진행 상황 ({resume['iteration']}번째 iteration에서 {resume['exit_reason']}로 중단)
+{resume['progress_summary'][:1500]}
+
+## 지시사항
+위 원본 요청에서 아직 완료되지 않은 부분을 이어서 진행하세요.
+이미 생성된 파일은 read_file/glob_files로 확인한 후, 누락된 부분만 작업하세요.
+"""
+
+        return await self.run(resume_prompt, project_id=resume.get("project_id"))
 
     def close(self) -> None:
         """리소스 정리."""

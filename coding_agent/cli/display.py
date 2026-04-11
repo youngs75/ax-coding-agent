@@ -143,6 +143,7 @@ def print_help() -> None:
 | Command | Description |
 |---------|-------------|
 | `/help` | 도움말 |
+| `/resume` | 중단된 작업 이어서 진행 |
 | `/memory` | 저장된 메모리 목록 |
 | `/memory add <layer> <key> <content>` | 메모리 수동 추가 |
 | `/memory delete <key>` | 메모리 삭제 |

@@ -64,6 +64,19 @@ def _handle_command(cmd: str) -> bool:
         loop.close()
         sys.exit(0)
 
+    elif command == "/resume":
+        if loop.has_resume_state():
+            info = loop.get_resume_info()
+            if info:
+                console.print(f"  [cyan]원본 요청:[/cyan] {info['original_request'][:80]}...")
+                console.print(f"  [cyan]중단 사유:[/cyan] {info['exit_reason']} ({info['iteration']} iterations)")
+                console.print(f"  [yellow]이어서 진행합니다...[/yellow]")
+                import asyncio
+                asyncio.get_event_loop().create_task(_run_resume())
+        else:
+            print_status("이어서 할 작업이 없습니다.", "dim")
+        return True
+
     elif command == "/memory":
         store = loop.get_memory_store()
         if len(parts) >= 4 and parts[1] == "add":
@@ -123,6 +136,24 @@ def _handle_command(cmd: str) -> bool:
         return True
 
     return False
+
+
+# ── Resume 실행 ──
+
+async def _run_resume() -> None:
+    """중단된 작업을 이어서 실행."""
+    loop = _get_loop()
+    try:
+        result = await loop.run_resume()
+        response = result.get("final_response", "")
+        print_response(response)
+        iterations = result.get("iteration", 0)
+        exit_reason = result.get("exit_reason", "completed")
+        if exit_reason and exit_reason not in ("completed", ""):
+            print_stall_warning(exit_reason)
+        print_agent_status("completed", f"{iterations} steps")
+    except Exception as e:
+        print_error(str(e))
 
 
 # ── 스트리밍 에이전트 실행 ──
@@ -295,6 +326,18 @@ async def _async_main() -> None:
     # 작업 디렉토리 표시
     cwd = os.getcwd()
     console.print(f"  [dim]workspace: {cwd}[/dim]")
+
+    # 이어서 할 작업이 있으면 알림
+    loop = _get_loop()
+    if loop.has_resume_state():
+        info = loop.get_resume_info()
+        if info:
+            console.print()
+            console.print(f"  [yellow]⚡ 이전 작업이 중단되었습니다[/yellow]")
+            console.print(f"  [dim]{info['original_request'][:80]}...[/dim]")
+            console.print(f"  [dim]{info['exit_reason']} ({info['iteration']} iterations)[/dim]")
+            console.print(f"  [yellow]/resume 으로 이어서 진행할 수 있습니다[/yellow]")
+
     console.print()
 
     history_path = os.path.expanduser("~/.ax_agent_history")
