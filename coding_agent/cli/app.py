@@ -151,7 +151,9 @@ async def _run_agent_streaming(user_input: str) -> None:
     console.print(f"  [dim]{ICON_THINK} thinking...[/dim]", end="\r")
 
     try:
-        async for event in graph.astream_events(initial_state, version="v2"):
+        async for event in graph.astream_events(
+            initial_state, version="v2", config={"recursion_limit": 500}
+        ):
             kind = event.get("event", "")
             name = event.get("name", "")
             data = event.get("data", {})

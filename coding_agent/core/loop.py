@@ -388,7 +388,7 @@ class AgentLoop:
         builder.add_edge("extract_memory_final", END)
         builder.add_edge("safe_stop", END)
 
-        return builder.compile().with_config({"recursion_limit": 200})
+        return builder.compile()
 
     async def run(self, user_message: str, project_id: str | None = None) -> dict[str, Any]:
         """사용자 메시지를 처리하고 최종 상태를 반환한다."""
@@ -403,7 +403,10 @@ class AgentLoop:
         log.info("agent_loop.start", message_length=len(user_message))
 
         try:
-            final_state = await self._graph.ainvoke(initial_state)
+            final_state = await self._graph.ainvoke(
+                initial_state,
+                config={"recursion_limit": 500},
+            )
         except Exception as e:
             log.error("agent_loop.fatal_error", error=str(e))
             final_state = {

@@ -213,7 +213,10 @@ class SubAgentManager:
         }
 
         try:
-            final_state = await graph.ainvoke(initial_state)
+            final_state = await graph.ainvoke(
+                initial_state,
+                config={"recursion_limit": 500},
+            )
         except Exception as exc:
             return SubAgentResult(success=False, output="", error=str(exc))
 
@@ -287,7 +290,7 @@ class SubAgentManager:
 
         return builder.compile(
             # recursion_limit controls max number of supersteps
-        ).with_config({"recursion_limit": 500})
+        )
 
     # ── Cancel ────────────────────────────────────────────────
 
