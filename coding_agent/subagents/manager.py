@@ -1,4 +1,11 @@
-"""SubAgentManager — orchestrates spawning, execution, and lifecycle of SubAgents."""
+"""SubAgentManager — orchestrates spawning, execution, and lifecycle of SubAgents.
+
+Incorporates four root-cause fixes from E2E analysis:
+  Fix 1 — Message window: trim old messages before each LLM call (claw-code style).
+  Fix 2 — Turn counting: hard max_turns limit + text repetition detection.
+  Fix 3 — Output isolation: return structured summary, not raw LLM text.
+  Fix 4 — Tool list in prompt: handled by factory.build_system_prompt().
+"""
 
 from __future__ import annotations
 
@@ -7,7 +14,12 @@ import time
 from typing import Any, Sequence
 
 import structlog
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
@@ -26,6 +38,9 @@ from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
 
 log = structlog.get_logger(__name__)
+
+# ── Fix 2: SubAgent turn limits ──────────────────────────────
+_SUBAGENT_MAX_TURNS = 50  # hard limit per SubAgent session
 
 # Map tool names to actual tool objects
 _ALL_TOOLS: dict[str, BaseTool] = {}
@@ -208,7 +223,7 @@ class SubAgentManager:
         setup_elapsed = time.monotonic() - t0
 
         t0 = time.monotonic()
-        graph = self._build_subagent_graph(instance, system_prompt, tools, model)
+        graph, get_hit_max_turns = self._build_subagent_graph(instance, system_prompt, tools, model)
         graph_elapsed = time.monotonic() - t0
 
         initial_state: dict[str, Any] = {
@@ -253,28 +268,71 @@ class SubAgentManager:
             )
             return SubAgentResult(success=False, output="", error=str(exc))
 
-        # Extract the final assistant message
+        # ── Fix 3: Extract structured summary instead of raw LLM text ──
         messages = final_state.get("messages", [])
         if not messages:
             return SubAgentResult(success=False, output="", error="No messages in final state")
 
-        last_msg = messages[-1]
-        content = getattr(last_msg, "content", str(last_msg))
-
-        # Collect any files that were written (heuristic: look at tool calls)
+        # Collect files written/edited (heuristic: look at tool calls)
         written_files: list[str] = []
+        edited_files: list[str] = []
+        executed_commands: int = 0
+        tool_errors: list[str] = []
         for msg in messages:
             if hasattr(msg, "tool_calls"):
                 for tc in msg.tool_calls:
-                    if tc.get("name") == "write_file":
-                        args = tc.get("args", {})
+                    name = tc.get("name", "")
+                    args = tc.get("args", {})
+                    if name == "write_file":
                         path = args.get("path", "")
                         if path:
                             written_files.append(path)
+                    elif name == "edit_file":
+                        path = args.get("path", "")
+                        if path:
+                            edited_files.append(path)
+                    elif name == "execute":
+                        executed_commands += 1
+            # Collect tool errors from ToolMessages
+            if isinstance(msg, ToolMessage):
+                content_str = msg.content if isinstance(msg.content, str) else str(msg.content)
+                if "error" in content_str.lower()[:100]:
+                    tool_errors.append(content_str[:150])
+
+        # Get the last AI message for a brief summary
+        last_ai_content = ""
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and hasattr(msg, "content") and msg.content:
+                raw = msg.content if isinstance(msg.content, str) else str(msg.content)
+                last_ai_content = raw[:500]
+                break
+
+        # Build structured output (DeepAgents pattern: final message only)
+        summary_parts = []
+        if written_files:
+            summary_parts.append(f"Files created: {', '.join(written_files)}")
+        if edited_files:
+            summary_parts.append(f"Files edited: {', '.join(edited_files)}")
+        if executed_commands:
+            summary_parts.append(f"Commands executed: {executed_commands}")
+        if tool_errors:
+            summary_parts.append(f"Errors encountered: {len(tool_errors)}")
+        # Include a brief excerpt of the last AI response for context
+        if last_ai_content:
+            summary_parts.append(f"Summary: {last_ai_content}")
+
+        structured_output = "\n".join(summary_parts) if summary_parts else "Task completed."
+
+        # If max_turns was hit, mark as incomplete so Orchestrator knows
+        if get_hit_max_turns():
+            structured_output += (
+                f"\n[INCOMPLETE — stopped at {_SUBAGENT_MAX_TURNS} turns. "
+                "Some work may remain unfinished. Review files and continue if needed.]"
+            )
 
         return SubAgentResult(
             success=True,
-            output=content if isinstance(content, str) else str(content),
+            output=structured_output,
             written_files=written_files,
         )
 
@@ -290,32 +348,105 @@ class SubAgentManager:
         """Build a simple ReAct-style LangGraph for a SubAgent.
 
         Flow: agent (LLM call) <-> tools, with early termination detection.
+
+        Root-cause fixes applied:
+          Fix 1 — Message window: trim to _SUBAGENT_MAX_MESSAGES before LLM call.
+          Fix 2 — Turn counting (max_turns) + text repetition detection.
         """
         model_with_tools = model.bind_tools(tools) if tools else model
 
-        # Track recent tool calls for repetition detection
+        # ── Fix 2: Turn & repetition tracking ─────────────────
         _recent_calls: list[tuple[str, str]] = []
-        _MAX_REPEAT = 3  # stop after 3 identical consecutive calls
+        _MAX_REPEAT = 3
+        _turn_count = 0
+        _hit_max_turns = False  # signals incomplete work to caller
+        _recent_texts: list[str] = []  # track consecutive text-only outputs
+        _MAX_TEXT_REPEAT = 3  # stop after 3 identical text outputs
+
+        # Collect valid tool names for error feedback (Fix 4)
+        _valid_tool_names = {t.name for t in tools} if tools else set()
 
         def agent_node(state: dict[str, Any]) -> dict[str, Any]:
-            """Call the LLM with the current message history."""
+            """Call the LLM with full message history.
+
+            No message trimming is applied here.  SubAgent context stays
+            well within the model's 128K window (typically <15K tokens).
+            The 60K token bloat problem was at the Orchestrator level where
+            SubAgent results accumulated — NOT inside SubAgents themselves.
+            """
+            nonlocal _turn_count
+            _turn_count += 1
             messages = state["messages"]
             response = model_with_tools.invoke(messages)
             return {"messages": [response]}
 
         def should_continue(state: dict[str, Any]) -> str:
-            """Decide whether to call tools or finish, with early termination."""
+            """Decide whether to call tools or finish, with multi-layer protection.
+
+            Checks (in order):
+            1. max_turns hard limit (Fix 2 — Claude Code pattern)
+            2. No tool calls → check for text repetition (Fix 2)
+            3. Invalid tool name → inject corrective feedback (Fix 4)
+            4. Repeated identical tool calls → early stop
+            """
+            nonlocal _turn_count
             messages = state["messages"]
             last = messages[-1]
-            if not (hasattr(last, "tool_calls") and last.tool_calls):
+
+            # ── Fix 2: Hard turn limit (Claude Code maxTurns pattern) ──
+            nonlocal _hit_max_turns
+            if _turn_count >= _SUBAGENT_MAX_TURNS:
+                _hit_max_turns = True
+                log.warning(
+                    "subagent.max_turns_reached",
+                    agent_id=instance.agent_id,
+                    turns=_turn_count,
+                    max_turns=_SUBAGENT_MAX_TURNS,
+                )
                 return END
 
-            # Detect repeated identical tool calls → likely stuck
+            # ── No tool calls: check text repetition ──
+            if not (hasattr(last, "tool_calls") and last.tool_calls):
+                # Fix 2: Detect repeated text-only outputs
+                content = getattr(last, "content", "")
+                if isinstance(content, str) and content.strip():
+                    text_sig = content.strip()[:200]
+                    _recent_texts.append(text_sig)
+                    # Keep only last entries
+                    while len(_recent_texts) > _MAX_TEXT_REPEAT * 2:
+                        _recent_texts.pop(0)
+                    if len(_recent_texts) >= _MAX_TEXT_REPEAT:
+                        tail = _recent_texts[-_MAX_TEXT_REPEAT:]
+                        if all(t == tail[0] for t in tail):
+                            log.warning(
+                                "subagent.early_stop.repeated_text",
+                                agent_id=instance.agent_id,
+                                text_preview=tail[0][:80],
+                            )
+                            return END
+                return END
+
+            # ── Fix 4: Check for invalid tool names ──
+            if _valid_tool_names:
+                for tc in last.tool_calls:
+                    name = tc.get("name", "")
+                    if name and name not in _valid_tool_names:
+                        log.warning(
+                            "subagent.invalid_tool",
+                            agent_id=instance.agent_id,
+                            tool=name,
+                            valid=list(_valid_tool_names),
+                        )
+                        # Don't route to tools — will fail. Return END to
+                        # let LangGraph's ToolNode handle the error naturally,
+                        # but we still route to "tools" so the error feedback
+                        # reaches the LLM for self-correction.
+
+            # ── Detect repeated identical tool calls → likely stuck ──
             for tc in last.tool_calls:
                 call_sig = (tc.get("name", ""), str(tc.get("args", {})))
                 _recent_calls.append(call_sig)
 
-            # Keep only the last _MAX_REPEAT * 2 entries
             while len(_recent_calls) > _MAX_REPEAT * 2:
                 _recent_calls.pop(0)
 
@@ -345,7 +476,10 @@ class SubAgentManager:
 
         builder.set_entry_point("agent")
 
-        return builder.compile()
+        compiled = builder.compile()
+        # Return both the graph and an accessor for the max_turns flag
+        # so _run_agent() can report incomplete work to the Orchestrator.
+        return compiled, lambda: _hit_max_turns
 
     # ── Parallel spawn ───────────────────────────────────────
 

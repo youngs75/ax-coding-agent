@@ -66,6 +66,7 @@ SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
 - coder: 코드 생성, 파일 작성, 패키지 설치, 테스트 작성 및 실행
 - reviewer: 코드 리뷰, 품질 검토, 개선점 도출
 - fixer: 버그 수정, 에러 해결, 테스트 실패 대응
+- verifier: 테스트 실행, 빌드 확인, 구현 검증 (코드 수정 없이 검증만)
 - researcher: 기술 조사, 라이브러리 비교, 레퍼런스 탐색
 
 ## 당신이 직접 할 수 있는 것
@@ -75,7 +76,8 @@ SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
 
 ## 당신이 직접 하면 안 되는 것
 - write_file, edit_file, execute를 직접 호출하여 코드 작성/수정/실행
-- 이런 작업은 반드시 task 도구로 coder 또는 fixer SubAgent에게 위임
+- 테스트 실행이 필요하면 verifier SubAgent에게 위임
+- 이런 작업은 반드시 task 도구로 전문 SubAgent에게 위임
 
 ## 복잡한 개발 요청의 작업 프로세스
 
@@ -195,6 +197,30 @@ class AgentLoop:
             log.debug("timing.inject_memory", elapsed_s=round(time.monotonic() - t0, 3))
             return updates
 
+        # ── Fix 1: Orchestrator message window ────────────────
+        _ORCH_MAX_MESSAGES = 60  # keep system + last N messages
+
+        def _trim_orchestrator_messages(messages: list) -> list:
+            """Trim orchestrator message history.
+
+            Preserves:
+              [0] SystemMessage (system prompt)
+              [1] HumanMessage  (user request — MUST NOT be trimmed)
+              [-N:] Most recent messages
+            """
+            if len(messages) <= _ORCH_MAX_MESSAGES + 2:
+                return messages
+            from langchain_core.messages import SystemMessage as _Sys
+            # Keep system prompt + user's original request
+            head = messages[:2]
+            recent = messages[-_ORCH_MAX_MESSAGES:]
+            log.info(
+                "orchestrator.message_window.trimmed",
+                before=len(messages),
+                after=len(head) + len(recent),
+            )
+            return head + recent
+
         def agent_node(state: AgentState) -> dict[str, Any]:
             """LLM 호출 노드.
 
@@ -203,13 +229,15 @@ class AgentLoop:
             2. 미지원 (GLM, MiniMax 등) → 프롬프트에 도구 스키마 주입,
                텍스트 응답에서 tool_call JSON 블록 파싱
             3. 메시지 전처리: 고아 tool_call 정리, DashScope 직렬화 보장
+            4. Fix 1: 메시지 윈도우 적용 (토큰 증가 방지)
             """
             t0 = time.monotonic()
             tier = state.get("current_tier", "strong")
             iteration = (state.get("iteration") or 0) + 1
             model, use_prompt_tools = get_bound_model(tier)
 
-            messages = list(state.get("messages", []))
+            # Fix 1: Trim messages before LLM call
+            messages = _trim_orchestrator_messages(list(state.get("messages", [])))
 
             # 시스템 프롬프트 구성
             memory_ctx = state.get("memory_context", "")

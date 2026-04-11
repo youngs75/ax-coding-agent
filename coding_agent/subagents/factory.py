@@ -26,11 +26,27 @@ class _RoleTemplate:
 
 # ── Role templates ────────────────────────────────────────────
 
+_FORK_RULES = """
+## Output Rules (MANDATORY)
+1. When you finish the task, respond with a brief text summary.
+   Do NOT keep calling tools after the task is complete.
+2. Your final summary should be under 500 words with this format:
+   Scope: <what you did>
+   Result: <outcome — success/failure/partial>
+   Files changed: <list of created/modified files>
+   Issues: <any problems encountered, or "none">
+3. Do NOT converse, ask questions, or suggest next steps.
+4. Stay strictly within the task scope.
+5. Do NOT call tools that are not in the available tools list above.
+"""
+
 _PLANNER_PROMPT = """\
 You are a planning agent. Your job is to analyze the task, explore the codebase,
 and produce clear, actionable plans and documents.
 
-Task: {task_summary}
+Task: {{task_summary}}
+
+Available tools: {tools}
 
 Guidelines:
 - Read relevant files to understand the current architecture.
@@ -38,56 +54,85 @@ Guidelines:
 - Output a numbered step-by-step plan. Be specific about file paths and changes.
 - Use write_file to save planning documents (PRD, SPEC, etc.) to the requested path.
 - Do NOT write application code — only plans and specification documents.
-"""
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
 
 _CODER_PROMPT = """\
 You are a coding agent. Your job is to implement the requested changes precisely.
 
-Task: {task_summary}
+Task: {{task_summary}}
+
+Available tools: {tools}
 
 Guidelines:
 - Read existing files before modifying them.
 - Write clean, production-quality code that follows existing conventions.
 - Create or update tests when appropriate.
 - After writing files, verify correctness with a quick execution if possible.
-"""
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
 
 _REVIEWER_PROMPT = """\
 You are a code review agent. Your job is to review code changes for correctness,
 style, and potential issues.
 
-Task: {task_summary}
+Task: {{task_summary}}
+
+Available tools: {tools}
 
 Guidelines:
 - Read the relevant files and understand the context.
 - Check for bugs, edge cases, and style violations.
 - Provide a structured review with severity levels (critical, warning, info).
 - Suggest specific fixes for any issues found.
-"""
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
 
 _FIXER_PROMPT = """\
 You are a bug-fixing agent. Your job is to diagnose and fix the reported issue.
 
-Task: {task_summary}
+Task: {{task_summary}}
+
+Available tools: {tools}
 
 Guidelines:
 - Reproduce the issue if possible (run tests or execute code).
 - Read relevant source files and trace the root cause.
 - Apply a minimal, targeted fix.
 - Verify the fix works by re-running the failing test or command.
-"""
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
 
 _RESEARCHER_PROMPT = """\
 You are a research agent. Your job is to gather information from the codebase
 and summarize findings.
 
-Task: {task_summary}
+Task: {{task_summary}}
+
+Available tools: {tools}
 
 Guidelines:
 - Search broadly using glob and grep to find relevant code.
 - Read and understand the key files.
 - Provide a concise summary with file paths and code references.
-"""
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
+
+_VERIFIER_PROMPT = """\
+You are a verification agent. Your job is to run tests, check builds,
+and verify that the implementation works correctly.
+
+Task: {{task_summary}}
+
+Available tools: {tools}
+
+Guidelines:
+- Run the test suite and report pass/fail results clearly.
+- If tests fail, report the exact error messages and failing test names.
+- Check that the build succeeds (compile, lint, type-check if applicable).
+- Do NOT fix code — only verify and report. If fixes are needed, say so.
+- Do NOT call tools that are not in the available tools list above.
+""" + _FORK_RULES
 
 ROLE_TEMPLATES: dict[str, _RoleTemplate] = {
     "planner": _RoleTemplate(
@@ -115,6 +160,11 @@ ROLE_TEMPLATES: dict[str, _RoleTemplate] = {
         default_tools=["read_file", "glob_files", "grep"],
         model_tier="default",
     ),
+    "verifier": _RoleTemplate(
+        system_prompt_template=_VERIFIER_PROMPT,
+        default_tools=["read_file", "execute", "glob_files", "grep"],
+        model_tier="fast",
+    ),
 }
 
 # Task-analysis prompt used by _analyze_task to classify into a role
@@ -127,6 +177,7 @@ agent role from the following list:
 - reviewer: for tasks that require reviewing, auditing, or critiquing existing code
 - fixer: for tasks that require debugging, fixing bugs, or resolving errors
 - researcher: for tasks that require searching, reading, or gathering information
+- verifier: for tasks that require running tests, checking builds, or verifying implementations
 
 Respond with ONLY the role name (one word, lowercase). No explanation.
 
@@ -199,13 +250,17 @@ class SubAgentFactory:
             "implement", "create", "write", "code", "build", "install", "setup",
         ],
         "reviewer": [
-            "리뷰", "검토", "검증", "확인", "review", "audit", "check", "verify",
+            "리뷰", "검토", "review", "audit",
         ],
         "fixer": [
             "수정", "fix", "bug", "오류", "에러", "디버그", "debug", "repair", "실패",
         ],
         "researcher": [
             "조사", "탐색", "찾", "search", "research", "find", "explore",
+        ],
+        "verifier": [
+            "테스트", "검증", "확인", "빌드", "실행",
+            "test", "verify", "check", "build", "run test", "validate",
         ],
     }
 
@@ -261,12 +316,20 @@ class SubAgentFactory:
 
     @staticmethod
     def build_system_prompt(instance: SubAgentInstance) -> str:
-        """Generate the full system prompt for an instance from its role template."""
+        """Generate the full system prompt for an instance from its role template.
+
+        The prompt includes the actual tool list so the LLM knows exactly
+        which tools are available and does not hallucinate non-existent ones.
+        """
         template = ROLE_TEMPLATES.get(instance.role)
+        tools_str = ", ".join(instance.tools) if instance.tools else "none"
         if template is None:
-            # Fallback: generic prompt
             return (
                 f"You are a helpful coding agent.\n\nTask: {instance.task_summary}\n\n"
-                "Complete the task using the tools available to you."
+                f"Available tools: {tools_str}\n"
+                "Complete the task using ONLY the tools listed above.\n"
+                + _FORK_RULES
             )
-        return template.system_prompt_template.format(task_summary=instance.task_summary)
+        # Two-stage format: first inject {tools}, then {task_summary}
+        prompt_with_tools = template.system_prompt_template.format(tools=tools_str)
+        return prompt_with_tools.format(task_summary=instance.task_summary)

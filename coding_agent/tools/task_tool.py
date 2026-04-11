@@ -92,11 +92,19 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
             )
 
             if result.success:
-                parts = [result.output]
+                # Fix 3: Return structured summary, not raw SubAgent output.
+                # Distinguish COMPLETED vs INCOMPLETE so the Orchestrator
+                # knows whether to continue the same phase or move on.
+                is_incomplete = "[INCOMPLETE" in result.output
+                status = "INCOMPLETE" if is_incomplete else "COMPLETED"
+                parts = [
+                    f"[Task {status} — {agent_type}]",
+                    result.output,
+                ]
                 if result.written_files:
-                    parts.append(f"\n\nFiles written: {', '.join(result.written_files)}")
-                parts.append(f"\n[Duration: {result.duration_s:.1f}s]")
-                return "".join(parts)
+                    parts.append(f"Files written: {', '.join(result.written_files)}")
+                parts.append(f"[Duration: {result.duration_s:.1f}s]")
+                return "\n".join(parts)
             else:
                 return f"SubAgent failed: {result.error or 'unknown error'}"
 

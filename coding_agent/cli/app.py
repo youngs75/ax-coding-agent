@@ -181,6 +181,11 @@ async def _run_agent_streaming(user_input: str) -> None:
 
     console.print(f"  [dim]{ICON_THINK} thinking...[/dim]", end="\r")
 
+    # Fix 4: Track SubAgent nesting depth to filter internal events.
+    # When _subagent_depth > 0, we're inside a SubAgent — suppress
+    # internal LLM streaming and most tool events to avoid CLI noise.
+    _subagent_depth = 0
+
     try:
         async for event in graph.astream_events(
             initial_state, version="v2", config={"recursion_limit": 500}
@@ -189,12 +194,42 @@ async def _run_agent_streaming(user_input: str) -> None:
             name = event.get("name", "")
             data = event.get("data", {})
 
-            # ── 도구 호출 시작 ──
+            # ── SubAgent 위임 감지 ──
+            if kind == "on_tool_start" and name == "task":
+                _subagent_depth += 1
+                tool_input = data.get("input", {})
+                desc = tool_input.get("description", "")[:60] if isinstance(tool_input, dict) else ""
+                agent_type = tool_input.get("agent_type", "auto") if isinstance(tool_input, dict) else "auto"
+                print_delegate(agent_type, desc)
+                continue
+
+            if kind == "on_tool_end" and name == "task":
+                _subagent_depth = max(0, _subagent_depth - 1)
+                # Show SubAgent completion with brief result
+                output = data.get("output", "")
+                output_str = str(output.content) if hasattr(output, "content") else str(output)
+                # Show first line (the [Task COMPLETED] header)
+                first_line = output_str.split("\n")[0][:120] if output_str else ""
+                print_tool_result(name, first_line, is_error=False)
+                continue
+
+            # ── Fix 4: Suppress SubAgent internal events ──
+            if _subagent_depth > 0:
+                # Only count iterations inside SubAgent (for progress display)
+                if kind == "on_chat_model_start":
+                    iteration += 1
+                    console.print(
+                        f"\r  [dim]{ICON_THINK} SubAgent working... (step {iteration})[/dim]",
+                        end="\r",
+                    )
+                # Skip all other SubAgent internal events
+                continue
+
+            # ── 도구 호출 시작 (Orchestrator only) ──
             if kind == "on_tool_start":
                 tool_input = data.get("input", {})
                 brief = ""
                 if isinstance(tool_input, dict):
-                    # 파일 경로나 명령어를 간략히 표시
                     brief = tool_input.get("path", "")
                     if not brief:
                         brief = tool_input.get("command", "")
@@ -204,7 +239,7 @@ async def _run_agent_streaming(user_input: str) -> None:
                         brief = tool_input.get("description", "")[:60]
                 print_tool_call(name, brief)
 
-            # ── 도구 호출 완료 ──
+            # ── 도구 호출 완료 (Orchestrator only) ──
             elif kind == "on_tool_end":
                 output = data.get("output", "")
                 output_str = str(output.content) if hasattr(output, "content") else str(output)
@@ -212,12 +247,12 @@ async def _run_agent_streaming(user_input: str) -> None:
                 if is_error or len(output_str) > 200:
                     print_tool_result(name, output_str, is_error=is_error)
 
-            # ── LLM 호출 시작 ──
+            # ── LLM 호출 시작 (Orchestrator only) ──
             elif kind == "on_chat_model_start":
                 iteration += 1
                 console.print(f"\r  [dim]{ICON_THINK} thinking... (step {iteration})[/dim]", end="\r")
 
-            # ── LLM 스트리밍 토큰 ──
+            # ── LLM 스트리밍 토큰 (Orchestrator only) ──
             elif kind == "on_chat_model_stream":
                 chunk = data.get("chunk", None)
                 if chunk and hasattr(chunk, "content") and chunk.content:
@@ -229,15 +264,7 @@ async def _run_agent_streaming(user_input: str) -> None:
             elif kind == "on_chain_end" and name in (
                 "extract_memory", "extract_memory_final"
             ):
-                # 메모리 추출 완료 시
                 pass
-
-            # ── SubAgent 위임 감지 ──
-            elif kind == "on_tool_start" and name == "task":
-                tool_input = data.get("input", {})
-                desc = tool_input.get("description", "")[:60] if isinstance(tool_input, dict) else ""
-                agent_type = tool_input.get("agent_type", "auto") if isinstance(tool_input, dict) else "auto"
-                print_delegate(agent_type, desc)
 
     except KeyboardInterrupt:
         print_status("\n  Interrupted.", "yellow")
