@@ -3,30 +3,34 @@
 #
 # 사용법:
 #   docker build -t ax-coding-agent .
-#   docker run -it --rm --network host -v $(pwd):/workspace ax-coding-agent
+#   docker run -it --rm --network host \
+#     -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+#     -v $(pwd):/workspace ax-coding-agent
 # ═══════════════════════════════════════════════════════════════
 
 FROM python:3.12-slim
 
+# 시스템 의존성 + gosu (사용자 전환용)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ripgrep tree \
+    git curl ripgrep tree gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# 소스 + .env 복사
 COPY pyproject.toml ./
 COPY coding_agent/ ./coding_agent/
-COPY tests/ ./tests/
 COPY .env ./
+COPY entrypoint.sh ./
 
-RUN pip install --no-cache-dir -e .
-RUN mkdir -p /app/memory_store /workspace
+RUN pip install --no-cache-dir -e . \
+    && mkdir -p /app/memory_store /workspace \
+    && chmod +x /app/entrypoint.sh
 
-# 환경변수: .env에서 로드되므로 최소한만 설정
 ENV PYTHONUNBUFFERED=1
 ENV MEMORY_DB_PATH=/app/memory_store/memory.db
 
 WORKDIR /workspace
 
-ENTRYPOINT ["python", "-m", "coding_agent.cli.app"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["/workspace"]

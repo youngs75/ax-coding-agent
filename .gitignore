@@ -9,3 +9,4 @@ dist/
 build/
 memory_store/*.db
 .claude/
+.ax-agent/

@@ -267,7 +267,14 @@ async def _run_agent_simple(user_input: str) -> None:
 # ── 메인 루프 ──
 
 async def _async_main() -> None:
+    # 로깅 초기화 (콘솔은 깨끗하게, 디버그는 파일로)
+    from coding_agent.logging_config import setup_logging
+    log_file = setup_logging(os.getcwd())
+
     print_welcome()
+
+    if log_file:
+        console.print(f"  [dim]logs: {log_file}[/dim]")
 
     # 작업 디렉토리 표시
     cwd = os.getcwd()
