@@ -218,6 +218,20 @@ async def _run_agent_streaming(user_input: str) -> None:
     elapsed = time.time() - start_time
     console.print(f"\r{'':80}")  # 클리어
 
+    # ── 최종 응답 정리: LLM이 섞어 넣은 JSON 메모리 블록 제거 ──
+    import re
+    # [{"layer":...}] 형태의 JSON 배열 제거
+    final_content = re.sub(
+        r'\[\s*\{["\']layer["\'].*?\}\s*\]',
+        '',
+        final_content,
+        flags=re.DOTALL,
+    )
+    # ```tool_call ... ``` 블록 제거 (프롬프트 기반 도구 호출 잔여물)
+    final_content = re.sub(r'```tool_call\s*\n?.*?\n?```', '', final_content, flags=re.DOTALL)
+    # 연속 빈 줄 정리
+    final_content = re.sub(r'\n{3,}', '\n\n', final_content).strip()
+
     # ── 최종 응답 출력 ──
     if final_content.strip():
         print_response(final_content)
