@@ -239,6 +239,9 @@ class AgentLoop:
 
         def check_progress(state: AgentState) -> dict[str, Any]:
             """진전 감시 노드."""
+            nonlocal _consecutive_errors
+            _consecutive_errors = 0  # 도구 실행 성공 → 에러 카운터 리셋
+
             messages = state.get("messages", [])
             iteration = state.get("iteration", 0)
 
@@ -265,18 +268,42 @@ class AgentLoop:
 
             return {}
 
+        _consecutive_errors = 0
+        _MAX_CONSECUTIVE_ERRORS = 3
+
         def handle_error(state: AgentState) -> dict[str, Any]:
-            """에러 처리 노드."""
+            """에러 처리 노드.
+
+            같은 에러가 연속으로 _MAX_CONSECUTIVE_ERRORS번 발생하면
+            재시도하지 않고 즉시 안전 중단한다.
+            """
+            nonlocal _consecutive_errors
+            _consecutive_errors += 1
+
             error_info = state.get("error_info", {})
             error = error_info.get("exception") or Exception(
                 error_info.get("error", "unknown")
             )
+
+            # 연속 에러 한도 초과 → 즉시 중단
+            if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                log.error(
+                    "error_handler.consecutive_limit",
+                    count=_consecutive_errors,
+                    error=str(error)[:200],
+                )
+                return {
+                    "error_info": {},
+                    "exit_reason": f"consecutive_errors_{_consecutive_errors}",
+                }
+
             resolution = self._error_handler.handle(error, state)
 
             log.info(
                 "error_handler.resolution",
                 action=resolution.action,
                 status=resolution.status_message,
+                consecutive=_consecutive_errors,
             )
 
             result: dict[str, Any] = {"error_info": {}}
