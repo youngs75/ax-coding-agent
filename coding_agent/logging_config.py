@@ -88,7 +88,7 @@ def setup_logging(workspace: str | None = None) -> Path | None:
         ),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(
-            file=open(str(log_file), "a", encoding="utf-8") if log_file else sys.stderr
+            file=open(str(log_file), "a", encoding="utf-8", buffering=1) if log_file else sys.stderr
         ),
         cache_logger_on_first_use=True,
     )
