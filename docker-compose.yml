@@ -69,6 +69,7 @@ services:
   # ── AI Coding Agent ──
   agent:
     build: .
+    image: ax-coding-agent           # ax-agent.sh가 이 이름으로 docker run 직접 호출
     container_name: ax-coding-agent
     stdin_open: true
     tty: true

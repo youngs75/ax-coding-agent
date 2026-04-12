@@ -28,6 +28,22 @@ model_list:
       model: claude-sonnet-4-20250514
       api_key: os.environ/ANTHROPIC_API_KEY
 
+  # Claude 4.6 세대 (직접 호출)
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
   # ═══════════════════════════════════════════════
   #  DashScope (Qwen 공식 API)
   # ═══════════════════════════════════════════════
@@ -55,6 +71,46 @@ model_list:
       model: dashscope/qwen3-coder-next
       api_key: os.environ/DASHSCOPE_API_KEY
       api_base: os.environ/DASHSCOPE_BASE_URL
+
+  # ═══════════════════════════════════════════════
+  #  z.ai (GLM 공식 API — 직접 호출)
+  #  Standard endpoint:  https://api.z.ai/api/paas/v4
+  #  Coding endpoint:    https://api.z.ai/api/coding/paas/v4
+  #  OpenAI-compatible, ZAI_API_KEY 필요
+  # ═══════════════════════════════════════════════
+
+  # 최신 flagship (일반 엔드포인트)
+  - model_name: z-ai/glm-5.1
+    litellm_params:
+      model: openai/glm-5.1
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+
+  # 최신 flagship (코딩 전용 엔드포인트 — STRONG tier 권장)
+  - model_name: z-ai/glm-5.1-coding
+    litellm_params:
+      model: openai/glm-5.1
+      api_base: https://api.z.ai/api/coding/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+
+  # 이전 세대
+  - model_name: z-ai/glm-4.6
+    litellm_params:
+      model: openai/glm-4.6
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+
+  - model_name: z-ai/glm-4.5
+    litellm_params:
+      model: openai/glm-4.5
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
+
+  - model_name: z-ai/glm-4.5-air
+    litellm_params:
+      model: openai/glm-4.5-air
+      api_base: https://api.z.ai/api/paas/v4
+      api_key: os.environ/ZAI_API_KEY
 
   # ═══════════════════════════════════════════════
   #  OpenRouter (다중 모델 라우터)

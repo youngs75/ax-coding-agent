@@ -17,15 +17,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 소스 + .env 복사
+# 소스 복사 + .env 복사
+# NOTE: .env는 선택적 (없으면 .env.example을 fallback으로 복사).
+#   - 권장: docker build 전에 `cp .env.example .env` 후 API 키 입력
+#   - 대안: .env.example 기본값으로 빌드 후 runtime에 `-e KEY=value`로 주입
+# COPY .env* 는 .env와 .env.example 둘 다 매칭하지만,
+# .env가 없을 때도 빌드가 실패하지 않도록 .env.example을 항상 복사한 뒤
+# .env가 없으면 .env.example을 .env로 복제한다.
 COPY pyproject.toml ./
 COPY coding_agent/ ./coding_agent/
-COPY .env ./
+COPY .env.example ./
+COPY .env* ./
 COPY entrypoint.sh ./
 
 RUN pip install --no-cache-dir -e . \
     && mkdir -p /app/memory_store /workspace \
-    && chmod +x /app/entrypoint.sh
+    && chmod +x /app/entrypoint.sh \
+    && if [ ! -f /app/.env ] && [ -f /app/.env.example ]; then \
+         cp /app/.env.example /app/.env; \
+         echo "⚠ .env not found, copied .env.example — override API keys via docker run -e"; \
+       fi
 
 ENV PYTHONUNBUFFERED=1
 ENV MEMORY_DB_PATH=/app/memory_store/memory.db
