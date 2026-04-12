@@ -16,7 +16,7 @@ ax_advanced_coding_ai_agent/
 │   ├── tools/                      # 도구 시스템 (파일, 셸, SubAgent 위임)
 │   ├── cli/                        # 대화형 CLI (Rich + prompt-toolkit)
 │   └── utils/                      # 유틸리티 (Langfuse 트레이스 추출 등)
-├── tests/                          # 유닛 테스트 (231개, 8차 세션 기준)
+├── tests/                          # 유닛 테스트 (235개, 9차 세션 기준)
 ├── memory_store/                   # SQLite 메모리 DB (런타임 생성)
 ├── docker-compose.yml              # 풀스택 배포 (Agent + LiteLLM + Langfuse)
 ├── Dockerfile                      # 에이전트 Docker 이미지

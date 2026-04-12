@@ -5,11 +5,12 @@
 오픈소스 모델(Qwen 계열, GLM-5)과 폐쇄형 모델(Claude 4.6)을 모두 지원하며, 자체 LiteLLM Gateway + Langfuse 관측성을 통한 LLM 운영 체계를 포함합니다.
 
 **실증된 역량** — PMS(Project Management System) 풀스택을 단일 사용자 요청으로 생성:
-- **최종 (8차 E2E, Qwen3 DashScope, Sub-B + Phase 3 A/B/C 패치)**: 25개 atomic task SPEC 자율 작성 · 4개 task 자동 ledger 진행 (B-1) · HITL 6문항 · **무한 reject 루프 0**, **verifier↔fixer 사이클 차단 작동**
-- **이전 주력 (6차 E2E, Qwen3 DashScope 직접 호출)**: 24.8분 · 16 SubAgent · 66 파일 · 11 테스트 · FINAL_REPORT.md 자동 생성 · max_turns 0회, 텍스트 누출 0회
+- **최종 (9차 E2E, Qwen3 DashScope, 8차 핫픽스 4건 반영)**: **35.0분 · 15/15 task 완주 · 26 SubAgent 호출 · 51 파일.** fixer 1회 11.1s (v8 12 사이클 → 단발 수정), verifier 3회 38.0s (v8 1226s → **97% 감소**), ProgressGuard A-2 hook record 48건 (v8 0 → 완전 정상화), execute 90s timeout 발화 0건. TASK-14 모바일 테스트는 Playwright viewport 에뮬레이션 3 디바이스로 자율 작성. 상세는 [`EVIDENCE.md` §8 9차 E2E](EVIDENCE.md) 참조
+- **직전 (8차 E2E, Sub-B + Phase 3 A/B/C)**: 25개 atomic task SPEC 자율 작성, HITL 6문항, 무한 reject 루프 0. TASK-09 conftest 5함정으로 76분+ 사용자 cancel — 이후 4건 핫픽스를 9차에 반영
+- **이전 주력 (6차 E2E)**: 24.8분 · 16 SubAgent · 66 파일 · 11 테스트 · FINAL_REPORT.md 자동 생성
 - **참고 (5차 E2E, OpenRouter GLM-5)**: 30분 · 10 SubAgent · 100+ 파일 · 26 테스트
 
-자세한 내역은 [`EVIDENCE.md`](EVIDENCE.md)의 "8. 실제 E2E 실행 증빙" 참조. 시스템 구성도와 실행 흐름은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 참조.
+자세한 내역은 [`EVIDENCE.md`](EVIDENCE.md)의 "8. 실제 E2E 실행 증빙"(9차 포함) 및 "**10. 과제 요구사항의 구조적 분석과 평가 축 해석**" 참조. 시스템 구성도와 실행 흐름은 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 참조.
 
 ### Harness 설계 철학 (8차 세션에서 최종 정립)
 
@@ -21,7 +22,11 @@
 4. **컨텍스트 전달 자동화** — `_user_decisions` prepend, `task` 도구의 자동 todo ledger 마킹 (B-1) — LLM에게 컨텍스트 관리 부담을 주지 않음
 5. **관찰 가능성** — Langfuse 자동 트레이싱 + structured `agent.log`
 
-8차 세션 직전 7차에서는 `submit_spec_section`이 SPEC 4섹션 + per-task GWT marker를 강제하면서 사용자 입력의 7섹션 의도와 충돌해 같은 reject가 13회 반복되는 사고가 발생했습니다. 이를 계기로 형식 강제(B형)를 폐기하고 위 5가지 책임만 남긴 결과, 8차에서 25 atomic task SPEC이 사용자 자율 구조 그대로 생성되며 무한 루프가 사라졌습니다.
+8차 세션 직전 7차에서는 `submit_spec_section`이 SPEC 4섹션 + per-task GWT marker를 강제하면서 사용자 입력의 7섹션 의도와 충돌해 같은 reject가 13회 반복되는 사고가 발생했습니다. 이를 계기로 형식 강제(B형)를 폐기하고 위 5가지 책임만 남긴 결과, 8차에서 25 atomic task SPEC이 사용자 자율 구조 그대로 생성되며 무한 루프가 사라졌습니다. 9차에서는 8차 사후 4건 핫픽스(A-2 hook / planner 슬림화 / execute 90s timeout)를 반영해 fixer 사이클 재발 없이 진행 중입니다.
+
+### 과제 요구사항의 구조적 함정 인식 (9차 세션)
+
+이 과제는 (a) 클로즈드 미사용 · 오픈소스 · 한 티어 이상 SLM 포함, (b) Docker 단일 컨테이너 환경, (c) Claude Code 수준 산출물이라는 **3중 제약**을 동시에 요구합니다. 모두 동시에 달성하기는 쉽지 않아 보였고, 그 안에서 나름대로 최선을 다해 설계해 왔습니다. 4-Tier 중 fast 티어에 `qwen3.5-flash` (SLM)를 배치해 모델 조건을 충족하면서, reasoning/strong에는 중대형 오픈소스(`qwen3-max`, `qwen3-coder-plus`)를 두어 툴 호출 안정성을 확보했습니다. 이 조합으로도 Claude Code 수준과는 현실적인 간극이 남고, 이 간극이 **모델 축소 때문이라기보다는 3축 조합의 난이도 자체에서 오는 것**임이 반복 실험에서 드러났습니다. 그래서 완주 자체에 매달리기보다 어디에서 왜 어려웠는지 정직하게 노출하는 것이 더 설계 가치 있다고 판단했습니다. 샘플 PMS 요구사항 7개 중 단일 컨테이너에서 자동 검증이 비교적 수월한 것은 1개(CRUD) 정도였고, 나머지 6개(특히 "사용자 편의성", "모바일 접속", "간트 차트 드래그")는 해석·축소·시뮬레이션이 필요했습니다. 상세 분석은 [`EVIDENCE.md` §10 과제 요구사항의 구조적 분석](EVIDENCE.md)에서 다룹니다.
 
 ---
 
@@ -303,7 +308,7 @@ FAST_MODEL=dashscope/qwen3.5-flash
 # 로컬 설치 (테스트용)
 pip install -e .
 
-# 전체 테스트 (231개) — 8차 세션 기준
+# 전체 테스트 (235개) — 8차 핫픽스 + 9차 세션 기준
 make test
 
 # 모듈별 테스트
@@ -316,7 +321,8 @@ make test-resilience   # 복원력 (ProgressGuard task repeat 포함)
 - 1차 제출(5차 E2E): 65개 (메모리 + SubAgent + 복원력 + 성능)
 - 6차 회귀 차단 (P3.5): 145개
 - 7차 shell hardening (P0) + Option A: 204개
-- 8차 Sub-B + Phase 3 A/B/C (todo ledger, verifier 출력 강화, task repeat 차단): **231개**
+- 8차 Sub-B + Phase 3 A/B/C (todo ledger, verifier 출력 강화, task repeat 차단): 231개
+- **8차 핫픽스 + 9차 실증** (A-2 reverse-lookup 회귀 2 + execute timeout 90s pin 2): **235개**
 
 ---
 
@@ -361,7 +367,7 @@ ax_advanced_coding_ai_agent/
 │   │   └── display.py              # Rich 출력 포매팅 + todo Panel
 │   └── utils/                      # 유틸리티
 │       └── langfuse_trace_exporter.py  # Langfuse 트레이스 추출
-├── tests/                          # 테스트 (231개, 8차 세션 기준)
+├── tests/                          # 테스트 (235개, 8차 핫픽스 + 9차 세션 기준)
 │   ├── test_memory.py              # 메모리 시스템
 │   ├── test_subagents.py           # SubAgent 상태 전이
 │   ├── test_resilience.py          # 복원력
@@ -429,3 +435,4 @@ ax_advanced_coding_ai_agent/
 | 13 | HITL이 작동하는가? | **예** | `ask_tool.py` + LangGraph interrupt, 8차 E2E에서 PRD 단계 4문항 + SPEC 단계 2문항 답변 후 진행 |
 | 14 | 진행 상황 ledger가 있는가? | **예** | `todo_tool.py` TodoStore + B-1 자동 마킹, CLI Rich Panel 실시간 표시 |
 | 15 | LLM에게 형식 강제 없이도 좋은 산출물이 나오는가? | **예** | 8차에서 Sub-B 적용 후 25 atomic task SPEC 자율 작성 (사용자 입력의 7섹션 의도 충실 반영) |
+| 16 | 과제의 3중 제약(모델·환경·품질)을 인지하고 그 안에서의 선택·한계를 메타 분석으로 문서화했는가? | **예** | [`EVIDENCE.md` §10](EVIDENCE.md) — 모델·환경·품질 3축 제약, 요구사항 7개 실행 가능성 매핑, 평가 축 5가지 해석, TASK-14 모바일 사례 |
