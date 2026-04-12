@@ -299,16 +299,187 @@ python -m coding_agent.utils.langfuse_trace_exporter --trace <trace-id> -v
 
 ---
 
-## 8. 아직 남아 있는 한계
+## 8. 실제 E2E 실행 증빙 (PMS 프로젝트 생성)
+
+### 시나리오
+단일 사용자 요청 (PMS 시스템 — PRD → SPEC → TDD 구현)으로 다섯 차례 E2E 실행을 수행하고, 매 실행마다 근본 원인 수정을 반영했다.
+
+### 실행 이력
+
+| # | 모델 | 환경 | 결과 | 핵심 개선 |
+|---|------|------|------|---------|
+| 1차 | DashScope Qwen | 최초 빌드 | list_directory 오류 96회, 텍스트 반복 726회, safe_stop | 도구 목록 프롬프트 주입, Fork Rules |
+| 2차 | DashScope Qwen | SubAgent 트림 | coder 1개 완료, 50턴 소진 | 트림 제거, INCOMPLETE 시그널 |
+| 3차 | DashScope Qwen | Fork Rules 수정 | 완료, 60개 파일, safe_stop | SubAgent 턴 제어 |
+| 4차 | DashScope Qwen | Orchestrator 도구 제한 | **14.7분 완료**, 33개 파일, SPEC 7/7 작업 구현 | Orchestrator에 write_file/execute 차단 |
+| 5차 | OpenRouter GLM-5 + Qwen | CLI 개선, 도구 제한 | ~35분, 100+ 파일, FS+BE 풀스택, 26+ 테스트 파일 | 프론트엔드/백엔드 동시 생성 |
+| **6차** | **DashScope Qwen3 직접 호출** | max_turns=100, LLM_TIMEOUT=600, 스피너 개선 | **24.8분, 16 SubAgent, 66 파일, 11 테스트, 자체 완료 보고서 생성** | 검증 사이클 완주, FINAL_REPORT.md 자동 생성 |
+
+### 5차 E2E 결과 (GLM5 기반)
+
+**SubAgent 파이프라인** (10개 SubAgent, 29분):
+
+| # | 역할 | 작업 | 시간 | 파일 |
+|---|------|------|------|------|
+| 1 | planner (reasoning) | PRD 작성 | 72.5s | 1 |
+| 2 | planner (reasoning) | SPEC 작성 (DB 스키마) | 141.6s | 1 |
+| 3 | coder (strong) | 백엔드 초기화 + DB 스키마 (TDD) | 378.6s | 29 |
+| 4 | coder (strong) | 프로젝트 CRUD API | 190.3s | 7 |
+| 5 | coder (strong) | 사용자 관리 API | 176.9s | 16 |
+| 6 | coder (strong) | 간트 차트 API | 155.7s | 8 |
+| 7 | coder (strong) | 프론트엔드 초기화 + 목록 페이지 | 209.3s | 33 |
+| 8 | coder (strong) | 프로젝트 상세/생성/수정 폼 | 473.1s (50턴) | 5 |
+| 9 | coder (strong) | 간트 차트 컴포넌트 | 325.1s | 6 |
+
+**총 100+ 파일 생성** (backend + frontend + docs + 26개 테스트)
+
+**아키텍처 증빙**:
+- 4-Tier 모델 자동 활용: `reasoning=GLM5`, `strong=GLM5`, `default=qwen3-coder`, `fast=qwen3.5-flash`
+- Orchestrator 직접 도구 호출 0회 (전부 SubAgent 위임)
+- max_turns 도달 1회 (coder #8) — 이후 100으로 상향
+- 텍스트 누출 0회 (`final_content` 매 iteration 리셋)
+- CLI 트리 구조로 위임 계층 실시간 가시화
+
+### 산출물 품질 (5차 E2E)
+
+```
+new_pms_glm/
+├── docs/
+│   ├── PRD.md    (18.7KB, 590줄)
+│   └── SPEC.md   (11.5KB, 8개 테이블 ERD + 인덱스)
+├── backend/      (NestJS + Prisma + PostgreSQL)
+│   ├── prisma/
+│   ├── src/
+│   │   ├── controllers, services, routes, models, middleware
+│   │   ├── tests/ (15+ 테스트 파일)
+│   └── package.json, Dockerfile
+├── frontend/     (React + Vite + TypeScript)
+│   ├── src/
+│   │   ├── components, pages, hooks, services, utils
+│   │   ├── tests/ (10+ 테스트 파일)
+│   └── package.json, vite.config.ts
+└── docker-compose.yml
+```
+
+### 6차 E2E 상세 (주력 제출 대상)
+
+**구성**:
+- REASONING/STRONG/DEFAULT/FAST 모두 DashScope 직접 호출
+- `qwen3-max`, `qwen3-coder-next`, `qwen3.5-plus`, `qwen3.5-flash`
+- 병렬로 z.ai GLM-5.1도 시도했으나 reasoning 모드 특성상 단일 LLM 호출이 600초+ → 타임아웃 → 중단
+
+**SubAgent 파이프라인** (16개, 24.8분):
+
+| # | 역할 | 작업 | 시간 | 파일 |
+|---|------|------|------|------|
+| 1 | planner | PRD 작성 | 42.3s | 1 |
+| 2 | planner | SPEC 작성 | 85.4s | 1 |
+| 3 | coder | 백엔드 구조 초기화 | 109.9s | **24** |
+| 4 | coder | 프로젝트 CRUD API | 146.9s | 18 |
+| 5 | coder | 프로젝트 조회 API | 64.9s | 0 |
+| 6 | verifier | 환경 검증 | 13.5s | 0 |
+| 7 | reviewer | 백엔드 리뷰 | 63.2s | 0 |
+| 8 | fixer | 누락 기능 수정 | 28.0s | 0 |
+| 9 | coder | 간트 차트 API (TDD) | 124.3s | 5 |
+| 10 | coder | 프론트엔드 초기화 | 92.5s | **21** |
+| 11 | coder | 프론트엔드 프로젝트 목록 | 50.7s | 1 |
+| 12 | coder | 프론트엔드 간트 차트 | 20.0s | 0 |
+| 13 | verifier | 통합 검증 | 3.9s | 0 |
+| 14 | reviewer | 종합 코드 리뷰 | 115.0s | 0 |
+| 15 | **fixer** | reviewer 이슈 수정 | **261.2s** | 1 |
+| 16 | reviewer | 최종 품질 검증 | 85.9s | 0 |
+| 17 | **planner** | **FINAL_REPORT.md 자동 생성** | 64.4s | 1 |
+
+**지표 요약**:
+- 총 시간: **24.8분** (1,485.8s)
+- Orchestrator 반복: 23회 (max_iterations=50 내)
+- **Orchestrator 직접 도구 호출: 0회**
+- **max_turns 도달: 0회**
+- **텍스트 누출: 0회**
+- 실패한 SubAgent: 0개 (전원 success=True)
+- Langfuse 트레이스: 100개, 평균 latency 5.34s, 총 비용 $0.37 (OpenRouter 부분만 계측)
+
+**자체 검증 사이클 작동 증거**:
+SubAgent #14(reviewer) → #15(fixer, 261s) → #16(reviewer 최종) → #17(planner FINAL_REPORT)
+이 4단계 검증 체인이 자동으로 돌며, FINAL_REPORT.md에 **완료/부분완료/미완료 체크리스트**를 정직하게 기록.
+
+### 6차 산출물 구조 (총 66 파일)
+
+```
+new_pms_qwen/
+├── docs/
+│   ├── PRD.md              (2.4KB)
+│   ├── SPEC.md             (5.0KB, API-PROJ-01~05, API-GANTT-01~02, UI 명세)
+│   ├── SETUP.md
+│   ├── FINAL_REPORT.md     ← 자체 완료 보고서 (체크리스트 + 누락 사항)
+│   └── api-spec/README.md
+├── backend/                (Node.js + TypeScript + Express)
+│   ├── src/
+│   │   ├── controllers/    (project, gantt, user)
+│   │   ├── services/       (project, gantt, user)
+│   │   ├── routes/         (4개)
+│   │   ├── models/         (project.entity, user.entity)
+│   │   ├── utils/          (middleware, response)
+│   │   └── server.ts
+│   ├── __tests__/          ← 11개 테스트 파일 (project 5개, models, utils, health, etc.)
+│   ├── db/                 (database.ts, schema.ts)
+│   └── package.json, jest.config.js, tsconfig.json, README.md
+├── frontend/               (Next.js + React + TypeScript + Tailwind)
+│   ├── src/
+│   │   ├── app/            (layout, page, gantt, projects)
+│   │   ├── pages/          (_app, index, gantt, projects)
+│   │   ├── components/     (common: Button/Input/Modal, layout)
+│   │   ├── lib/api.ts
+│   │   └── styles/globals.css
+│   ├── package.json, tsconfig.json, tailwind.config.js
+│   └── README.md
+└── IMPLEMENTATION_SUMMARY.md
+```
+
+**SPEC 완료도** (FINAL_REPORT.md에 기록, 자체 평가):
+| 기능 | 완료도 |
+|------|-------|
+| API-PROJ-01~05 (CRUD) | **100%** |
+| API-GANTT-01 (조회) | **100%** |
+| API-GANTT-02 (갱신) | 70% (순환 의존성 단순화) |
+| UI-PROJ-LIST-01 | 60% (API 연동 미구현) |
+| UI-GANTT-01 | 70% (API 연동 미구현) |
+| UI-RESP-01 (반응형) | 20% (Tailwind 설정만) |
+
+### Claude 4.6 비교 실행 (참고, 중단)
+
+Claude Opus + Sonnet 4.6 구성으로도 병행 테스트 시도 (`ax-agent-claude`):
+- planner (Opus): PRD 290s → SPEC **530s (2,963줄, 12개 원자 태스크)** — Opus가 SDD 요구사항을 훨씬 정확히 이해
+- coder #1 (Sonnet) TASK-001: 12분 경과 후 50턴 MAX (단일 태스크에 NestJS + Next.js 풀스택 초기화가 들어있어 과부하)
+- 총 2개 Phase에 20분+ 소요, 마감 시간 제약으로 중단
+
+### z.ai GLM-5.1 비교 실행 (참고, 중단)
+
+z.ai BigModel API 직접 호출로 GLM-5.1 reasoning 모델 시도:
+- planner PRD 250.5s — 완료
+- planner SPEC **658초 후 LLM 단일 호출이 600초 timeout** → retry 2회 후 실패
+- 원인: GLM-5.1이 reasoning 모델이라 thinking tokens이 단일 호출에서 600초를 초과
+- Qwen3(DashScope)와의 속도 격차가 큼: PRD 42s vs 250s
+
+**Reasoning 모델 공통 관찰** (Claude Opus, z.ai GLM-5.1):
+- SPEC 작성 품질은 매우 높음 (Opus의 경우 12개 원자 태스크 분해)
+- 하지만 단일 LLM 호출이 매우 길어 harness의 turn limit / timeout과 충돌
+- **현재 harness는 non-reasoning 모델(Qwen3, OpenRouter GLM-5)과 더 잘 맞음**
+- 다음 세션 개선 과제: harness 레벨 출력 구조화 (DeepAgents `write_todos` 패턴)로 weaker model의 SPEC 품질 보완
+
+---
+
+## 9. 아직 남아 있는 한계
 
 1. **git worktree 기반 병렬 실행**: 설계 완료, 미구현. 현재 순차 실행만 지원.
 2. **메모리 정정 UI**: `/memory delete`로 삭제 가능하나, 충돌 시 자동 정정 로직은 미구현.
 3. **HITL (Human-in-the-Loop)**: Planner 계획 승인 후 실행하는 interrupt 미구현.
-4. **프론트엔드 산출물**: PMS E2E 테스트 시 백엔드 위주로 생성됨. 프론트엔드는 추가 실행 필요.
+4. **Harness 레벨 출력 구조화**: 약한 모델이 SPEC 작성 시 일부 섹션 누락 가능. DeepAgents의 `write_todos` 패턴 / Codex의 `update_plan` 패턴 도입 필요 (다음 세션 백로그).
+5. **모델 적응적 turn limit**: 현재 고정 100턴. 모델 역량에 따라 동적 조정 필요.
 
 ---
 
-## 9. 테스트 실행
+## 10. 테스트 실행
 
 ```bash
 # 전체 테스트 (65개)
@@ -321,4 +492,39 @@ make test-resilience   # 복원력 (21개)
 
 # 성능 최적화 테스트 (18개) — tests/test_performance.py
 python -m pytest tests/test_performance.py -v
+```
+
+---
+
+## 11. E2E 재현 절차
+
+### 요구 사항
+- Docker + Docker Compose
+- `.env`에 OpenRouter 또는 DashScope API 키
+
+### 실행
+
+```bash
+# 1. LiteLLM Gateway 기동 (OpenRouter/DashScope/Anthropic 통합)
+docker compose up -d litellm
+
+# 2. 에이전트 실행 (워크스페이스 지정)
+./ax-agent.sh /path/to/new_workspace
+
+# 3. 대화형 CLI에서 PMS 요청 입력
+#    (PRD → SPEC → TDD 구현 프로세스 자동 수행)
+```
+
+### 결과물 검증
+
+```bash
+# 실제 생성된 파일 확인
+find /path/to/new_workspace -not -path '*/node_modules/*' -type f | head -30
+
+# SubAgent 실행 로그 확인
+cat /path/to/new_workspace/.ax-agent/logs/agent.log | head -100
+
+# Langfuse 트레이스 추출 (선택)
+python -m coding_agent.utils.langfuse_trace_exporter --list-sessions 5
+python -m coding_agent.utils.langfuse_trace_exporter --session <id> -v -o traces.md
 ```
