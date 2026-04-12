@@ -10,3 +10,6 @@ build/
 memory_store/*.db
 .claude/
 .ax-agent/
+
+# 빌드 artifact
+submission-*.zip
