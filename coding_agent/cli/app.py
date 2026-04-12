@@ -17,8 +17,11 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
 from coding_agent.cli.display import (
+    ICON_AGENT,
     ICON_THINK,
+    TREE_PIPE,
     console,
+    get_spinner,
     print_agents_table,
     print_agent_status,
     print_delegate,
@@ -31,6 +34,8 @@ from coding_agent.cli.display import (
     print_response,
     print_stall_warning,
     print_status,
+    print_subagent_done,
+    print_subagent_start,
     print_tool_call,
     print_tool_result,
     print_welcome,
@@ -178,8 +183,12 @@ async def _run_agent_streaming(user_input: str) -> None:
     final_content = ""
     iteration = 0
     shown_tools = set()
+    _sa_info: dict = {"start_time": 0.0, "steps": 0, "tools": 0}
+    spinner = get_spinner()
 
-    console.print(f"  [dim]{ICON_THINK} thinking...[/dim]", end="\r")
+    console.print()
+    console.print(f"  [bold cyan]{ICON_AGENT} Orchestrator[/bold cyan]")
+    console.print()
 
     # Fix 4: Track SubAgent nesting depth to filter internal events.
     # When _subagent_depth > 0, we're inside a SubAgent — suppress
@@ -198,31 +207,46 @@ async def _run_agent_streaming(user_input: str) -> None:
             if kind == "on_tool_start" and name == "task":
                 _subagent_depth += 1
                 tool_input = data.get("input", {})
-                desc = tool_input.get("description", "")[:60] if isinstance(tool_input, dict) else ""
+                raw_desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
+                first_line = raw_desc.split("\n")[0].strip()
+                desc = first_line[:50] + "..." if len(first_line) > 50 else first_line
                 agent_type = tool_input.get("agent_type", "auto") if isinstance(tool_input, dict) else "auto"
-                print_delegate(agent_type, desc)
+                spinner.stop()
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+                print_subagent_start(agent_type, desc)
+                _sa_info = {"start_time": time.time(), "steps": 0, "tools": 0}
+                spinner.start("initializing...")
                 continue
 
             if kind == "on_tool_end" and name == "task":
                 _subagent_depth = max(0, _subagent_depth - 1)
-                # Show SubAgent completion with brief result
+                spinner.stop()
                 output = data.get("output", "")
                 output_str = str(output.content) if hasattr(output, "content") else str(output)
-                # Show first line (the [Task COMPLETED] header)
-                first_line = output_str.split("\n")[0][:120] if output_str else ""
-                print_tool_result(name, first_line, is_error=False)
+                success = "COMPLETED" in output_str and "INCOMPLETE" not in output_str
+                elapsed = time.time() - _sa_info.get("start_time", time.time())
+                print_subagent_done(
+                    elapsed, _sa_info["steps"], _sa_info["tools"], success,
+                )
                 continue
 
-            # ── Fix 4: Suppress SubAgent internal events ──
+            # ── SubAgent 내부 이벤트: 스피너로 표시 ──
             if _subagent_depth > 0:
-                # Only count iterations inside SubAgent (for progress display)
                 if kind == "on_chat_model_start":
-                    iteration += 1
-                    console.print(
-                        f"\r  [dim]{ICON_THINK} SubAgent working... (step {iteration})[/dim]",
-                        end="\r",
-                    )
-                # Skip all other SubAgent internal events
+                    _sa_info["steps"] += 1
+                    spinner.update(f"thinking... (step {_sa_info['steps']})")
+                elif kind == "on_tool_start" and name != "task":
+                    _sa_info["tools"] += 1
+                    tool_input = data.get("input", {})
+                    brief = ""
+                    if isinstance(tool_input, dict):
+                        brief = (
+                            tool_input.get("path", "")
+                            or tool_input.get("command", "")[:40]
+                            or tool_input.get("pattern", "")
+                        )
+                    spinner.update(f"{name} {brief}".strip()[:60])
                 continue
 
             # ── 도구 호출 시작 (Orchestrator only) ──
@@ -250,7 +274,11 @@ async def _run_agent_streaming(user_input: str) -> None:
             # ── LLM 호출 시작 (Orchestrator only) ──
             elif kind == "on_chat_model_start":
                 iteration += 1
-                console.print(f"\r  [dim]{ICON_THINK} thinking... (step {iteration})[/dim]", end="\r")
+                # Reset per-iteration content so only the LAST response
+                # is kept.  This prevents 50 iterations of internal
+                # reasoning + memory JSON from leaking into CLI output.
+                final_content = ""
+                console.print(f"\r  [dim]{ICON_AGENT} Orchestrator · step {iteration}[/dim]", end="\r")
 
             # ── LLM 스트리밍 토큰 (Orchestrator only) ──
             elif kind == "on_chat_model_stream":
@@ -258,6 +286,9 @@ async def _run_agent_streaming(user_input: str) -> None:
                 if chunk and hasattr(chunk, "content") and chunk.content:
                     content = chunk.content
                     if isinstance(content, str):
+                        # Append to current iteration's content only.
+                        # final_content is reset on each on_chat_model_start
+                        # so only the LAST response is kept for display.
                         final_content += content
 
             # ── 노드 완료 ──
@@ -267,13 +298,16 @@ async def _run_agent_streaming(user_input: str) -> None:
                 pass
 
     except KeyboardInterrupt:
+        spinner.stop()
         print_status("\n  Interrupted.", "yellow")
         return
     except Exception as e:
+        spinner.stop()
         print_error(str(e))
         return
 
     elapsed = time.time() - start_time
+    spinner.stop()
     console.print(f"\r{'':80}")  # 클리어
 
     # ── 최종 응답 정리: LLM이 섞어 넣은 JSON 메모리 블록 제거 ──

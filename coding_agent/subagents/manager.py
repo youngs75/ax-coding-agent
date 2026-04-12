@@ -40,7 +40,11 @@ from coding_agent.tools.shell import SHELL_TOOLS
 log = structlog.get_logger(__name__)
 
 # ── Fix 2: SubAgent turn limits ──────────────────────────────
-_SUBAGENT_MAX_TURNS = 50  # hard limit per SubAgent session
+# Raised from 50 → 100 after E2E showed complex tasks (frontend forms,
+# admin dashboards) legitimately needing more turns when using open-source
+# models. 50 turns hit max for 1 out of 9 coders in the GLM5 run but the
+# work was clearly valid, just unfinished.
+_SUBAGENT_MAX_TURNS = 100  # hard limit per SubAgent session
 
 # Map tool names to actual tool objects
 _ALL_TOOLS: dict[str, BaseTool] = {}

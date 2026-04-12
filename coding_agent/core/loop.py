@@ -51,6 +51,9 @@ from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
 from coding_agent.tools.task_tool import build_task_tool, build_parallel_tasks_tool
 
+# Note: FILE_TOOLS and SHELL_TOOLS are still imported for SubAgent use
+# via manager.py. Orchestrator only uses read-only subset (see __init__).
+
 log = structlog.get_logger(__name__)
 
 SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
@@ -69,15 +72,16 @@ SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
 - verifier: 테스트 실행, 빌드 확인, 구현 검증 (코드 수정 없이 검증만)
 - researcher: 기술 조사, 라이브러리 비교, 레퍼런스 탐색
 
-## 당신이 직접 할 수 있는 것
-- read_file, glob_files, grep으로 프로젝트 현황 파악
-- 전체 진행 상황 확인 및 다음 단계 결정
-- SubAgent 결과를 검토하고 후속 작업 위임
+## 당신이 사용할 수 있는 도구 (4개만)
+- read_file: 파일 내용 확인
+- glob_files: 파일 목록 검색
+- grep: 코드 내 패턴 검색
+- task: SubAgent에게 작업 위임 (유일한 실행 수단)
 
-## 당신이 직접 하면 안 되는 것
-- write_file, edit_file, execute를 직접 호출하여 코드 작성/수정/실행
-- 테스트 실행이 필요하면 verifier SubAgent에게 위임
-- 이런 작업은 반드시 task 도구로 전문 SubAgent에게 위임
+## 절대 규칙
+당신에게는 write_file, edit_file, execute 도구가 없습니다.
+코드 작성, 파일 수정, 명령 실행이 필요하면 반드시 task로 SubAgent에게 위임하세요.
+환경 설정(npm install, docker 등)도 coder 또는 verifier SubAgent에게 위임하세요.
 
 ## 복잡한 개발 요청의 작업 프로세스
 
@@ -141,7 +145,13 @@ class AgentLoop:
         # parallel_tool은 구현은 유지하되, Orchestrator가 의존성을 정확히
         # 판단하기 어려운 현재 단계에서는 비활성화.  의존성 분석이 추가되면 재활성화.
         # parallel_tool = build_parallel_tasks_tool(self._manager)
-        self._tools = FILE_TOOLS + SHELL_TOOLS + [task_tool]
+
+        # Orchestrator에는 읽기 전용 도구 + task 위임 도구만 바인딩.
+        # write_file, edit_file, execute는 SubAgent 전용 — Orchestrator가
+        # 직접 코드를 작성/수정/실행하면 23회 이상 직접 도구 호출이 발생하는
+        # 문제가 E2E에서 확인됨.  SubAgent는 manager.py에서 별도로 도구를 resolve.
+        from coding_agent.tools.file_ops import read_file, glob_files, grep
+        self._tools = [read_file, glob_files, grep, task_tool]
 
         # 그래프
         self._graph = self._build_graph()
