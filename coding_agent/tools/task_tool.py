@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import StructuredTool
@@ -13,6 +14,28 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from coding_agent.subagents.manager import SubAgentManager
+
+
+# Match the *first* TASK-NN-style identifier appearing in a delegation
+# description so the manager can auto-advance the todo ledger without
+# requiring the orchestrator LLM to remember update_todo calls. We
+# anchor on word boundaries so substrings like "TASK-04-fixup" still
+# resolve to TASK-04, and we accept 2+ digit ids to be forward-compatible.
+_TASK_ID_PATTERN = re.compile(r"\bTASK-\d{2,}\b", re.IGNORECASE)
+
+
+def _extract_task_id(description: str) -> str | None:
+    """Return the first TASK-NN id found in *description*, or None.
+
+    Always normalised to upper case so the lookup matches the canonical
+    ids stored in TodoStore (which echo whatever the planner wrote).
+    """
+    if not description:
+        return None
+    m = _TASK_ID_PATTERN.search(description)
+    if m is None:
+        return None
+    return m.group(0).upper()
 
 
 class TaskToolInput(BaseModel):
@@ -102,6 +125,13 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
                 desc=description[:80],
             )
 
+            # B-1: auto-advance the todo ledger so the orchestrator LLM
+            # does not have to remember update_todo on every delegation.
+            # Silently no-ops if the id is not in the ledger.
+            task_id = _extract_task_id(description)
+            if task_id:
+                manager.auto_advance_todo(task_id, "in_progress")
+
             result = _spawn()
 
             # ── Interrupt propagation loop ──
@@ -142,6 +172,15 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
                 # knows whether to continue the same phase or move on.
                 is_incomplete = "[INCOMPLETE" in result.output
                 status = "INCOMPLETE" if is_incomplete else "COMPLETED"
+                # B-1: when a coder finishes successfully (and not flagged
+                # as incomplete), promote the todo to completed. verifier/
+                # fixer keep it at in_progress so the cycle is visible.
+                if (
+                    task_id
+                    and not is_incomplete
+                    and agent_type in ("coder", "auto")
+                ):
+                    manager.auto_advance_todo(task_id, "completed")
                 parts = [
                     f"[Task {status} — {agent_type}]",
                     result.output,

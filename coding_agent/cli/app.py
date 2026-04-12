@@ -37,6 +37,7 @@ from coding_agent.cli.display import (
     print_status,
     print_subagent_done,
     print_subagent_start,
+    print_todo_panel,
     print_tool_call,
     print_tool_result,
     print_welcome,
@@ -51,6 +52,12 @@ def _get_loop():
     if _loop is None:
         from coding_agent.core.loop import AgentLoop
         _loop = AgentLoop()
+        # Render todo ledger as Rich Panel after every write_todos / update_todo.
+        # The callback receives ``list[TodoItem]`` directly from the tool.
+        try:
+            _loop._manager.set_todo_change_callback(print_todo_panel)
+        except Exception:
+            pass
     return _loop
 
 

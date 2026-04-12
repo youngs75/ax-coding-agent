@@ -41,7 +41,11 @@ from coding_agent.subagents.registry import SubAgentRegistry
 from coding_agent.tools.ask_tool import build_ask_user_question_tool
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
-from coding_agent.tools.spec_tool import build_submit_spec_section_tool
+from coding_agent.tools.todo_tool import (
+    TodoStore,
+    build_update_todo_tool,
+    build_write_todos_tool,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -57,14 +61,11 @@ _ALL_TOOLS: dict[str, BaseTool] = {}
 for _t in FILE_TOOLS + SHELL_TOOLS:
     _ALL_TOOLS[_t.name] = _t
 
-# Tool names whose instances must be built fresh per SubAgent invocation
-# because they own per-session state (e.g. SpecSectionStore) or must
-# capture a per-manager callback (e.g. ask_user_question → record answers).
-# The builders for manager-scoped tools are wired up in
-# SubAgentManager._resolve_tools (they need access to ``self``).
-_STATIC_DYNAMIC_TOOL_BUILDERS: dict[str, callable] = {  # type: ignore[type-arg]
-    "submit_spec_section": build_submit_spec_section_tool,
-}
+# Reserved for future per-session tool builders that own state but do
+# not need a manager callback. Currently empty — manager-scoped tools
+# (ask_user_question, write_todos/update_todo) are wired directly inside
+# SubAgentManager._resolve_tools because they need access to ``self``.
+_STATIC_DYNAMIC_TOOL_BUILDERS: dict[str, callable] = {}  # type: ignore[type-arg]
 
 
 class SubAgentManager:
@@ -87,6 +88,13 @@ class SubAgentManager:
         # prepend this list to their task description so coder/verifier
         # /fixer all see the same hard constraints the planner asked for.
         self._user_decisions: list[str] = []
+        # ── Todo ledger ──
+        # Owned by the manager so the same store survives across multiple
+        # orchestrator turns within one user session. The CLI may register
+        # an ``on_change`` callback via set_todo_change_callback to render
+        # the live ledger as a Rich Panel.
+        self._todo_store = TodoStore()
+        self._todo_change_callback = None  # type: ignore[var-annotated]
 
     # ── Decision accumulator API ─────────────────────────────
     def record_user_decision(self, formatted_answer: str) -> None:
@@ -117,13 +125,85 @@ class SubAgentManager:
         lines.append("## 작업 내용")
         return "\n".join(lines) + "\n"
 
+    # ── Todo ledger API ──────────────────────────────────────
+    def get_todo_store(self) -> TodoStore:
+        """Return the manager-owned TodoStore (for tests / CLI inspection)."""
+        return self._todo_store
+
+    def set_todo_change_callback(self, callback) -> None:
+        """Register a function called with the updated todo list after
+        each successful write_todos / update_todo invocation.
+
+        The callback must not raise — exceptions are swallowed by the tool.
+        """
+        self._todo_change_callback = callback
+
+    def auto_advance_todo(self, task_id: str, status: str) -> bool:
+        """Best-effort auto-update for a known todo id.
+
+        Used by ``task_tool`` to flip a todo to ``in_progress`` when
+        delegation starts and to ``completed`` when a coder finishes,
+        without requiring the LLM to call ``update_todo`` explicitly.
+        Silently no-ops when the id is not in the ledger so behavior
+        degrades gracefully.
+
+        Returns True when the store actually changed.
+        """
+        if not task_id:
+            return False
+        try:
+            current = self._todo_store.list_items()
+        except Exception:
+            return False
+        match = next((it for it in current if it.id == task_id), None)
+        if match is None:
+            return False
+        if match.status == status:
+            return False
+        # Don't downgrade a completed todo back to in_progress
+        if match.status == "completed" and status != "completed":
+            return False
+        try:
+            self._todo_store.update(task_id, status)  # type: ignore[arg-type]
+        except KeyError:
+            return False
+        if self._todo_change_callback is not None:
+            try:
+                self._todo_change_callback(self._todo_store.list_items())
+            except Exception:
+                pass
+        log.info(
+            "subagent.todo.auto_advance",
+            task_id=task_id,
+            status=status,
+        )
+        return True
+
+    def build_todo_tools(self) -> list[BaseTool]:
+        """Build a fresh pair of (write_todos, update_todo) tools bound
+        to the manager's store and current change callback.
+
+        The orchestrator builds these once at construction time.
+        """
+        return [
+            build_write_todos_tool(
+                store=self._todo_store,
+                on_change=self._todo_change_callback,
+            ),
+            build_update_todo_tool(
+                store=self._todo_store,
+                on_change=self._todo_change_callback,
+            ),
+        ]
+
     def _resolve_tools(self, tool_names: list[str]) -> list[BaseTool]:
         """Resolve a list of tool name strings into BaseTool instances.
 
         Static tools come from the shared registry. Dynamic tools (those
         with per-session state) are built fresh on every call so each
         SubAgent invocation gets its own store. Manager-scoped tools
-        (ask_user_question) are built with ``self`` captured in closure.
+        (ask_user_question, write_todos/update_todo) are built with
+        ``self`` captured in closure so they share the manager's stores.
         """
         resolved: list[BaseTool] = []
         for name in tool_names:
@@ -134,6 +214,22 @@ class SubAgentManager:
             if name == "ask_user_question":
                 resolved.append(
                     build_ask_user_question_tool(on_answer=self.record_user_decision)
+                )
+                continue
+            if name == "write_todos":
+                resolved.append(
+                    build_write_todos_tool(
+                        store=self._todo_store,
+                        on_change=self._todo_change_callback,
+                    )
+                )
+                continue
+            if name == "update_todo":
+                resolved.append(
+                    build_update_todo_tool(
+                        store=self._todo_store,
+                        on_change=self._todo_change_callback,
+                    )
                 )
                 continue
             tool = _ALL_TOOLS.get(name)
@@ -508,11 +604,18 @@ class SubAgentManager:
         if not messages:
             return SubAgentResult(success=False, output="", error="No messages in final state")
 
+        is_verifier = instance.role == "verifier"
+
         # Collect files written/edited (heuristic: look at tool calls)
         written_files: list[str] = []
         edited_files: list[str] = []
         executed_commands: int = 0
         tool_errors: list[str] = []
+        # A-1: For verifier we additionally capture the *raw* execute tool
+        # results (paired with their commands) so the orchestrator gets
+        # exit codes / stdout tails instead of "Commands executed: 3".
+        verifier_runs: list[dict[str, str]] = []
+        pending_execute_cmd: str | None = None
         for msg in messages:
             if hasattr(msg, "tool_calls"):
                 for tc in msg.tool_calls:
@@ -528,11 +631,24 @@ class SubAgentManager:
                             edited_files.append(path)
                     elif name == "execute":
                         executed_commands += 1
+                        if is_verifier:
+                            pending_execute_cmd = (
+                                args.get("command", "") if isinstance(args, dict) else ""
+                            )
             # Collect tool errors from ToolMessages
             if isinstance(msg, ToolMessage):
                 content_str = msg.content if isinstance(msg.content, str) else str(msg.content)
                 if "error" in content_str.lower()[:100]:
                     tool_errors.append(content_str[:150])
+                if is_verifier and pending_execute_cmd is not None:
+                    # Pair the latest execute call with this tool result.
+                    verifier_runs.append(
+                        {
+                            "command": pending_execute_cmd[:200],
+                            "result": content_str,
+                        }
+                    )
+                    pending_execute_cmd = None
 
         # Get the last AI message for a brief summary
         last_ai_content = ""
@@ -552,6 +668,25 @@ class SubAgentManager:
             summary_parts.append(f"Commands executed: {executed_commands}")
         if tool_errors:
             summary_parts.append(f"Errors encountered: {len(tool_errors)}")
+        # A-1: Verifier-only — embed each execute(command, result) so the
+        # orchestrator sees concrete exit codes / stdout tails. Without
+        # this it loops verifier→fixer→verifier on "Commands executed: N"
+        # because it has no failing test name to copy into the fixer's
+        # description, the very thing the orchestrator prompt requires.
+        if is_verifier and verifier_runs:
+            run_blocks: list[str] = ["", "## Verifier execution results"]
+            for i, run in enumerate(verifier_runs[-5:], 1):  # last 5 runs
+                cmd = run["command"]
+                res = run["result"]
+                # Keep the head (often exit code / first error line) and
+                # the tail (last assertion / traceback). Models tend to
+                # truncate the middle anyway.
+                head = res[:400]
+                tail = res[-1000:] if len(res) > 1400 else ""
+                body = head + ("\n... (truncated) ...\n" + tail if tail else "")
+                run_blocks.append(f"### Run {i}: `{cmd}`")
+                run_blocks.append(body.strip())
+            summary_parts.append("\n".join(run_blocks))
         # Include a brief excerpt of the last AI response for context
         if last_ai_content:
             summary_parts.append(f"Summary: {last_ai_content}")

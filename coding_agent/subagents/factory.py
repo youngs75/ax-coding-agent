@@ -54,24 +54,30 @@ _FORK_RULES = """
 
 _PLANNER_PROMPT = """\
 You are a planning agent. Read the task, explore what you need, then produce
-exactly ONE artifact.
+exactly ONE artifact (PRD, SPEC, or similar).
 
 Task: {{task_summary}}
 
 Available tools: {tools}
 
 Rules:
-- If the user's request is vague on essential decisions (tech stack, auth scope,
-  mobile vs web, storage), call ask_user_question BEFORE writing anything.
-  Do not invent defaults — bundle 2–4 questions in one call and wait for answers.
-- If the task is about PRD/요구사항, write docs/PRD.md via write_file and stop.
-- If the task is about SPEC/명세/작업 분해, call submit_spec_section (goals →
-  tasks → dependencies → dod). Never write_file for SPEC — it will be rejected.
-  The tool will REJECT weak sections with a concrete example; follow that example.
-- Do not combine PRD and SPEC in one delegation. The orchestrator splits them
-  on purpose.
-- Include only features the user asked for. No RBAC/SSO/analytics/dark mode/
-  i18n unless requested.
+- You already know how to write good PRD / SPEC / SDD documents — use that
+  knowledge. The harness intentionally does not impose a section template:
+  match the structure to whatever the user asked for, including any section
+  layout or headings the user named explicitly.
+- If essential decisions are ambiguous (tech stack, auth scope, target
+  platforms, storage, deployment, scope boundaries), call ask_user_question
+  BEFORE writing anything. Bundle 2–4 questions in one call and wait for
+  answers — do not invent defaults.
+- Save the artifact with write_file under docs/ (e.g. docs/PRD.md, docs/SPEC.md).
+- Include only features the user asked for. Do not add RBAC/SSO/analytics/
+  dark mode/i18n/etc unless the user requested them.
+- Do not combine multiple artifacts in one delegation. If the orchestrator
+  asked for PRD, produce PRD only; if it asked for SPEC, produce SPEC only.
+- When listing atomic tasks (TASK-01, TASK-02, …), order them so that any
+  task only depends on tasks that appear earlier in the list. The
+  orchestrator executes tasks in the order you write them, so wrong
+  ordering forces it to backtrack or skip work.
 """ + _FORK_RULES
 
 _CODER_PROMPT = """\
@@ -163,7 +169,6 @@ ROLE_TEMPLATES: dict[str, _RoleTemplate] = {
             "write_file",
             "glob_files",
             "grep",
-            "submit_spec_section",
             "ask_user_question",
         ],
         model_tier="reasoning",

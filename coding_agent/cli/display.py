@@ -215,6 +215,82 @@ def print_iteration_info(iteration: int, tier: str, model: str = "") -> None:
     console.print(f"  [dim]iteration {iteration} · {tier}[/dim]")
 
 
+# ── Todo ledger 표시 ──
+
+_TODO_GLYPHS = {
+    "pending": ("☐", "white"),
+    "in_progress": ("◐", "yellow"),
+    "completed": ("✓", "green"),
+}
+
+
+def print_todo_panel(items: list) -> None:
+    """Orchestrator todo ledger를 Rich Panel로 표시.
+
+    write_todos / update_todo 호출 직후, 또는 task tool의 자동 마킹
+    (B-1 auto_advance_todo) 직후 manager 콜백을 통해 호출된다.
+    items는 ``TodoItem`` 인스턴스 리스트.
+
+    Spinner-safe: task tool이 SubAgent 진행 중에 콜백을 발화시키면
+    spinner의 carriage-return 라인과 패널 첫 줄이 같은 줄에 겹칠 수
+    있어, 출력 전후로 spinner를 일시 정지·재개한다.
+    """
+    saved_msg: str | None = None
+    was_running = _spinner.is_running
+    if was_running:
+        saved_msg = _spinner._message  # type: ignore[attr-defined]
+        _spinner.stop()
+
+    try:
+        _render_todo_panel(items)
+    finally:
+        if was_running and saved_msg:
+            _spinner.start(saved_msg)
+
+
+def _render_todo_panel(items: list) -> None:
+    if not items:
+        console.print(
+            Panel("[dim]todo ledger is empty[/dim]",
+                  title="📋 Todos",
+                  border_style="cyan",
+                  padding=(0, 1))
+        )
+        return
+
+    counts = {"pending": 0, "in_progress": 0, "completed": 0}
+    for it in items:
+        status = getattr(it, "status", "pending")
+        counts[status] = counts.get(status, 0) + 1
+
+    lines: list[str] = []
+    for it in items:
+        status = getattr(it, "status", "pending")
+        glyph, color = _TODO_GLYPHS.get(status, ("?", "white"))
+        item_id = getattr(it, "id", "?")
+        content = getattr(it, "content", "")
+        if status == "completed":
+            lines.append(f"[{color}]{glyph}[/{color}] [dim strike]{item_id}: {content}[/dim strike]")
+        elif status == "in_progress":
+            lines.append(f"[{color}]{glyph}[/{color}] [bold]{item_id}: {content}[/bold]")
+        else:
+            lines.append(f"[{color}]{glyph}[/{color}] {item_id}: {content}")
+
+    title = (
+        f"📋 Todos · {counts['completed']}/{len(items)} done"
+        f" · [yellow]{counts['in_progress']} active[/yellow]"
+        f" · [dim]{counts['pending']} pending[/dim]"
+    )
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=title,
+            border_style="cyan",
+            padding=(0, 1),
+        )
+    )
+
+
 def print_stall_warning(message: str) -> None:
     """StallDetector 경고 표시."""
     console.print(f"  {ICON_WARN} [yellow]{message}[/yellow]")

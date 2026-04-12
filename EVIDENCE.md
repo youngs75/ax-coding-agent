@@ -302,7 +302,7 @@ python -m coding_agent.utils.langfuse_trace_exporter --trace <trace-id> -v
 ## 8. 실제 E2E 실행 증빙 (PMS 프로젝트 생성)
 
 ### 시나리오
-단일 사용자 요청 (PMS 시스템 — PRD → SPEC → TDD 구현)으로 다섯 차례 E2E 실행을 수행하고, 매 실행마다 근본 원인 수정을 반영했다.
+단일 사용자 요청 (PMS 시스템 — PRD → SPEC → TDD 구현)으로 여덟 차례 E2E 실행을 수행하고, 매 실행마다 근본 원인 수정을 반영했다.
 
 ### 실행 이력
 
@@ -313,7 +313,9 @@ python -m coding_agent.utils.langfuse_trace_exporter --trace <trace-id> -v
 | 3차 | DashScope Qwen | Fork Rules 수정 | 완료, 60개 파일, safe_stop | SubAgent 턴 제어 |
 | 4차 | DashScope Qwen | Orchestrator 도구 제한 | **14.7분 완료**, 33개 파일, SPEC 7/7 작업 구현 | Orchestrator에 write_file/execute 차단 |
 | 5차 | OpenRouter GLM-5 + Qwen | CLI 개선, 도구 제한 | ~35분, 100+ 파일, FS+BE 풀스택, 26+ 테스트 파일 | 프론트엔드/백엔드 동시 생성 |
-| **6차** | **DashScope Qwen3 직접 호출** | max_turns=100, LLM_TIMEOUT=600, 스피너 개선 | **24.8분, 16 SubAgent, 66 파일, 11 테스트, 자체 완료 보고서 생성** | 검증 사이클 완주, FINAL_REPORT.md 자동 생성 |
+| 6차 | DashScope Qwen3 직접 호출 | max_turns=100, LLM_TIMEOUT=600, 스피너 개선 | 24.8분, 16 SubAgent, 66 파일, 11 테스트, 자체 완료 보고서 생성 | 검증 사이클 완주, FINAL_REPORT.md 자동 생성 |
+| 7차 | DashScope Qwen3 (Sub-B 직전) | `submit_spec_section` 4섹션 + per-task GWT 강제, reference example 첨부 | **무한 reject 루프** — 같은 잘못된 tasks 콘텐츠를 13회 연속 재전송 | 사용자 입력의 7섹션 SPEC 의도와 harness 4섹션 강제 충돌 발견 |
+| **8차** | **DashScope Qwen3 (Sub-B + Phase 3 A/B/C)** | spec_tool 폐기, write_file SPEC 경로 거부 제거, todo ledger 자동 마킹, verifier 출력 강화, ProgressGuard task repeat | **PRD/SPEC 자율 작성 (25 atomic task), HITL 6문항, 무한 루프 0**, B-1 자동 ledger 작동 | **최종 제출 대상.** Harness 설계 철학 정립 — LLM에게 형식 강제 X, 안전·탐지·명료성·컨텍스트·관찰 5가지만 책임 |
 
 ### 5차 E2E 결과 (GLM5 기반)
 
@@ -446,6 +448,83 @@ new_pms_qwen/
 | UI-GANTT-01 | 70% (API 연동 미구현) |
 | UI-RESP-01 (반응형) | 20% (Tailwind 설정만) |
 
+### 7차 E2E 회귀 사고 (Sub-B 전환 직전)
+
+**구성**: DashScope Qwen3 직접 호출, `submit_spec_section` 4섹션(goals/tasks/dependencies/dod) + per-task GWT marker + 1200자 minimum + 25 dod checkbox + reference example 첨부.
+
+**증상**: planner가 SPEC 작성 중 `tasks` 섹션을 13회 연속 동일한 잘못된 콘텐츠로 재전송하며 모두 `REJECTED` 받음. 단일 LLM 호출 82.8s, 54k input tokens, $0.11. orchestrator가 자연어 응답으로 종료하며 PRD만 남기고 SPEC 단계 실패.
+
+**Langfuse trace 분석으로 발견한 근본 원인**:
+1. **Task description과 도구 스키마의 구조 불일치** — orchestrator가 사용자 원본 입력의 "SPEC 7섹션 구조 (개요/아키텍처/데이터모델/API/테스트/구현/작업목록)"를 그대로 planner에 전달했는데, `submit_spec_section`은 4섹션만 받음. LLM은 `section: "tasks"`에 7섹션 잡탕을 욱여넣고 같은 잘못된 reject 메시지를 13회 받으면서도 self-correction 못 함.
+2. **`_split_task_blocks` 카운팅 버그** — `_TASK_ID_PATTERN = r"TASK-\d{2,}"`가 본문 어디든 TASK-NN을 매칭해 별도 블록으로 자르는 바람에 dependencies 섹션 안의 cross-reference("TASK-01 → TASK-02")까지 짧은 블록으로 잡혀 100자 미달 reject.
+3. **Reference example 첨부의 은밀한 bias** — planner 프롬프트에 PMS-스타일 SPEC 예시를 넣자 다른 도메인(ETL/게임 등)에도 PMS 4-tier 웹앱 구조를 끌고 올 위험이 표면화.
+
+**의사결정**:
+> "Harness로서 강화해야 하는 것은 LLM에게 패턴이나 포맷을 강제하는 것이 아니고, 주어진 역할에 맞게, 컨텍스트에 충실하게, LLM 스스로 알고있는 지식을 최대한 활용해 task를 정확하게 수행하라는 것이고, 오동작을 잘 탐지하고, 도구 호출에 명확한 정보와 명확한 응답을 해주는 것."
+
+이 원칙에 따라 **Sub-B**(spec_tool 통째 폐기 + reference 미첨부 + planner 프롬프트 슬림화)와 **Phase 3 A/B/C**(verifier 출력 강화, ProgressGuard task repeat, 자동 todo 마킹) 두 패치를 8차 직전에 적용.
+
+### 8차 E2E 상세 (최종 제출 대상)
+
+**구성 변경 (7차 → 8차)**:
+- `coding_agent/tools/spec_tool.py` 삭제 (4섹션 + per-task 검증 모두 제거)
+- `coding_agent/tools/file_ops.py` `_check_write_policy`에서 SPEC 경로 거부 제거
+- `coding_agent/subagents/factory.py` planner `default_tools`에서 `submit_spec_section` 제거, 프롬프트 슬림화 + HITL 1순위
+- `coding_agent/core/loop.py` SYSTEM_PROMPT — submit_spec_section 가이드 제거, "사용자 명시 구조 그대로 전달" 명시, write_todos + 자동 마킹 가이드 추가
+- `coding_agent/tools/todo_tool.py` 신규 — `TodoStore` + `write_todos` + `update_todo` (Claude Code TodoWriteTool 패턴)
+- `coding_agent/tools/task_tool.py` — `_extract_task_id` + `manager.auto_advance_todo` (B-1 자동 마킹)
+- `coding_agent/subagents/manager.py` — `_invoke_graph` verifier role 한정으로 execute(command, exit_code, stdout tail) 그대로 노출 (A-1)
+- `coding_agent/resilience/progress_guard.py` — `_task_history` deque + `task_repeat_threshold=6`로 동일 TASK-NN 반복 차단 (A-2)
+- `coding_agent/cli/display.py` `print_todo_panel` 추가 + spinner-safe 출력
+
+**E2E 입력**: 7차와 동일 PMS 요구사항 (PM/관리자/웹·모바일/프로젝트 정보/Task 일정/간트 차트).
+
+**실행 흐름** (관찰 시점까지):
+
+| 단계 | SubAgent | 시간 | 결과 |
+|------|----------|------|------|
+| HITL Q1 | planner ask | - | 플랫폼: 반응형 웹 |
+| HITL Q2 | planner ask | - | 간트: Frappe Gantt |
+| HITL Q3 | planner ask | - | 인증: 기본 ID/PW |
+| HITL Q4 | planner ask | - | 일정 항목: 단순 (이름/시작/종료) |
+| 1 | planner | 45.5s · 2 steps · 2 tools | PRD.md 작성 |
+| HITL Q1' | planner ask (SPEC 단계) | - | 백엔드: Python + FastAPI |
+| HITL Q2' | planner ask (SPEC 단계) | - | DB: PostgreSQL |
+| 2 | planner | 74.9s · 2 steps · 2 tools | SPEC.md 자율 작성 (**25 atomic task, 5 Phase**) |
+| 3 | coder TASK-01 | 134.3s · 40 steps · 39 tools | Docker, Compose, CI/CD 구조 — todo 자동 ✓ |
+| 4 | coder TASK-02 | (관찰 중) · - · - | PostgreSQL 컨테이너화 — todo 자동 ✓ |
+| ... | (TASK-03/04 자동 진행) | | TASK-04까지 ledger ✓ 4/25 |
+| 5 | coder TASK-05 | 325.1s · 100 steps · 106 tools | JWT 인증 API — INCOMPLETE (max_turns=100 도달) |
+| 6 | verifier TASK-05 | 5.1s · 3 steps · 5 tools | 검증 결과 보고 |
+| 7 | fixer TASK-05 | (관찰 중) | 누락 보강 |
+
+**검증된 작동**:
+- ✅ **B-1 자동 todo 마킹** — TASK-01~04가 ledger에 자동 ✓ 처리. orchestrator가 `update_todo`를 거의 호출하지 않음에도 panel이 정확히 갱신됨
+- ✅ **Sub-B 자율 SPEC** — 25 atomic task를 5 Phase(인프라/인증/CRUD/간트/대시보드/마무리)로 LLM이 자율 구조화. 사용자 명시한 7섹션 형식 강제 없음에도 명확한 dependency 순서로 작성
+- ✅ **HITL 2단계 분기** — PRD 단계에 4문항 → SPEC 단계에 백엔드/DB 2문항 추가. planner가 각 단계에 필요한 결정만 골라 사용자에게 질문하고, 답변이 `_user_decisions`로 누적되어 후속 SubAgent에 자동 prepend
+- ✅ **C-2 순차 진행** — 7차에서 발생한 "TASK-04로 점프, TASK-01~03 건너뜀" 사고가 사라지고 TASK-01부터 정확히 순서대로 진행
+- ✅ **무한 reject 루프 0** — 7차의 13회 reject 같은 사고 없음. spec_tool 자체가 폐기됐기 때문에 구조적으로 발생 불가능
+- ✅ **CLI Rich Panel 실시간 갱신** — 25 task의 진행 상태(☐ pending / ◐ in_progress / ✓ completed)가 매 task delegation마다 자동 업데이트, spinner와 충돌 없음
+
+**데이터 수집 (agent.log)**:
+```
+event='timing.agent_node' iteration=4 ... tool_calls=['write_todos']    # 1회 ledger 등록
+event='timing.agent_node' iteration=6 ... tool_calls=['update_todo']    # 1회 수동 호출
+event='timing.task_tool.start' agent_type='coder' desc='TASK-01: ...'
+event='subagent.todo.auto_advance' task_id='TASK-01' status='in_progress'  # B-1 자동
+event='subagent.todo.auto_advance' task_id='TASK-01' status='completed'     # B-1 자동
+event='timing.task_tool.start' agent_type='coder' desc='TASK-02: ...'
+... (TASK-02, 03, 04 동일 패턴)
+```
+
+LLM이 명시적으로 호출한 todo 도구는 `write_todos` 1회 + `update_todo` 1회뿐이고, **나머지 진행은 모두 harness가 자동 동기화**. 약한 모델(Qwen3)이 ledger 관리에 attention을 쓰지 않게 한 B-1의 효과가 실측으로 확인됨.
+
+**재현 방법**:
+```bash
+make down && make up && ./ax-agent.sh /tmp/new_pms_qwen3_v8
+# 동일 PMS 요구사항 입력 후 HITL 6문항 답변
+```
+
 ### Claude 4.6 비교 실행 (참고, 중단)
 
 Claude Opus + Sonnet 4.6 구성으로도 병행 테스트 시도 (`ax-agent-claude`):
@@ -471,28 +550,47 @@ z.ai BigModel API 직접 호출로 GLM-5.1 reasoning 모델 시도:
 
 ## 9. 아직 남아 있는 한계
 
-1. **git worktree 기반 병렬 실행**: 설계 완료, 미구현. 현재 순차 실행만 지원.
-2. **메모리 정정 UI**: `/memory delete`로 삭제 가능하나, 충돌 시 자동 정정 로직은 미구현.
-3. **HITL (Human-in-the-Loop)**: Planner 계획 승인 후 실행하는 interrupt 미구현.
-4. **Harness 레벨 출력 구조화**: 약한 모델이 SPEC 작성 시 일부 섹션 누락 가능. DeepAgents의 `write_todos` 패턴 / Codex의 `update_plan` 패턴 도입 필요 (다음 세션 백로그).
-5. **모델 적응적 turn limit**: 현재 고정 100턴. 모델 역량에 따라 동적 조정 필요.
+**8차 세션에서 해결된 항목** (6차 시점에 한계로 기록되었던 것들):
+- ~~HITL (Human-in-the-Loop)~~: ✅ `ask_tool.py` + LangGraph `interrupt()` 구현. 8차 E2E에서 PRD 4문항 + SPEC 2문항 답변이 후속 SubAgent에 자동 prepend됨
+- ~~Harness 레벨 출력 구조화~~: ✅ `todo_tool.py`의 `write_todos` + B-1 자동 마킹으로 orchestrator의 진행 상황 추적 자동화. 단, **출력 형식 강제는 폐기**(Sub-B) — Harness 설계 철학 변경에 따른 의도된 결정
+
+**남아 있는 한계**:
+1. **git worktree 기반 병렬 실행**: 설계 완료, 미구현. 현재 순차 실행만 지원
+2. **메모리 정정 UI**: `/memory delete`로 삭제 가능하나, 충돌 시 자동 정정 로직은 미구현
+3. **모델 적응적 turn limit**: 현재 고정 `_SUBAGENT_MAX_TURNS=100`. 8차 E2E TASK-05(JWT 인증 API)에서 100턴 도달 후 INCOMPLETE 마킹 — 단일 task에 너무 많은 작업이 묶여 있을 가능성. 다음 세션 백로그: planner가 더 작은 단위로 분해하도록 가이드 (강제는 X)
+4. **`_extract_task_id`의 SPEC ID 형식 의존성**: planner가 SPEC에 `TASK-NN` 형식 식별자를 안 쓰면 B-1 자동 마킹이 silent no-op. 다른 형식(예: `T01`, `Issue-1`)을 쓰는 SPEC에는 자동 동기화 안 됨. 패턴 확장 또는 LLM 기반 추출이 다음 백로그
+5. **Stall watchdog 미구현**: Claude Code의 45s 프롬프트-패턴 기반 hang 감지 패턴 미적용. P0 shell hardening + ProgressGuard repeat 차단으로 8차에서 hang 0건 달성했지만, 향후 더 긴 작업에서는 stall watchdog이 보완책으로 필요할 수 있음
+6. **단일 SubAgent 호출 비용 가시성**: Langfuse 트레이싱은 자동이지만 CLI에서 실시간 누적 비용 표시 없음
 
 ---
 
 ## 10. 테스트 실행
 
 ```bash
-# 전체 테스트 (65개)
+# 전체 테스트 (231개, 8차 세션 기준)
 make test
 
 # 모듈별 테스트
-make test-memory       # 메모리 시스템 (10개)
-make test-subagents    # SubAgent 상태 전이 (14개)
-make test-resilience   # 복원력 (21개)
+make test-memory       # 메모리 시스템
+make test-subagents    # SubAgent 상태 전이
+make test-resilience   # 복원력 (ProgressGuard task repeat 포함)
 
-# 성능 최적화 테스트 (18개) — tests/test_performance.py
+# 성능 최적화 테스트 — tests/test_performance.py
 python -m pytest tests/test_performance.py -v
+
+# 8차 세션 신규 테스트
+python -m pytest tests/test_todo_tool.py -v          # Todo ledger 21개
+python -m pytest tests/test_p35_phase3.py -v         # Phase 3 A/B/C 27개
+python -m pytest tests/test_shell_tool.py -v         # P0 shell hardening 54개
 ```
+
+**테스트 카운트 추이**:
+| 단계 | 개수 | 신규 |
+|------|------|------|
+| 1차 제출 (5차 E2E) | 65 | 메모리 + SubAgent + 복원력 + 성능 |
+| 6차 회귀 차단 (P3.5) | 145 | +80 (write_file 정책, decisions, role 분리) |
+| 7차 P0 + Option A | 204 | +59 (shell hardening 54, fixer 도구 경계 3, spec 검증 2) |
+| **8차 Sub-B + Phase 3 A/B/C** | **231** | **+27** (자동 todo 마킹, task repeat, verifier 출력) |
 
 ---
 

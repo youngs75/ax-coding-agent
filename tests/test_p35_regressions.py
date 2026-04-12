@@ -1,13 +1,13 @@
 """P3.5 회귀 방지 테스트.
 
-다음 회귀 5건을 코드 레벨에서 차단했는지 검증:
+다음 동작을 코드 레벨에서 검증:
 
-1. write_file이 SPEC.md 경로를 거부한다 (submit_spec_section 우회 방지)
-2. write_file이 *-mobile.tsx 등 플랫폼별 파일명 패턴을 거부한다
-3. write_file이 정상 경로는 여전히 허용한다
-4. SubAgentManager가 ask_user_question 답변을 누적한다
-5. 누적된 user_decisions가 다음 SubAgent의 HumanMessage에 prepend된다
-6. decisions가 없으면 HumanMessage가 변하지 않는다 (기본 동작 보존)
+1. write_file이 PRD/SPEC/SDD 등 설계 문서를 자유롭게 허용한다 (강제 폐기 후)
+2. write_file이 *-mobile.tsx 등 플랫폼별 파일명 패턴은 여전히 거부한다
+3. SubAgentManager가 ask_user_question 답변을 누적한다
+4. 누적된 user_decisions가 다음 SubAgent의 HumanMessage에 prepend된다
+5. decisions가 없으면 HumanMessage가 변하지 않는다 (기본 동작 보존)
+6. fixer/coder/verifier 도구 경계가 유지된다
 """
 
 from __future__ import annotations
@@ -26,40 +26,27 @@ from coding_agent.subagents.registry import SubAgentRegistry
 from coding_agent.tools.file_ops import _check_write_policy, write_file
 
 
-# ── 1) write_file — SPEC 경로 거부 ──────────────────────────────
+# ── 1) write_file — SPEC/PRD/SDD는 자유롭게 작성 가능 ──────────
+# 이전에는 submit_spec_section을 강제하기 위해 SPEC 경로를 거부했지만,
+# Sub-B 결정으로 LLM이 PRD/SPEC/SDD를 자율적으로 작성하도록 강제를 풀었다.
+# 이 테스트들은 회귀 방지: 어떤 문서든 write_file로 정상 작성되어야 한다.
+
 
 @pytest.mark.parametrize(
-    "path",
-    [
-        "SPEC.md",
-        "docs/SPEC.md",
-        "/tmp/workspace/docs/SPEC.md",
-        "spec.md",
-        "docs/spec",
-        "./SPEC.md",
-        "some/nested/path/SPEC.md",
-    ],
+    "filename",
+    ["PRD.md", "SPEC.md", "SDD.md", "spec.md", "Architecture.md", "DESIGN.md"],
 )
-def test_write_file_rejects_spec_paths(path: str) -> None:
-    err = _check_write_policy(path)
-    assert err is not None
-    assert "submit_spec_section" in err
-    assert "REJECTED" in err
-
-
-def test_write_file_tool_rejects_spec(tmp_path: Path) -> None:
-    target = tmp_path / "docs" / "SPEC.md"
-    result = write_file.invoke({"path": str(target), "content": "# SPEC\n\nsome content"})
-    assert "REJECTED" in result
-    assert "submit_spec_section" in result
-    assert not target.exists(), "SPEC.md must not be written on policy failure"
-
-
-def test_write_file_allows_prd(tmp_path: Path) -> None:
-    target = tmp_path / "docs" / "PRD.md"
-    result = write_file.invoke({"path": str(target), "content": "# PRD\n"})
+def test_write_file_allows_design_documents(tmp_path: Path, filename: str) -> None:
+    target = tmp_path / "docs" / filename
+    result = write_file.invoke({"path": str(target), "content": f"# {filename}\n\nbody"})
     assert "REJECTED" not in result
     assert target.exists()
+
+
+def test_check_write_policy_does_not_block_spec() -> None:
+    """SPEC 경로 차단 정책이 완전히 제거되었는지 직접 검증."""
+    for path in ("SPEC.md", "docs/SPEC.md", "spec.md", "/tmp/x/docs/SPEC.md"):
+        assert _check_write_policy(path) is None, f"unexpected reject for {path}"
 
 
 # ── 2) write_file — 플랫폼별 파일명 거부 ────────────────────────
@@ -166,14 +153,6 @@ def test_resolve_tools_ask_user_question_records_on_answer() -> None:
     # tool will call via its closure.
     manager.record_user_decision("User answered — Mobile: Responsive only")
     assert "User answered — Mobile: Responsive only" in manager.get_user_decisions()
-
-
-def test_resolve_tools_submit_spec_section_fresh_per_call() -> None:
-    manager = _make_manager()
-    a = manager._resolve_tools(["submit_spec_section"])[0]
-    b = manager._resolve_tools(["submit_spec_section"])[0]
-    # Different instances → independent stores (per-session isolation).
-    assert a is not b
 
 
 def test_resolve_tools_static_tool_shared() -> None:
