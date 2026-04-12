@@ -48,8 +48,15 @@ def test_dangerous_blocks_system_root_deletion():
 
 
 def test_resolve_timeout_default(monkeypatch):
+    """Default is 90s (was 300s pre-v8.1).
+
+    Single biggest contributor to v8 verifier hangs (449s) was the
+    first execute call eating the full 300s window because the LLM
+    had not yet learned to inline `timeout NN`. 90s comfortably covers
+    normal pytest/build/install while killing collection hangs early.
+    """
     monkeypatch.delenv("EXECUTE_TIMEOUT", raising=False)
-    assert _resolve_timeout() == 300
+    assert _resolve_timeout() == 90
 
 
 def test_resolve_timeout_clamps_to_max(monkeypatch):
@@ -64,7 +71,20 @@ def test_resolve_timeout_clamps_to_min(monkeypatch):
 
 def test_resolve_timeout_ignores_garbage(monkeypatch):
     monkeypatch.setenv("EXECUTE_TIMEOUT", "not-a-number")
-    assert _resolve_timeout() == 300
+    assert _resolve_timeout() == 90
+
+
+def test_resolve_timeout_env_override_within_range(monkeypatch):
+    """Operators can still raise the cap via EXECUTE_TIMEOUT env."""
+    monkeypatch.setenv("EXECUTE_TIMEOUT", "240")
+    assert _resolve_timeout() == 240
+
+
+def test_execute_default_timeout_constant_is_90():
+    """Direct constant pin so a future global edit cannot quietly
+    revert this without the test catching it."""
+    from coding_agent.tools.shell import _EXECUTE_TIMEOUT_DEFAULT
+    assert _EXECUTE_TIMEOUT_DEFAULT == 90
 
 
 # ── _autofix_command ─────────────────────────────────────────────────

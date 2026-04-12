@@ -34,7 +34,19 @@ from pydantic import BaseModel, Field
 # ── Configuration ───────────────────────────────────────────────────
 
 # Hard upper bound. The harness — not the LLM — owns this number.
-_EXECUTE_TIMEOUT_DEFAULT = 300
+#
+# Timeout history:
+#   v1   300s — original default. v8 E2E showed pytest collection
+#                hang on a broken conftest.py burned a full 5-minute
+#                window before the LLM noticed.
+#   v8.1  90s — single biggest sink in 449s verifier hang was the
+#                first execute call running without an inline timeout
+#                prefix and consuming the full default. 90s comfortably
+#                covers normal pytest/build/install runs (median <30s
+#                in v8 traces) while killing collection hangs early.
+#                Users with legitimately longer steps can raise it via
+#                the EXECUTE_TIMEOUT env var, capped at MAX below.
+_EXECUTE_TIMEOUT_DEFAULT = 90
 _EXECUTE_TIMEOUT_MAX = 600
 
 
@@ -266,7 +278,10 @@ class ExecuteInput(BaseModel):
     """Input schema for the ``execute`` tool.
 
     Note: ``timeout`` is intentionally NOT exposed. The harness owns it
-    via the EXECUTE_TIMEOUT environment variable, capped to 600 seconds.
+    via the EXECUTE_TIMEOUT environment variable, default 90s, capped
+    to 600 seconds. If a command genuinely needs longer (e.g. heavy
+    pip install), prefix the command with `timeout 180 ...` or set
+    EXECUTE_TIMEOUT in the environment.
     """
 
     command: str = Field(description="The shell command to run")
@@ -278,11 +293,14 @@ def execute(command: str, working_directory: str = ".") -> str:
     """Run a shell command with stdin closed and a hard timeout.
 
     The command runs with /dev/null as stdin so interactive prompts
-    cannot block. A timeout (default 300s, capped at 600s) is enforced
-    by the harness; the LLM cannot extend it. CI-style environment
-    variables are injected by default (CI=1, NO_COLOR=1, etc.) so
-    test runners do not enter watch mode. Dev servers and explicit
-    --watch invocations are rejected at the boundary.
+    cannot block. A timeout (default 90s, capped at 600s) is enforced
+    by the harness; the LLM cannot extend it from the tool args. To
+    raise it for one command, the LLM can wrap with `timeout NNN ...`;
+    to raise it for the whole session, set EXECUTE_TIMEOUT in env.
+    CI-style environment variables are injected by default (CI=1,
+    NO_COLOR=1, etc.) so test runners do not enter watch mode. Dev
+    servers and explicit --watch invocations are rejected at the
+    boundary.
     """
     if _is_dangerous(command):
         return f"Error: dangerous command blocked: {command}"
