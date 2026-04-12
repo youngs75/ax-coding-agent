@@ -78,6 +78,14 @@ Rules:
   task only depends on tasks that appear earlier in the list. The
   orchestrator executes tasks in the order you write them, so wrong
   ordering forces it to backtrack or skip work.
+- Read the user request twice and look for **methodology keywords**
+  (TDD, BDD, SDD, DDD, CI/CD, microservices, monorepo, etc.) — even
+  when they appear in parentheses, footnotes, or trailing remarks.
+  When you spot one, the atomic task breakdown MUST reflect it. For
+  TDD specifically, every feature slice gets its tests written *before*
+  the implementation, so do not bundle "write tests" into a single
+  task at the end of a phase — interleave test+implementation pairs.
+  The same applies to other methodology keywords the user mentions.
 """ + _FORK_RULES
 
 _CODER_PROMPT = """\

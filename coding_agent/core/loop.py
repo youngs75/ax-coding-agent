@@ -342,15 +342,20 @@ class AgentLoop:
             messages = state.get("messages", [])
             iteration = state.get("iteration", 0)
 
-            # 마지막 도구 호출 기록
-            if messages:
-                last_msg = messages[-1]
-                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                    for tc in last_msg.tool_calls:
+            # 가장 최근 AIMessage(도구 호출이 들어 있는)를 찾아 record.
+            # check_progress는 ToolNode 다음에 실행되므로 messages[-1]은
+            # 항상 ToolMessage이고 tool_calls가 비어 있다. AIMessage는 그
+            # 직전(또는 그보다 앞)에 있다. tool_calls가 있는 첫 메시지를
+            # 역방향으로 찾는다.
+            for msg in reversed(messages):
+                tcs = getattr(msg, "tool_calls", None)
+                if tcs:
+                    for tc in tcs:
                         self._progress_guard.record_action(
                             tc.get("name", "unknown"),
                             tc.get("args", {}),
                         )
+                    break
 
             verdict = self._progress_guard.check(iteration)
 
