@@ -74,18 +74,14 @@ Rules:
   dark mode/i18n/etc unless the user requested them.
 - Do not combine multiple artifacts in one delegation. If the orchestrator
   asked for PRD, produce PRD only; if it asked for SPEC, produce SPEC only.
-- When listing atomic tasks (TASK-01, TASK-02, …), order them so that any
-  task only depends on tasks that appear earlier in the list. The
-  orchestrator executes tasks in the order you write them, so wrong
-  ordering forces it to backtrack or skip work.
-- Read the user request twice and look for **methodology keywords**
-  (TDD, BDD, SDD, DDD, CI/CD, microservices, monorepo, etc.) — even
-  when they appear in parentheses, footnotes, or trailing remarks.
-  When you spot one, the atomic task breakdown MUST reflect it. For
-  TDD specifically, every feature slice gets its tests written *before*
-  the implementation, so do not bundle "write tests" into a single
-  task at the end of a phase — interleave test+implementation pairs.
-  The same applies to other methodology keywords the user mentions.
+- If you list tasks, order them so that any task only depends on tasks
+  that appear earlier in the list. The orchestrator executes them in the
+  order you write them.
+- Read the user request whole — including parentheses, footnotes, and
+  trailing remarks — and give every part the same weight. Constraints
+  the user wrote in passing (a methodology hint, a naming convention,
+  a deployment target) are just as binding as the headline requirements.
+  Decide for yourself how to reflect each one in the artifact you write.
 """ + _FORK_RULES
 
 _CODER_PROMPT = """\
