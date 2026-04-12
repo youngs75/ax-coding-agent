@@ -17,7 +17,7 @@ auth scope?" — replaces invented assumptions with user-verified facts.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
@@ -147,22 +147,58 @@ def _ask_user_question(questions: list[AskQuestionItem]) -> str:
     return _format_answer(payload, answer)
 
 
+_ASK_TOOL_DESCRIPTION = (
+    "Pause work and ask the user 1–4 multiple-choice questions about "
+    "essential decisions you cannot infer from the request "
+    "(e.g. tech stack, auth scope, mobile vs web, library choice). "
+    "Use BEFORE writing PRD/SPEC when the request is vague. "
+    "Do NOT use for trivial yes/no questions or things you can decide. "
+    "LANGUAGE: question text, header labels, option labels, and option "
+    "descriptions MUST be written in Korean unless the user explicitly "
+    "requested another language. The user reads these directly. "
+    "The harness blocks until the user answers and returns their "
+    "selections as a single string formatted: "
+    "'User answered — Header1: choice | Header2: choice ...'."
+)
+
+
+def build_ask_user_question_tool(
+    on_answer: Callable[[str], None] | None = None,
+) -> StructuredTool:
+    """Build an ``ask_user_question`` tool instance.
+
+    ``on_answer`` is invoked with the formatted answer string every time
+    the user resolves an interrupt. SubAgentManager uses this hook to
+    accumulate user decisions across a session and prepend them to every
+    subsequent SubAgent task description — so coders/verifiers/fixers
+    see the same constraints the planner saw.
+    """
+
+    def _run(questions: list[AskQuestionItem]) -> str:
+        payload = _build_payload(questions)
+        answer = interrupt(payload)
+        formatted = _format_answer(payload, answer)
+        if on_answer is not None:
+            try:
+                on_answer(formatted)
+            except Exception:  # noqa: BLE001 — callback must never break the tool
+                pass
+        return formatted
+
+    return StructuredTool.from_function(
+        func=_run,
+        name="ask_user_question",
+        description=_ASK_TOOL_DESCRIPTION,
+        args_schema=AskUserQuestionInput,
+    )
+
+
+# Default shared instance — no callback. Kept for tests and callers that
+# don't need the decision-accumulation behavior.
 ask_user_question_tool = StructuredTool.from_function(
     func=_ask_user_question,
     name="ask_user_question",
-    description=(
-        "Pause work and ask the user 1–4 multiple-choice questions about "
-        "essential decisions you cannot infer from the request "
-        "(e.g. tech stack, auth scope, mobile vs web, library choice). "
-        "Use BEFORE writing PRD/SPEC when the request is vague. "
-        "Do NOT use for trivial yes/no questions or things you can decide. "
-        "LANGUAGE: question text, header labels, option labels, and option "
-        "descriptions MUST be written in Korean unless the user explicitly "
-        "requested another language. The user reads these directly. "
-        "The harness blocks until the user answers and returns their "
-        "selections as a single string formatted: "
-        "'User answered — Header1: choice | Header2: choice ...'."
-    ),
+    description=_ASK_TOOL_DESCRIPTION,
     args_schema=AskUserQuestionInput,
 )
 
@@ -172,6 +208,7 @@ __all__ = [
     "AskQuestionOption",
     "AskUserQuestionInput",
     "ask_user_question_tool",
+    "build_ask_user_question_tool",
     "_build_payload",
     "_format_answer",
 ]

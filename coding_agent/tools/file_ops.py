@@ -115,9 +115,50 @@ class WriteFileInput(BaseModel):
     content: str = Field(description="파일에 쓸 내용")
 
 
+# ── Path policy: block anti-patterns at the tool boundary ───────────
+# Some LLM behaviors we cannot reliably prevent with prompts alone:
+#   1) Writing SPEC.md via write_file instead of submit_spec_section
+#      (bypasses section validation → 81-line SPEC without atomic tasks)
+#   2) Creating *-mobile.tsx / *-desktop.tsx files for "responsive web"
+#      (responsive should be one codebase + CSS media queries)
+# The tool itself rejects these paths so the LLM gets immediate feedback
+# and tries a different approach rather than producing degraded output.
+
+_SPEC_FILENAME_RE = re.compile(r"(^|[/\\])spec(\.md)?$", re.IGNORECASE)
+
+_PLATFORM_SUFFIX_RE = re.compile(
+    r"-(mobile|desktop|android|ios|tablet)\.(tsx|ts|jsx|js|vue|svelte|css|scss|styled\.ts)$",
+    re.IGNORECASE,
+)
+
+
+def _check_write_policy(path_str: str) -> str | None:
+    """Return an error message if *path_str* violates write policy, else None."""
+    name = Path(path_str).name
+    if _SPEC_FILENAME_RE.search(path_str) or name.lower() in {"spec.md", "spec"}:
+        return (
+            "REJECTED: SPEC 문서는 write_file로 작성할 수 없습니다. "
+            "대신 submit_spec_section(section=..., content=...)을 4번 호출하세요 "
+            "(section: goals, tasks, dependencies, dod). "
+            "4번째 섹션이 통과하면 harness가 docs/SPEC.md를 자동 생성합니다."
+        )
+    if _PLATFORM_SUFFIX_RE.search(name):
+        return (
+            f"REJECTED: 플랫폼별 파일명 패턴은 금지됩니다 ({name}). "
+            "Responsive web은 단일 코드베이스 + CSS media query로 구현하세요. "
+            "예: `LoginPage.tsx` 하나 + `@media (max-width: 768px)`. "
+            "별도 -mobile/-desktop/-tablet 파일을 만들지 마세요."
+        )
+    return None
+
+
 @tool("write_file", args_schema=WriteFileInput)
 def write_file(path: str, content: str) -> str:
     """새 파일을 생성하거나 기존 파일을 덮어쓴다."""
+    policy_error = _check_write_policy(path)
+    if policy_error is not None:
+        return policy_error
+
     p = Path(path).resolve()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)

@@ -38,7 +38,7 @@ from coding_agent.subagents.models import (
     SubAgentStatus,
 )
 from coding_agent.subagents.registry import SubAgentRegistry
-from coding_agent.tools.ask_tool import ask_user_question_tool
+from coding_agent.tools.ask_tool import build_ask_user_question_tool
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
 from coding_agent.tools.spec_tool import build_submit_spec_section_tool
@@ -57,37 +57,14 @@ _ALL_TOOLS: dict[str, BaseTool] = {}
 for _t in FILE_TOOLS + SHELL_TOOLS:
     _ALL_TOOLS[_t.name] = _t
 
-# ask_user_question is shareable (no per-session state) — its handler
-# pauses the LangGraph via interrupt() so the same instance works for
-# every SubAgent that lists it among its tools.
-_ALL_TOOLS[ask_user_question_tool.name] = ask_user_question_tool
-
 # Tool names whose instances must be built fresh per SubAgent invocation
-# because they own per-session state (e.g. SpecSectionStore).
-_DYNAMIC_TOOL_BUILDERS: dict[str, callable] = {  # type: ignore[type-arg]
+# because they own per-session state (e.g. SpecSectionStore) or must
+# capture a per-manager callback (e.g. ask_user_question → record answers).
+# The builders for manager-scoped tools are wired up in
+# SubAgentManager._resolve_tools (they need access to ``self``).
+_STATIC_DYNAMIC_TOOL_BUILDERS: dict[str, callable] = {  # type: ignore[type-arg]
     "submit_spec_section": build_submit_spec_section_tool,
 }
-
-
-def _resolve_tools(tool_names: list[str]) -> list[BaseTool]:
-    """Resolve a list of tool name strings into BaseTool instances.
-
-    Static tools come from the shared registry. Dynamic tools (those with
-    per-session state) are built fresh on every call so each SubAgent
-    invocation gets its own store.
-    """
-    resolved: list[BaseTool] = []
-    for name in tool_names:
-        builder = _DYNAMIC_TOOL_BUILDERS.get(name)
-        if builder is not None:
-            resolved.append(builder())
-            continue
-        tool = _ALL_TOOLS.get(name)
-        if tool is not None:
-            resolved.append(tool)
-        else:
-            log.warning("subagent.tool.not_found", tool_name=name)
-    return resolved
 
 
 class SubAgentManager:
@@ -104,6 +81,67 @@ class SubAgentManager:
         # the LLM and rewrite files.  Keyed by a deterministic hash of
         # the spawn arguments — same description+agent_type → same key.
         self._paused_runs: dict[str, dict[str, Any]] = {}
+        # ── User decisions accumulator ──
+        # Every time a SubAgent's ask_user_question tool resolves, the
+        # formatted answer is appended here. Subsequent SubAgent spawns
+        # prepend this list to their task description so coder/verifier
+        # /fixer all see the same hard constraints the planner asked for.
+        self._user_decisions: list[str] = []
+
+    # ── Decision accumulator API ─────────────────────────────
+    def record_user_decision(self, formatted_answer: str) -> None:
+        """Append a formatted ask_user_question answer to the session log."""
+        if formatted_answer and formatted_answer not in self._user_decisions:
+            self._user_decisions.append(formatted_answer)
+            log.info(
+                "subagent.user_decision_recorded",
+                count=len(self._user_decisions),
+                preview=formatted_answer[:80],
+            )
+
+    def get_user_decisions(self) -> list[str]:
+        """Return accumulated user decisions (for logging/tests)."""
+        return list(self._user_decisions)
+
+    def _decisions_header(self) -> str:
+        """Render accumulated decisions as a prepend block, or ''."""
+        if not self._user_decisions:
+            return ""
+        lines = ["## 사용자 결정 사항 (하드 제약)"]
+        for d in self._user_decisions:
+            lines.append(f"- {d}")
+        lines.append("")
+        lines.append("위 결정 사항은 사용자가 직접 답변한 내용입니다. "
+                     "이 제약을 벗어나는 기능/구성요소/스타일을 추가하지 마세요.")
+        lines.append("")
+        lines.append("## 작업 내용")
+        return "\n".join(lines) + "\n"
+
+    def _resolve_tools(self, tool_names: list[str]) -> list[BaseTool]:
+        """Resolve a list of tool name strings into BaseTool instances.
+
+        Static tools come from the shared registry. Dynamic tools (those
+        with per-session state) are built fresh on every call so each
+        SubAgent invocation gets its own store. Manager-scoped tools
+        (ask_user_question) are built with ``self`` captured in closure.
+        """
+        resolved: list[BaseTool] = []
+        for name in tool_names:
+            builder = _STATIC_DYNAMIC_TOOL_BUILDERS.get(name)
+            if builder is not None:
+                resolved.append(builder())
+                continue
+            if name == "ask_user_question":
+                resolved.append(
+                    build_ask_user_question_tool(on_answer=self.record_user_decision)
+                )
+                continue
+            tool = _ALL_TOOLS.get(name)
+            if tool is not None:
+                resolved.append(tool)
+            else:
+                log.warning("subagent.tool.not_found", tool_name=name)
+        return resolved
 
     @staticmethod
     def _spawn_key(task_description: str, agent_type: str) -> str:
@@ -341,7 +379,7 @@ class SubAgentManager:
 
         t0 = time.monotonic()
         system_prompt = self._factory.build_system_prompt(instance)
-        tools = _resolve_tools(instance.tools)
+        tools = self._resolve_tools(instance.tools)
         model = get_model(instance.model_tier, temperature=0.0)  # type: ignore[arg-type]
         setup_elapsed = time.monotonic() - t0
 
@@ -349,10 +387,18 @@ class SubAgentManager:
         graph, get_hit_max_turns = self._build_subagent_graph(instance, system_prompt, tools, model)
         graph_elapsed = time.monotonic() - t0
 
+        # Prepend accumulated user decisions to the human message so every
+        # SubAgent sees the same hard constraints the planner collected.
+        decisions_header = self._decisions_header()
+        human_content = (
+            decisions_header + instance.task_summary
+            if decisions_header
+            else instance.task_summary
+        )
         initial_state: dict[str, Any] = {
             "messages": [
                 SystemMessage(content=system_prompt),
-                HumanMessage(content=instance.task_summary),
+                HumanMessage(content=human_content),
             ],
         }
 

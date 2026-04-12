@@ -11,9 +11,15 @@ Hardening rules
    with a warning prefix so the LLM learns the pattern from the output.
 4. Timeout errors are returned in English with a clear diagnosis and
    suggested next action so the LLM can pick a different approach.
+5. CI-style environment variables are injected by default so test
+   runners (vitest, jest, vite, next) do not enter watch mode.
+6. Known watch/daemon commands (vitest with no 'run', npm run dev,
+   etc.) are rejected at the boundary with a concrete alternative,
+   because CI=1 does not cover every tool consistently.
 
 These rules together kill the "LLM retries the same hung command" loop
-that the previous E2E hit on ``npm create vite@latest .``.
+that the previous E2E hit on ``npm create vite@latest .`` and on
+``vitest`` (default watch mode).
 """
 
 from __future__ import annotations
@@ -131,6 +137,128 @@ def _autofix_command(command: str) -> tuple[str, list[str]]:
     return fixed, reasons
 
 
+# ── Watch/daemon command guard ──────────────────────────────────────
+#
+# Even with CI=1 injected (see _build_env), some commands are designed
+# to never exit: dev servers (`npm run dev`, `vite`, `next dev`) and
+# explicit watch flags (`--watch`, `-w`, `--serve`).  Letting the
+# subagent call these would either hit the 300s timeout (wasting the
+# budget) or pass ``CI=1`` to a tool that ignores it.  We reject at the
+# tool boundary with a specific alternative, so the LLM switches
+# approach immediately instead of burning the whole timeout.
+#
+# Key patterns, each with a short reason so the REJECTED message is
+# actionable.  All regex are case-insensitive and anchored on word
+# boundaries to avoid false positives like `test-server-dev-tools`.
+
+_WATCH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Explicit watch flags on any command.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:--watch|--watchAll(?!=false)|--watch-all)\b", re.IGNORECASE),
+        "the --watch flag runs forever. Use the one-shot form instead "
+        "(vitest → 'vitest run', jest → 'jest --watchAll=false').",
+    ),
+    (
+        re.compile(r"(?:^|[\s;&|])-w\b(?!\s*=\s*false)", re.IGNORECASE),
+        "-w enables watch mode. Run the test command once and exit instead.",
+    ),
+    # `vitest` with no subcommand is watch by default.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:npx\s+)?vitest(?!\s+(?:run|--run|related|list|bench))", re.IGNORECASE),
+        "bare 'vitest' enters watch mode by default. Use 'vitest run' "
+        "to execute tests once and exit.",
+    ),
+    # Dev / serve scripts on common JS package managers.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
+        "dev/start/serve/watch scripts are long-running servers. "
+        "The harness cannot collect their output. If you need to "
+        "smoke-test a server, run 'npm run build' then inspect the "
+        "output artifacts instead.",
+    ),
+    # Direct CLI invocations of dev servers.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:npx\s+)?(?:vite|next|nuxt|remix|parcel)\s+(?:dev|serve|start)\b", re.IGNORECASE),
+        "this is a dev server that never exits. Use the build command "
+        "('vite build', 'next build', etc.) if you need to verify the project.",
+    ),
+    (
+        re.compile(r"(?:^|[\s;&|])(?:npx\s+)?(?:vite|next|nuxt)(?:\s*$|\s+[-;&|])", re.IGNORECASE),
+        "bare 'vite' / 'next' / 'nuxt' launches a dev server. Use the "
+        "explicit build subcommand instead ('vite build', 'next build').",
+    ),
+    # webpack-dev-server is always a dev server, bare or with args.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:npx\s+)?webpack-dev-server\b", re.IGNORECASE),
+        "webpack-dev-server runs forever. Use 'webpack' (or 'webpack build') "
+        "to produce a one-shot bundle instead.",
+    ),
+    # Python / generic dev servers.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:python\s+-m\s+)?http\.server\b", re.IGNORECASE),
+        "http.server runs forever. Use curl against a production server "
+        "or inspect files directly with read_file.",
+    ),
+    (
+        re.compile(r"(?:^|[\s;&|])(?:flask\s+run|uvicorn|gunicorn|hypercorn|waitress-serve)\b", re.IGNORECASE),
+        "dev/app servers never exit from the harness's perspective. "
+        "Use the CLI's build or test entrypoint instead.",
+    ),
+    # File watchers.
+    (
+        re.compile(r"(?:^|[\s;&|])(?:tsc\s+(?:--watch|-w)|nodemon|pm2\s+(?:start|restart))\b", re.IGNORECASE),
+        "this command watches files forever. Use the one-shot form "
+        "('tsc' without --watch) or skip it.",
+    ),
+)
+
+
+def _is_watch_command(command: str) -> tuple[bool, str]:
+    """Return (True, reason) if *command* would run forever."""
+    for pattern, reason in _WATCH_PATTERNS:
+        if pattern.search(command):
+            return True, reason
+    return False, ""
+
+
+# ── Environment defaults ────────────────────────────────────────────
+#
+# These match the environment variables that CI systems (GitHub
+# Actions, CircleCI, etc.) set automatically.  Most modern dev tools
+# respect at least one of them to disable watch modes, color codes,
+# and interactive prompts.  Injecting them by default makes the
+# SubAgent environment behave like a CI runner — which is conceptually
+# exactly what it is.
+
+_CI_ENV_DEFAULTS: dict[str, str] = {
+    "CI": "1",                           # vitest/jest/vite/next: no watch
+    "DEBIAN_FRONTEND": "noninteractive",  # apt-get: no tzdata prompt
+    "NO_COLOR": "1",                     # cleaner logs
+    "TERM": "dumb",                      # prevents tools from probing TTY
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_INPUT": "1",                 # pip: never ask
+    "PYTHONUNBUFFERED": "1",             # flush python stdout promptly
+    "NPM_CONFIG_COLOR": "false",
+    "NPM_CONFIG_PROGRESS": "false",
+    "NPM_CONFIG_FUND": "false",
+    "NPM_CONFIG_AUDIT": "false",
+    "FORCE_COLOR": "0",
+}
+
+
+def _build_env() -> dict[str, str]:
+    """Build the environment for an execute() subprocess.
+
+    We start from the current process env (so PATH, HOME, LANG, etc.
+    are preserved) and overlay CI-style defaults.  The LLM-visible
+    subprocess always sees these, so 'vitest' alone runs once and
+    exits instead of entering watch mode.
+    """
+    env = os.environ.copy()
+    env.update(_CI_ENV_DEFAULTS)
+    return env
+
+
 # ── Execute tool ────────────────────────────────────────────────────
 
 
@@ -151,10 +279,21 @@ def execute(command: str, working_directory: str = ".") -> str:
 
     The command runs with /dev/null as stdin so interactive prompts
     cannot block. A timeout (default 300s, capped at 600s) is enforced
-    by the harness; the LLM cannot extend it.
+    by the harness; the LLM cannot extend it. CI-style environment
+    variables are injected by default (CI=1, NO_COLOR=1, etc.) so
+    test runners do not enter watch mode. Dev servers and explicit
+    --watch invocations are rejected at the boundary.
     """
     if _is_dangerous(command):
         return f"Error: dangerous command blocked: {command}"
+
+    is_watch, watch_reason = _is_watch_command(command)
+    if is_watch:
+        return (
+            "REJECTED: the harness does not run watch/daemon commands — "
+            + watch_reason
+            + f"\nRejected command: {command}"
+        )
 
     timeout = _resolve_timeout()
 
@@ -176,6 +315,7 @@ def execute(command: str, working_directory: str = ".") -> str:
             text=True,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            env=_build_env(),
         )
         output = ""
         if result.stdout:

@@ -9,8 +9,11 @@ import pytest
 
 from coding_agent.tools.shell import (
     _AUTO_FIX_RULES,
+    _CI_ENV_DEFAULTS,
     _autofix_command,
+    _build_env,
     _is_dangerous,
+    _is_watch_command,
     _resolve_timeout,
     execute,
 )
@@ -169,3 +172,136 @@ def test_execute_autofix_npm_create_emits_notice(tmp_path: Path, monkeypatch):
     fixed, reasons = _autofix_command("npm init somepkg")
     assert "--yes" in fixed
     assert reasons
+
+
+# ── Watch/daemon command guard (P0.2) ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "vitest",
+        "npx vitest",
+        "vitest --ui",
+        "vitest --watch",
+        "jest --watch",
+        "jest --watchAll",
+        "npm run dev",
+        "npm run start",
+        "yarn dev",
+        "pnpm dev",
+        "yarn serve",
+        "npm run watch",
+        "npx vite",
+        "vite",
+        "vite dev",
+        "next dev",
+        "nuxt dev",
+        "webpack-dev-server",
+        "python -m http.server",
+        "http.server",
+        "flask run",
+        "uvicorn main:app",
+        "gunicorn app:main",
+        "tsc --watch",
+        "tsc -w",
+        "nodemon app.js",
+        "pm2 start app.js",
+        "cd /workspace && npm run dev",  # prefix cd should still trigger
+        "source .env && vitest",
+    ],
+)
+def test_is_watch_command_blocks_known_daemons(command: str):
+    is_watch, reason = _is_watch_command(command)
+    assert is_watch, f"expected watch-mode rejection for: {command!r}"
+    assert reason  # non-empty diagnostic
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "vitest run",
+        "vitest run --reporter=verbose",
+        "npx vitest run",
+        "jest --watchAll=false",
+        "npm test",
+        "npm run build",
+        "vite build",
+        "next build",
+        "pytest",
+        "pytest -x",
+        "ls -la",
+        "python -m pytest",
+        "tsc",
+        "tsc --noEmit",
+        "npm install",
+        "npm ci",
+        "echo hello",
+        # Identifiers that contain substrings like "dev" or "serve"
+        # but are not actually watch commands:
+        "./test-server-dev-tools --help",
+        "grep dev file.txt",
+        "./my-watcher-tool --run",
+    ],
+)
+def test_is_watch_command_allows_one_shot_variants(command: str):
+    is_watch, reason = _is_watch_command(command)
+    assert not is_watch, (
+        f"false positive: {command!r} flagged as watch — reason: {reason}"
+    )
+
+
+def test_execute_rejects_watch_command_without_running(tmp_path: Path):
+    result = execute.invoke(
+        {"command": "vitest", "working_directory": str(tmp_path)}
+    )
+    assert "REJECTED" in result
+    assert "watch" in result.lower()
+    # Must include the actual rejected command in the message.
+    assert "vitest" in result
+
+
+def test_execute_rejects_npm_run_dev(tmp_path: Path):
+    result = execute.invoke(
+        {"command": "npm run dev", "working_directory": str(tmp_path)}
+    )
+    assert "REJECTED" in result
+    assert "dev" in result.lower()
+
+
+# ── CI environment injection (P0.1) ──────────────────────────────────
+
+
+def test_ci_env_defaults_contain_expected_keys():
+    # These are the CI-style variables we rely on to suppress
+    # watch mode and interactive prompts in test runners.
+    for key in ("CI", "DEBIAN_FRONTEND", "NO_COLOR", "TERM"):
+        assert key in _CI_ENV_DEFAULTS
+
+
+def test_build_env_overlays_ci_defaults_on_current_env(monkeypatch):
+    monkeypatch.setenv("CI", "")  # simulate unset-like
+    monkeypatch.setenv("PATH", "/tmp/fake-path:/usr/bin")
+    env = _build_env()
+    # Defaults applied
+    assert env["CI"] == "1"
+    assert env["DEBIAN_FRONTEND"] == "noninteractive"
+    assert env["NO_COLOR"] == "1"
+    assert env["TERM"] == "dumb"
+    # Existing critical variables preserved
+    assert env["PATH"].startswith("/tmp/fake-path")
+
+
+def test_execute_subprocess_receives_ci_env(tmp_path: Path):
+    """Real subprocess run — verify CI=1 lands in the child process."""
+    result = execute.invoke(
+        {
+            "command": "env | grep -E '^(CI|NO_COLOR|DEBIAN_FRONTEND|TERM)='",
+            "working_directory": str(tmp_path),
+        }
+    )
+    # CI=1 must appear in the env output; spot-check a few keys
+    assert "CI=1" in result
+    assert "NO_COLOR=1" in result
+    assert "DEBIAN_FRONTEND=noninteractive" in result
+    assert "TERM=dumb" in result

@@ -42,26 +42,64 @@ _SECTION_TITLES: dict[SpecSectionName, str] = {
     "dod": "## 4. Definition of Done",
 }
 
-# Validation thresholds are intentionally strict enough to rule out
-# "I just wrote a sentence" outputs but loose enough that a competent
-# plan passes on the first try.
+# Validation thresholds — tuned so "minimum acceptable" equals "decent"
+# rather than "barely passes". The planner must produce real detail per
+# task (artifact paths + acceptance criteria) not just one-line bullets.
 _MIN_GOALS_LEN = 200
 _MIN_GOALS_BULLETS = 3
 
-_MIN_TASKS_LEN = 300
-_MIN_TASK_COUNT = 8
+_MIN_TASKS_LEN = 1200  # total section length — forces per-task detail
+_MIN_TASK_COUNT = 10   # atomic task count (was 8)
 _TASK_ID_PATTERN = re.compile(r"TASK-\d{2,}")
 
-_MIN_DEPENDENCY_EDGES = 1
+# Per-task structural requirements: each TASK-NN block must contain
+# BOTH an artifact/file reference AND an acceptance criterion marker.
+_ARTIFACT_MARKERS = re.compile(
+    r"("
+    r"산출물|파일|경로|엔드포인트|artifact|file|path|endpoint|"
+    r"\.(?:py|ts|tsx|js|jsx|vue|svelte|md|sql|yaml|yml|json|css|scss|go|rs|java)\b|"
+    r"/[a-zA-Z0-9_./-]+"
+    r")",
+    re.IGNORECASE,
+)
+_ACCEPTANCE_MARKERS = re.compile(
+    r"("
+    r"GWT|Given.*When.*Then|Given/When/Then|"
+    r"(?:^|\n)\s*[-*]?\s*G\s*:.*?(?:\n.*?)?\s*[-*]?\s*W\s*:.*?(?:\n.*?)?\s*[-*]?\s*T\s*:|"
+    r"수용\s*기준|acceptance|"
+    r"- \[[ xX]\]"  # checkbox counts as acceptance too
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_MIN_DEPENDENCY_EDGES = 3  # was 1
 _DEPENDENCY_EDGE_PATTERN = re.compile(
     r"TASK-\d{2,}\s*(?:->|→|depends on|blocks)\s*TASK-\d{2,}",
     re.IGNORECASE,
 )
 
-_MIN_DOD_CHECKBOXES = 20
+_MIN_DOD_CHECKBOXES = 25  # was 20
 _CHECKBOX_PATTERN = re.compile(r"^\s*-\s*\[[ xX]\]", re.MULTILINE)
 
 _BULLET_PATTERN = re.compile(r"^\s*[-*]\s+\S", re.MULTILINE)
+
+
+def _split_task_blocks(stripped: str) -> list[tuple[str, str]]:
+    """Split a tasks section into (task_id, block_content) pairs.
+
+    Each block runs from one TASK-NN marker up to (but not including)
+    the next TASK-NN marker. If the section has no markers the list
+    is empty.
+    """
+    blocks: list[tuple[str, str]] = []
+    matches = list(_TASK_ID_PATTERN.finditer(stripped))
+    for i, m in enumerate(matches):
+        task_id = m.group(0)
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(stripped)
+        block = stripped[start:end]
+        blocks.append((task_id, block))
+    return blocks
 
 
 class SpecSectionInput(BaseModel):
@@ -110,7 +148,9 @@ def validate_section_content(section: SpecSectionName, content: str) -> None:
         if len(stripped) < _MIN_TASKS_LEN:
             raise ValueError(
                 f"'tasks' must be at least {_MIN_TASKS_LEN} characters "
-                f"(got {len(stripped)})."
+                f"(got {len(stripped)}). Each task needs artifact paths "
+                "AND acceptance criteria (Given/When/Then or checklist) — "
+                "one-line bullets are not enough."
             )
         task_ids = _TASK_ID_PATTERN.findall(stripped)
         unique_ids = set(task_ids)
@@ -119,6 +159,51 @@ def validate_section_content(section: SpecSectionName, content: str) -> None:
                 f"'tasks' must define at least {_MIN_TASK_COUNT} atomic tasks "
                 f"using IDs like TASK-01, TASK-02, ... "
                 f"(found {len(unique_ids)} unique IDs)."
+            )
+        # ── Per-task structural validation ──
+        # Each TASK-NN block must contain BOTH an artifact reference
+        # (file path / module / endpoint) AND an acceptance criterion
+        # (GWT / Given-When-Then / checklist / 수용 기준).
+        blocks = _split_task_blocks(stripped)
+        missing_artifact: list[str] = []
+        missing_acceptance: list[str] = []
+        too_short: list[str] = []
+        for task_id, block in blocks:
+            if len(block) < 100:
+                too_short.append(task_id)
+                continue
+            if not _ARTIFACT_MARKERS.search(block):
+                missing_artifact.append(task_id)
+            if not _ACCEPTANCE_MARKERS.search(block):
+                missing_acceptance.append(task_id)
+        if too_short:
+            raise ValueError(
+                f"Tasks {', '.join(too_short[:5])} are too short (<100 chars). "
+                "Each task block must include artifact paths AND acceptance criteria — "
+                "write several lines per task, not a single bullet."
+            )
+        if missing_artifact:
+            raise ValueError(
+                f"Tasks {', '.join(missing_artifact[:5])} are missing artifact references "
+                "(산출물/파일경로/endpoint). Example format per task:\n"
+                "- TASK-01: 인증 API\n"
+                "  - **산출물**: src/api/auth.py, tests/test_auth.py\n"
+                "  - **GWT**\n"
+                "    - G: 가입된 사용자가 존재\n"
+                "    - W: POST /api/login {email, password}\n"
+                "    - T: 200 {access_token}, 잘못된 비밀번호 시 401"
+            )
+        if missing_acceptance:
+            raise ValueError(
+                f"Tasks {', '.join(missing_acceptance[:5])} are missing acceptance "
+                "criteria. Each task needs Given/When/Then (GWT) or a checklist. "
+                "Example:\n"
+                "- TASK-01: ...\n"
+                "  - **산출물**: path/to/file.py\n"
+                "  - **GWT**\n"
+                "    - G: <초기 상태>\n"
+                "    - W: <행위>\n"
+                "    - T: <기대 결과>"
             )
         return
 

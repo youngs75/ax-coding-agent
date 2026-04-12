@@ -237,8 +237,14 @@ def test_renderer_invalid_then_valid():
 
 
 def test_tool_is_registered_in_manager_resolver():
-    from coding_agent.subagents.manager import _resolve_tools
-    resolved = _resolve_tools(["ask_user_question"])
+    from unittest.mock import MagicMock
+
+    from coding_agent.subagents.factory import SubAgentFactory
+    from coding_agent.subagents.manager import SubAgentManager
+    from coding_agent.subagents.registry import SubAgentRegistry
+
+    manager = SubAgentManager(SubAgentRegistry(), SubAgentFactory(SubAgentRegistry(), MagicMock()))
+    resolved = manager._resolve_tools(["ask_user_question"])
     assert len(resolved) == 1
     assert resolved[0].name == "ask_user_question"
 
