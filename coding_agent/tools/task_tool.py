@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import StructuredTool
+from langgraph.errors import GraphInterrupt
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
@@ -70,7 +72,28 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
     _log = _structlog.get_logger("task_tool")
 
     def _run_task(description: str, agent_type: str = "auto") -> str:
-        """Spawn a SubAgent to handle the described task and return its output."""
+        """Spawn a SubAgent to handle the described task and return its output.
+
+        Interrupt-aware: if the SubAgent pauses on a LangGraph interrupt
+        (e.g. ask_user_question called from a planner), this function
+        propagates the interrupt up to the orchestrator graph by calling
+        ``interrupt()`` itself. The orchestrator pauses too, the user
+        answers via the CLI, and on resume the *same* SubAgent run picks
+        up where it left off — no re-spawn, no duplicate LLM call.
+        """
+
+        def _spawn() -> Any:
+            return _run_async(manager.spawn(description, agent_type=agent_type))
+
+        def _resume(answer: Any) -> Any:
+            return _run_async(
+                manager.spawn(
+                    description,
+                    agent_type=agent_type,
+                    resume_value=answer,
+                )
+            )
+
         try:
             t0 = _time.monotonic()
             _log.info(
@@ -79,7 +102,29 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
                 desc=description[:80],
             )
 
-            result = _run_async(manager.spawn(description, agent_type=agent_type))
+            result = _spawn()
+
+            # ── Interrupt propagation loop ──
+            # The SubAgent may pause on any number of ask_user_question
+            # interrupts. Each one is forwarded up to the orchestrator
+            # graph via interrupt(); the resume value comes back here
+            # and we hand it to the SubAgent via _resume().
+            while result.interrupt_payload is not None:
+                _log.info(
+                    "task_tool.propagate_interrupt",
+                    agent_type=agent_type,
+                    thread_id=result.thread_id,
+                )
+                # interrupt() raises GraphInterrupt the first time the
+                # tool node runs; the second time (after Command(resume=))
+                # it returns the answer immediately.
+                user_answer = interrupt(result.interrupt_payload)
+                _log.info(
+                    "task_tool.received_answer",
+                    answer_preview=str(user_answer)[:80],
+                )
+                result = _resume(user_answer)
+
             elapsed = _time.monotonic() - t0
 
             _log.info(
@@ -108,6 +153,9 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
             else:
                 return f"SubAgent failed: {result.error or 'unknown error'}"
 
+        except GraphInterrupt:
+            # Must propagate so the outer graph pauses for the user.
+            raise
         except Exception as exc:
             return f"Error spawning SubAgent: {exc}"
 

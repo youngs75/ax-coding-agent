@@ -55,7 +55,8 @@ up:
 	  echo "     (편집기로 .env 열어서 DASHSCOPE_API_KEY 입력)"; \
 	  exit 1; \
 	fi
-	docker compose up -d --build litellm-db litellm agent
+	docker compose build agent
+	docker compose up -d litellm-db litellm
 	@echo ""
 	@echo "⏳ LiteLLM Gateway healthy 체크 중 (최대 120초)..."
 	@timeout 120 bash -c 'until [ "$$(docker inspect --format={{.State.Health.Status}} ax-litellm-proxy 2>/dev/null)" = "healthy" ]; do sleep 2; done' || (echo "⚠  Gateway 기동 실패 — docker compose logs litellm 확인"; exit 1)

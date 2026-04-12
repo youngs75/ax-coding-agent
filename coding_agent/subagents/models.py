@@ -7,6 +7,7 @@ import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Any
 
 
 class SubAgentStatus(str, Enum):
@@ -131,3 +132,10 @@ class SubAgentResult:
     error: str | None = None
     written_files: list[str] = field(default_factory=list)
     duration_s: float = 0.0
+    # If the SubAgent paused on a LangGraph interrupt() (e.g. an
+    # ask_user_question call inside a planner), this holds the payload.
+    # The caller (task_tool) propagates it to the orchestrator graph by
+    # calling interrupt() again. ``thread_id`` lets the caller resume
+    # the same SubAgent run later via Command(resume=...).
+    interrupt_payload: Any = None
+    thread_id: str | None = None

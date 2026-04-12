@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import time
+from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -164,7 +165,16 @@ async def _run_resume() -> None:
 # ── 스트리밍 에이전트 실행 ──
 
 async def _run_agent_streaming(user_input: str) -> None:
-    """LangGraph astream_events로 실시간 도구 호출/메모리 이벤트를 표시."""
+    """LangGraph astream_events로 실시간 도구 호출/메모리 이벤트를 표시.
+
+    Interrupt-aware: when the graph pauses on an ``ask_user_question``
+    interrupt, the renderer collects answers and we resume the same
+    thread with ``Command(resume=...)``.
+    """
+    import uuid as _uuid
+    from langgraph.types import Command as _Command
+    from coding_agent.cli.question_renderer import render_ask_user_question
+
     loop = _get_loop()
     graph = loop._graph
     store = loop.get_memory_store()
@@ -190,121 +200,148 @@ async def _run_agent_streaming(user_input: str) -> None:
     console.print(f"  [bold cyan]{ICON_AGENT} Orchestrator[/bold cyan]")
     console.print()
 
+    # Per-request thread_id; reused across resume rounds so the
+    # checkpointer can pick up the same conversation state.
+    thread_id = f"orch-{_uuid.uuid4()}"
+    config = {
+        "recursion_limit": 500,
+        "configurable": {"thread_id": thread_id},
+    }
+
     # Fix 4: Track SubAgent nesting depth to filter internal events.
     # When _subagent_depth > 0, we're inside a SubAgent — suppress
     # internal LLM streaming and most tool events to avoid CLI noise.
     _subagent_depth = 0
 
-    try:
-        async for event in graph.astream_events(
-            initial_state, version="v2", config={"recursion_limit": 500}
-        ):
-            kind = event.get("event", "")
-            name = event.get("name", "")
-            data = event.get("data", {})
+    # Outer loop drives interrupt-resume rounds. The first iteration
+    # passes the initial_state; subsequent rounds pass Command(resume=...).
+    next_input: Any = initial_state
 
-            # ── SubAgent 위임 감지 ──
-            if kind == "on_tool_start" and name == "task":
-                _subagent_depth += 1
-                tool_input = data.get("input", {})
-                raw_desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
-                first_line = raw_desc.split("\n")[0].strip()
-                desc = first_line[:50] + "..." if len(first_line) > 50 else first_line
-                agent_type = tool_input.get("agent_type", "auto") if isinstance(tool_input, dict) else "auto"
-                spinner.stop()
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-                print_subagent_start(agent_type, desc)
-                _sa_info = {"start_time": time.time(), "steps": 0, "tools": 0}
-                spinner.start("initializing...")
-                continue
+    while True:
+        try:
+            async for event in graph.astream_events(
+                next_input, version="v2", config=config
+            ):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                data = event.get("data", {})
 
-            if kind == "on_tool_end" and name == "task":
-                _subagent_depth = max(0, _subagent_depth - 1)
-                spinner.stop()
-                output = data.get("output", "")
-                output_str = str(output.content) if hasattr(output, "content") else str(output)
-                success = "COMPLETED" in output_str and "INCOMPLETE" not in output_str
-                elapsed = time.time() - _sa_info.get("start_time", time.time())
-                print_subagent_done(
-                    elapsed, _sa_info["steps"], _sa_info["tools"], success,
-                )
-                continue
+                # ── SubAgent 위임 감지 ──
+                if kind == "on_tool_start" and name == "task":
+                    _subagent_depth += 1
+                    tool_input = data.get("input", {})
+                    raw_desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
+                    first_line = raw_desc.split("\n")[0].strip()
+                    desc = first_line[:50] + "..." if len(first_line) > 50 else first_line
+                    agent_type = tool_input.get("agent_type", "auto") if isinstance(tool_input, dict) else "auto"
+                    spinner.stop()
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                    print_subagent_start(agent_type, desc)
+                    _sa_info = {"start_time": time.time(), "steps": 0, "tools": 0}
+                    spinner.start("initializing...")
+                    continue
 
-            # ── SubAgent 내부 이벤트: 스피너로 표시 ──
-            if _subagent_depth > 0:
-                if kind == "on_chat_model_start":
-                    _sa_info["steps"] += 1
-                    spinner.update(f"thinking... (step {_sa_info['steps']})")
-                elif kind == "on_tool_start" and name != "task":
-                    _sa_info["tools"] += 1
+                if kind == "on_tool_end" and name == "task":
+                    _subagent_depth = max(0, _subagent_depth - 1)
+                    spinner.stop()
+                    output = data.get("output", "")
+                    output_str = str(output.content) if hasattr(output, "content") else str(output)
+                    success = "COMPLETED" in output_str and "INCOMPLETE" not in output_str
+                    elapsed = time.time() - _sa_info.get("start_time", time.time())
+                    print_subagent_done(
+                        elapsed, _sa_info["steps"], _sa_info["tools"], success,
+                    )
+                    continue
+
+                # ── SubAgent 내부 이벤트: 스피너로 표시 ──
+                if _subagent_depth > 0:
+                    if kind == "on_chat_model_start":
+                        _sa_info["steps"] += 1
+                        spinner.update(f"thinking... (step {_sa_info['steps']})")
+                    elif kind == "on_tool_start" and name != "task":
+                        _sa_info["tools"] += 1
+                        tool_input = data.get("input", {})
+                        brief = ""
+                        if isinstance(tool_input, dict):
+                            brief = (
+                                tool_input.get("path", "")
+                                or tool_input.get("command", "")[:40]
+                                or tool_input.get("pattern", "")
+                            )
+                        spinner.update(f"{name} {brief}".strip()[:60])
+                    continue
+
+                # ── 도구 호출 시작 (Orchestrator only) ──
+                if kind == "on_tool_start":
                     tool_input = data.get("input", {})
                     brief = ""
                     if isinstance(tool_input, dict):
-                        brief = (
-                            tool_input.get("path", "")
-                            or tool_input.get("command", "")[:40]
-                            or tool_input.get("pattern", "")
-                        )
-                    spinner.update(f"{name} {brief}".strip()[:60])
+                        brief = tool_input.get("path", "")
+                        if not brief:
+                            brief = tool_input.get("command", "")
+                        if not brief:
+                            brief = tool_input.get("pattern", "")
+                        if not brief:
+                            brief = tool_input.get("description", "")[:60]
+                    print_tool_call(name, brief)
+
+                # ── 도구 호출 완료 (Orchestrator only) ──
+                elif kind == "on_tool_end":
+                    output = data.get("output", "")
+                    output_str = str(output.content) if hasattr(output, "content") else str(output)
+                    is_error = "error" in output_str.lower()[:50]
+                    if is_error or len(output_str) > 200:
+                        print_tool_result(name, output_str, is_error=is_error)
+
+                # ── LLM 호출 시작 (Orchestrator only) ──
+                elif kind == "on_chat_model_start":
+                    iteration += 1
+                    final_content = ""
+                    console.print(f"\r  [dim]{ICON_AGENT} Orchestrator · step {iteration}[/dim]", end="\r")
+
+                # ── LLM 스트리밍 토큰 (Orchestrator only) ──
+                elif kind == "on_chat_model_stream":
+                    chunk = data.get("chunk", None)
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        content = chunk.content
+                        if isinstance(content, str):
+                            final_content += content
+
+                # ── 노드 완료 ──
+                elif kind == "on_chain_end" and name in (
+                    "extract_memory", "extract_memory_final"
+                ):
+                    pass
+
+        except KeyboardInterrupt:
+            spinner.stop()
+            print_status("\n  Interrupted.", "yellow")
+            return
+        except Exception as e:
+            spinner.stop()
+            print_error(str(e))
+            return
+
+        # ── Interrupt detection: did the graph pause for a question? ──
+        try:
+            snap = await graph.aget_state(config)
+        except Exception:
+            snap = None
+        interrupts = getattr(snap, "interrupts", None) if snap else None
+        if interrupts:
+            spinner.stop()
+            payload = getattr(interrupts[0], "value", None)
+            if isinstance(payload, dict) and payload.get("kind") == "ask_user_question":
+                answers = render_ask_user_question(payload, console=console)
+                next_input = _Command(resume=answers)
                 continue
+            # Unknown interrupt — surface and bail
+            print_error(f"Unhandled interrupt payload: {payload!r}")
+            return
 
-            # ── 도구 호출 시작 (Orchestrator only) ──
-            if kind == "on_tool_start":
-                tool_input = data.get("input", {})
-                brief = ""
-                if isinstance(tool_input, dict):
-                    brief = tool_input.get("path", "")
-                    if not brief:
-                        brief = tool_input.get("command", "")
-                    if not brief:
-                        brief = tool_input.get("pattern", "")
-                    if not brief:
-                        brief = tool_input.get("description", "")[:60]
-                print_tool_call(name, brief)
-
-            # ── 도구 호출 완료 (Orchestrator only) ──
-            elif kind == "on_tool_end":
-                output = data.get("output", "")
-                output_str = str(output.content) if hasattr(output, "content") else str(output)
-                is_error = "error" in output_str.lower()[:50]
-                if is_error or len(output_str) > 200:
-                    print_tool_result(name, output_str, is_error=is_error)
-
-            # ── LLM 호출 시작 (Orchestrator only) ──
-            elif kind == "on_chat_model_start":
-                iteration += 1
-                # Reset per-iteration content so only the LAST response
-                # is kept.  This prevents 50 iterations of internal
-                # reasoning + memory JSON from leaking into CLI output.
-                final_content = ""
-                console.print(f"\r  [dim]{ICON_AGENT} Orchestrator · step {iteration}[/dim]", end="\r")
-
-            # ── LLM 스트리밍 토큰 (Orchestrator only) ──
-            elif kind == "on_chat_model_stream":
-                chunk = data.get("chunk", None)
-                if chunk and hasattr(chunk, "content") and chunk.content:
-                    content = chunk.content
-                    if isinstance(content, str):
-                        # Append to current iteration's content only.
-                        # final_content is reset on each on_chat_model_start
-                        # so only the LAST response is kept for display.
-                        final_content += content
-
-            # ── 노드 완료 ──
-            elif kind == "on_chain_end" and name in (
-                "extract_memory", "extract_memory_final"
-            ):
-                pass
-
-    except KeyboardInterrupt:
-        spinner.stop()
-        print_status("\n  Interrupted.", "yellow")
-        return
-    except Exception as e:
-        spinner.stop()
-        print_error(str(e))
-        return
+        # No interrupt — graph finished naturally
+        break
 
     elapsed = time.time() - start_time
     spinner.stop()

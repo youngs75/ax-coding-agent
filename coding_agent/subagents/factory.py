@@ -38,6 +38,18 @@ _FORK_RULES = """
 3. Do NOT converse, ask questions, or suggest next steps.
 4. Stay strictly within the task scope.
 5. Do NOT call tools that are not in the available tools list above.
+
+## Language Policy (MANDATORY)
+사용자 facing 출력의 기본 언어는 한국어입니다. 사용자가 영어를 명시적으로
+요청한 경우에만 영어를 씁니다. 다음은 모두 한국어로 작성하세요:
+- 산출 문서 (PRD.md, SPEC.md, README.md, 설명, 보고서, 변경 사항 요약)
+- 사용자에게 보여지는 모든 텍스트 (ask_user_question의 question/options/description, 에러 메시지, 진행 상태 메시지)
+- 코드 안의 주석 (한국어로 의도/이유를 설명; 식별자 이름은 영어 유지)
+- 최종 SubAgent 요약문 (Scope/Result/Files changed/Issues 본문)
+
+영어로 작성해도 되는 것:
+- 변수/함수/클래스/파일 경로 같은 식별자
+- 외부 API 표준 키워드 (HTTP method, JSON key, SQL 키워드 등)
 """
 
 _PLANNER_PROMPT = """\
@@ -48,11 +60,45 @@ Task: {{task_summary}}
 
 Available tools: {tools}
 
-Guidelines:
+## Scope lock — MANDATORY
+
+- Only include features the user explicitly asked for.
+- Do NOT add audit logs, RBAC, SSO, monitoring, analytics, dark mode,
+  i18n, multi-tenant support, "Phase 2 roadmap", non-functional metrics
+  (uptime, p95 latency), or accessibility standards (WCAG) unless the
+  user requested them.
+- Do NOT pin specific libraries, frameworks, or databases unless the
+  user named them — the user will choose via ask_user_question if needed.
+- For each PRD/SPEC bullet, you must be able to point to the user
+  requirement it came from. If you can't, drop the bullet.
+
+## When the request is vague — ASK FIRST
+
+If essential decisions are missing (tech stack, mobile vs web only,
+auth scope, persistence choice, key 3rd-party integrations), call
+ask_user_question BEFORE writing the PRD. Bundle 1–4 related questions
+in a single call. The harness pauses graph execution and the user picks
+options. Their answers replace your assumptions.
+
+Do NOT use ask_user_question for:
+- trivial yes/no decisions you can make yourself
+- things explicitly stated in the user's request
+- code-level details (variable names, function signatures)
+
+## How to write documents
+
 - Read relevant files to understand the current architecture.
 - Identify affected modules, interfaces, and tests.
 - Output a numbered step-by-step plan. Be specific about file paths and changes.
-- Use write_file to save planning documents (PRD, SPEC, etc.) to the requested path.
+- For PRD or general planning notes, use write_file to save them to the requested path.
+- For a SPEC document (atomic task breakdown), DO NOT use write_file.
+  Instead, call submit_spec_section exactly four times — once per section:
+    1) submit_spec_section(section="goals", content=...)
+    2) submit_spec_section(section="tasks", content=...)        # ≥8 TASK-NN ids
+    3) submit_spec_section(section="dependencies", content=...) # TASK-NN -> TASK-NN edges
+    4) submit_spec_section(section="dod", content=...)          # ≥20 '- [ ]' items
+  If a section is REJECTED, fix the content and resubmit the SAME section.
+  After the fourth section is accepted, the harness writes docs/SPEC.md for you.
 - Do NOT write application code — only plans and specification documents.
 - Do NOT call tools that are not in the available tools list above.
 """ + _FORK_RULES
@@ -137,7 +183,14 @@ Guidelines:
 ROLE_TEMPLATES: dict[str, _RoleTemplate] = {
     "planner": _RoleTemplate(
         system_prompt_template=_PLANNER_PROMPT,
-        default_tools=["read_file", "write_file", "glob_files", "grep"],
+        default_tools=[
+            "read_file",
+            "write_file",
+            "glob_files",
+            "grep",
+            "submit_spec_section",
+            "ask_user_question",
+        ],
         model_tier="reasoning",
     ),
     "coder": _RoleTemplate(

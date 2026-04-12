@@ -67,6 +67,13 @@ services:
       - agent-net
 
   # ── AI Coding Agent ──
+  # NOTE: 이 서비스는 `docker compose build`로 이미지를 만드는 용도입니다.
+  # 실행은 `./ax-agent.sh`가 별도의 `docker run`으로 수행하므로, `make up`은
+  # 이 서비스를 기동하지 않습니다. `docker compose run --rm agent`로 직접
+  # 실행하고 싶다면 HOST_UID/HOST_GID를 먼저 export 하세요:
+  #   export HOST_UID=$(id -u) HOST_GID=$(id -g)
+  # 기본 WORKSPACE_DIR는 ./workspace 로 고정되어 있어 프로젝트 루트가
+  # 실수로 바인드 마운트되는 것을 방지합니다.
   agent:
     build: .
     image: ax-coding-agent           # ax-agent.sh가 이 이름으로 docker run 직접 호출
@@ -74,9 +81,11 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - ${WORKSPACE_DIR:-.}:/workspace
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
       - agent-memory:/app/memory_store
     environment:
+      - HOST_UID=${HOST_UID:-1000}
+      - HOST_GID=${HOST_GID:-1000}
       - LLM_PROVIDER=litellm
       - LITELLM_PROXY_URL=http://litellm:4000/v1
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-harness-local-dev}
@@ -91,6 +100,8 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
+    profiles:
+      - manual                       # make up에서 자동 기동 방지
     networks:
       - agent-net
 

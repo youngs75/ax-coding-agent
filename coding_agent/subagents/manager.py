@@ -10,7 +10,9 @@ Incorporates four root-cause fixes from E2E analysis:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+import uuid
 from typing import Any, Sequence
 
 import structlog
@@ -22,8 +24,10 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command
 
 from coding_agent.core.state import AgentState
 from coding_agent.models import get_model
@@ -34,8 +38,10 @@ from coding_agent.subagents.models import (
     SubAgentStatus,
 )
 from coding_agent.subagents.registry import SubAgentRegistry
+from coding_agent.tools.ask_tool import ask_user_question_tool
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
+from coding_agent.tools.spec_tool import build_submit_spec_section_tool
 
 log = structlog.get_logger(__name__)
 
@@ -46,16 +52,36 @@ log = structlog.get_logger(__name__)
 # work was clearly valid, just unfinished.
 _SUBAGENT_MAX_TURNS = 100  # hard limit per SubAgent session
 
-# Map tool names to actual tool objects
+# Map tool names to actual tool objects (static / shareable across sessions)
 _ALL_TOOLS: dict[str, BaseTool] = {}
 for _t in FILE_TOOLS + SHELL_TOOLS:
     _ALL_TOOLS[_t.name] = _t
 
+# ask_user_question is shareable (no per-session state) — its handler
+# pauses the LangGraph via interrupt() so the same instance works for
+# every SubAgent that lists it among its tools.
+_ALL_TOOLS[ask_user_question_tool.name] = ask_user_question_tool
+
+# Tool names whose instances must be built fresh per SubAgent invocation
+# because they own per-session state (e.g. SpecSectionStore).
+_DYNAMIC_TOOL_BUILDERS: dict[str, callable] = {  # type: ignore[type-arg]
+    "submit_spec_section": build_submit_spec_section_tool,
+}
+
 
 def _resolve_tools(tool_names: list[str]) -> list[BaseTool]:
-    """Resolve a list of tool name strings into BaseTool instances."""
+    """Resolve a list of tool name strings into BaseTool instances.
+
+    Static tools come from the shared registry. Dynamic tools (those with
+    per-session state) are built fresh on every call so each SubAgent
+    invocation gets its own store.
+    """
     resolved: list[BaseTool] = []
     for name in tool_names:
+        builder = _DYNAMIC_TOOL_BUILDERS.get(name)
+        if builder is not None:
+            resolved.append(builder())
+            continue
         tool = _ALL_TOOLS.get(name)
         if tool is not None:
             resolved.append(tool)
@@ -70,6 +96,28 @@ class SubAgentManager:
     def __init__(self, registry: SubAgentRegistry, factory: SubAgentFactory) -> None:
         self._registry = registry
         self._factory = factory
+        # ── Interrupt-aware spawn cache ──
+        # When a SubAgent pauses on a LangGraph interrupt(), the caller
+        # (task_tool) records the (graph, thread_id, instance) here so a
+        # subsequent resume call can find the *same* compiled graph and
+        # the *same* thread_id, avoiding a fresh spawn that would re-run
+        # the LLM and rewrite files.  Keyed by a deterministic hash of
+        # the spawn arguments — same description+agent_type → same key.
+        self._paused_runs: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _spawn_key(task_description: str, agent_type: str) -> str:
+        """Deterministic key for caching paused SubAgent runs.
+
+        Uses a SHA-1 of the (description, agent_type) tuple. The same
+        spawn call from a re-executed orchestrator node maps to the same
+        key, which is what lets us resume instead of re-spawn.
+        """
+        h = hashlib.sha1()
+        h.update(task_description.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(agent_type.encode("utf-8"))
+        return h.hexdigest()[:16]
 
     # ── Spawn ─────────────────────────────────────────────────
 
@@ -78,19 +126,76 @@ class SubAgentManager:
         task_description: str,
         parent_id: str | None = None,
         agent_type: str = "auto",
+        resume_value: Any = None,
     ) -> SubAgentResult:
         """Spawn a SubAgent, execute it, and return the result.
 
-        The full lifecycle is managed here:
-        CREATED -> ASSIGNED -> RUNNING -> COMPLETED/FAILED -> DESTROYED
+        Lifecycle: CREATED -> ASSIGNED -> RUNNING -> COMPLETED/FAILED -> DESTROYED
+
+        If a previous call with the same (task_description, agent_type)
+        is paused on an interrupt, this call resumes that run instead of
+        starting a new one. ``resume_value`` is forwarded as the answer
+        to the inner ``interrupt()``.
         """
+        key = self._spawn_key(task_description, agent_type)
+        paused = self._paused_runs.get(key)
+
+        if paused is not None:
+            instance: SubAgentInstance = paused["instance"]
+            graph = paused["graph"]
+            thread_id: str = paused["thread_id"]
+            get_hit_max_turns = paused["get_hit_max_turns"]
+
+            # Idempotent re-spawn: when the orchestrator re-executes its
+            # tools node after an interrupt, _run_task calls spawn() again
+            # without an answer. We must NOT re-invoke the SubAgent in
+            # that case — return the cached interrupt payload so the
+            # task_tool's interrupt() picks up the user's stored answer.
+            if resume_value is None:
+                cached_payload = paused.get("interrupt_payload")
+                log.info(
+                    "subagent.resume_idempotent",
+                    agent_id=instance.agent_id,
+                    thread_id=thread_id,
+                )
+                return SubAgentResult(
+                    success=True,
+                    output="(awaiting user input)",
+                    interrupt_payload=cached_payload,
+                    thread_id=thread_id,
+                )
+
+            # Real resume: caller has the user's answer.
+            log.info(
+                "subagent.resume",
+                agent_id=instance.agent_id,
+                thread_id=thread_id,
+                resume_preview=str(resume_value)[:60],
+            )
+            try:
+                result = await self._invoke_graph(
+                    instance=instance,
+                    graph=graph,
+                    thread_id=thread_id,
+                    get_hit_max_turns=get_hit_max_turns,
+                    initial_or_resume=Command(resume=resume_value),
+                    spawn_key=key,
+                )
+                return result
+            finally:
+                # If the result is final (no more interrupts), drop the cache.
+                if key in self._paused_runs and not self._paused_runs[key].get("paused"):
+                    self._paused_runs.pop(key, None)
+                    self._try_destroy(instance.agent_id, reason="resume_complete")
+
+        # Fresh spawn path
         instance = self._factory.create_for_task(
             task_description, parent_id=parent_id, agent_type=agent_type
         )
         agent_id = instance.agent_id
 
         try:
-            result = await self._execute_with_retries(instance)
+            result = await self._execute_with_retries(instance, spawn_key=key)
             return result
         except Exception as exc:
             log.error(
@@ -109,7 +214,11 @@ class SubAgentManager:
             # Always attempt cleanup to DESTROYED
             self._try_destroy(agent_id, reason="spawn_complete")
 
-    async def _execute_with_retries(self, instance: SubAgentInstance) -> SubAgentResult:
+    async def _execute_with_retries(
+        self,
+        instance: SubAgentInstance,
+        spawn_key: str | None = None,
+    ) -> SubAgentResult:
         """Run the agent loop, retrying on failure up to max_retries."""
         agent_id = instance.agent_id
 
@@ -136,9 +245,15 @@ class SubAgentManager:
 
             start = time.monotonic()
             try:
-                result = await self._run_agent(instance)
+                result = await self._run_agent(instance, spawn_key=spawn_key)
                 duration = time.monotonic() - start
                 result.duration_s = duration
+
+                # An interrupt is *not* a failure — return immediately so
+                # the caller can propagate it. Lifecycle stays at RUNNING
+                # until the resume completes (or fails).
+                if result.interrupt_payload is not None:
+                    return result
 
                 if result.success:
                     self._registry.transition_state(
@@ -216,7 +331,11 @@ class SubAgentManager:
                     duration_s=duration,
                 )
 
-    async def _run_agent(self, instance: SubAgentInstance) -> SubAgentResult:
+    async def _run_agent(
+        self,
+        instance: SubAgentInstance,
+        spawn_key: str | None = None,
+    ) -> SubAgentResult:
         """Build and invoke the LangGraph for a single attempt."""
         t_total = time.monotonic()
 
@@ -237,6 +356,8 @@ class SubAgentManager:
             ],
         }
 
+        thread_id = f"sub-{instance.agent_id}-{uuid.uuid4().hex[:8]}"
+
         log.info(
             "timing.subagent.setup",
             agent_id=instance.agent_id,
@@ -245,14 +366,48 @@ class SubAgentManager:
             tools=instance.tools,
             setup_s=round(setup_elapsed, 3),
             graph_build_s=round(graph_elapsed, 3),
+            thread_id=thread_id,
         )
+
+        return await self._invoke_graph(
+            instance=instance,
+            graph=graph,
+            thread_id=thread_id,
+            get_hit_max_turns=get_hit_max_turns,
+            initial_or_resume=initial_state,
+            spawn_key=spawn_key,
+            t_total=t_total,
+        )
+
+    async def _invoke_graph(
+        self,
+        instance: SubAgentInstance,
+        graph: Any,
+        thread_id: str,
+        get_hit_max_turns: Any,
+        initial_or_resume: Any,
+        spawn_key: str | None = None,
+        t_total: float | None = None,
+    ) -> SubAgentResult:
+        """Single ``ainvoke`` call against an already-built SubAgent graph.
+
+        Used for both the fresh path (initial state) and the resume path
+        (Command). Detects ``__interrupt__`` and returns a SubAgentResult
+        with ``interrupt_payload`` set, plus caches the run in
+        ``_paused_runs`` so a future ``spawn`` with the same ``spawn_key``
+        will resume rather than re-execute.
+        """
+        if t_total is None:
+            t_total = time.monotonic()
+
+        config = {
+            "recursion_limit": 500,
+            "configurable": {"thread_id": thread_id},
+        }
 
         try:
             t0 = time.monotonic()
-            final_state = await graph.ainvoke(
-                initial_state,
-                config={"recursion_limit": 500},
-            )
+            final_state = await graph.ainvoke(initial_or_resume, config=config)
             invoke_elapsed = time.monotonic() - t0
 
             log.info(
@@ -261,7 +416,7 @@ class SubAgentManager:
                 role=instance.role,
                 invoke_s=round(invoke_elapsed, 3),
                 total_s=round(time.monotonic() - t_total, 3),
-                msg_count=len(final_state.get("messages", [])),
+                msg_count=len(final_state.get("messages", []) if isinstance(final_state, dict) else []),
             )
         except Exception as exc:
             log.error(
@@ -271,6 +426,36 @@ class SubAgentManager:
                 error=str(exc)[:200],
             )
             return SubAgentResult(success=False, output="", error=str(exc))
+
+        # ── Interrupt path: ask_user_question (or any other) paused ──
+        if isinstance(final_state, dict) and final_state.get("__interrupt__"):
+            interrupts = final_state["__interrupt__"]
+            first = interrupts[0] if isinstance(interrupts, (list, tuple)) else interrupts
+            payload = getattr(first, "value", first)
+            log.info(
+                "subagent.paused_on_interrupt",
+                agent_id=instance.agent_id,
+                thread_id=thread_id,
+            )
+            if spawn_key is not None:
+                self._paused_runs[spawn_key] = {
+                    "instance": instance,
+                    "graph": graph,
+                    "thread_id": thread_id,
+                    "get_hit_max_turns": get_hit_max_turns,
+                    "paused": True,
+                    "interrupt_payload": payload,
+                }
+            return SubAgentResult(
+                success=True,
+                output="(awaiting user input)",
+                interrupt_payload=payload,
+                thread_id=thread_id,
+            )
+
+        # ── Resume completed: drop the cache entry if any ──
+        if spawn_key is not None and spawn_key in self._paused_runs:
+            self._paused_runs[spawn_key]["paused"] = False
 
         # ── Fix 3: Extract structured summary instead of raw LLM text ──
         messages = final_state.get("messages", [])
@@ -480,7 +665,12 @@ class SubAgentManager:
 
         builder.set_entry_point("agent")
 
-        compiled = builder.compile()
+        # InMemorySaver is required for interrupt() to work inside the
+        # SubAgent (e.g. ask_user_question called from a planner). Each
+        # SubAgent run gets its own checkpointer instance — runs do not
+        # share state, and the cache in _paused_runs holds the live
+        # graph reference until the resume completes.
+        compiled = builder.compile(checkpointer=InMemorySaver())
         # Return both the graph and an accessor for the max_turns flag
         # so _run_agent() can report incomplete work to the Orchestrator.
         return compiled, lambda: _hit_max_turns

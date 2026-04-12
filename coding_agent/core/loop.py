@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command
 
 from coding_agent.config import get_config
 from coding_agent.core.orchestrator import should_delegate
@@ -54,6 +57,12 @@ from coding_agent.tools.task_tool import build_task_tool, build_parallel_tasks_t
 # Note: FILE_TOOLS and SHELL_TOOLS are still imported for SubAgent use
 # via manager.py. Orchestrator only uses read-only subset (see __init__).
 
+# Async callback type for satisfying ask_user_question interrupts.
+# Receives the interrupt payload (dict) and returns the user's answer.
+from typing import Awaitable, Callable
+
+AskUserCallback = Callable[[Any], Awaitable[Any]]
+
 log = structlog.get_logger(__name__)
 
 SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
@@ -85,34 +94,27 @@ SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
 
 ## 복잡한 개발 요청의 작업 프로세스
 
-### Phase 1: 요구사항 분석 & PRD 작성
-task 도구 호출: agent_type="planner"
-→ PRD(Product Requirements Document)를 docs/PRD.md에 작성하도록 위임
+각 단계는 task 도구로 적절한 SubAgent에게 위임합니다. 도메인은 사용자 요구사항에서 도출하고, 절대 가정하지 마세요.
 
-### Phase 2: 작업 분해 & 개발 명세
-task 도구 호출: agent_type="planner"
-→ PRD를 원자 단위로 분해하고 SPEC.md를 작성하도록 위임
-→ Spec Driven Development 방식
+### Phase 1: 요구사항 분석 & PRD 작성 (planner)
+- 사용자 요구사항이 모호하면 planner가 ask_user_question으로 먼저 사용자에게 핵심 결정을 묻습니다.
+- PRD에는 사용자가 명시한 항목만 포함합니다. RBAC, SSO, 다크 모드, 모니터링, "Phase 2 로드맵" 같은 전형적 enterprise 항목을 자동으로 추가하지 마세요.
 
-### Phase 3: TDD 기반 구현 (단계별로 나눠서 위임)
-각 기능 단위로 task 도구 호출: agent_type="coder"
-→ 예: "백엔드 프로젝트 초기화 및 DB 스키마 구현"
-→ 예: "프로젝트 CRUD API 구현 (테스트 먼저 작성)"
-→ 예: "프론트엔드 초기화 및 프로젝트 목록 페이지 구현"
-→ 예: "간트 차트 컴포넌트 구현"
+### Phase 2: 작업 분해 & 개발 명세 (planner)
+- PRD를 원자 단위 작업으로 분해하여 SPEC.md를 작성합니다 (Spec Driven Development).
 
-### Phase 4: 코드 리뷰 & 검증
-task 도구 호출: agent_type="reviewer"
-→ 생성된 코드의 품질 검토 및 개선점 도출
+### Phase 3: 구현 (coder, 단계별로 나눠서)
+- SPEC의 원자 작업 단위로 task 도구 호출.
+- 작업 분해는 사용자 요구사항에서 직접 도출하세요. 도메인이 무엇인지(웹/모바일/CLI/데이터 파이프라인/...)에 따라 분해 패턴이 달라집니다 — 미리 정해진 템플릿을 따르지 마세요.
+- TDD 권장: 가능하면 테스트 먼저, 그 다음 구현.
 
-### Phase 5: 문제 수정
-task 도구 호출: agent_type="fixer"
-→ 발견된 문제점 수정
+### Phase 4: 검증 (verifier) → 코드 리뷰 (reviewer) → 수정 (fixer)
+- 필요할 때만 호출. 단순 작업에는 생략 가능.
 
 ## 작업 분할 원칙
-- 하나의 SubAgent에 너무 많은 작업을 주지 마세요
-- 기능 단위로 나눠서 여러 SubAgent를 순차적으로 호출하세요
-- 예: 백엔드 초기화 → 백엔드 API → 프론트엔드 초기화 → 프론트엔드 UI → 간트 차트
+- 하나의 SubAgent에 너무 많은 작업을 주지 마세요.
+- 기능 단위로 나눠서 순차적으로 위임하세요.
+- 사용자가 요구하지 않은 기능을 임의로 추가하지 마세요.
 
 {memory_context}
 """
@@ -510,10 +512,25 @@ class AgentLoop:
         builder.add_edge("extract_memory_final", END)
         builder.add_edge("safe_stop", END)
 
-        return builder.compile()
+        # InMemorySaver enables LangGraph interrupt() — required by the
+        # ask_user_question tool path. The checkpointer also gives us a
+        # thread-scoped resume capability for free.
+        return builder.compile(checkpointer=InMemorySaver())
 
-    async def run(self, user_message: str, project_id: str | None = None) -> dict[str, Any]:
-        """사용자 메시지를 처리하고 최종 상태를 반환한다."""
+    async def run(
+        self,
+        user_message: str,
+        project_id: str | None = None,
+        ask_user: "AskUserCallback | None" = None,
+    ) -> dict[str, Any]:
+        """사용자 메시지를 처리하고 최종 상태를 반환한다.
+
+        ``ask_user`` is an optional async callback used to satisfy
+        ``ask_user_question`` interrupts. It receives the interrupt
+        payload (a dict produced by the tool) and must return the
+        user's answer (any JSON-serializable value). If omitted and
+        an interrupt fires, the run aborts with exit_reason='no_ask_user_handler'.
+        """
         self._progress_guard.reset()
 
         initial_state: dict[str, Any] = {
@@ -522,13 +539,46 @@ class AgentLoop:
             "working_directory": get_config().project_root.as_posix(),
         }
 
-        log.info("agent_loop.start", message_length=len(user_message))
+        # Each user request gets its own thread so checkpointer state
+        # does not leak between turns. The interrupt-resume loop below
+        # uses the same thread_id to continue execution.
+        thread_id = f"orch-{uuid.uuid4()}"
+        config = {
+            "recursion_limit": 500,
+            "configurable": {"thread_id": thread_id},
+        }
+
+        log.info("agent_loop.start", message_length=len(user_message), thread_id=thread_id)
 
         try:
-            final_state = await self._graph.ainvoke(
-                initial_state,
-                config={"recursion_limit": 500},
-            )
+            final_state = await self._graph.ainvoke(initial_state, config=config)
+
+            # ── Interrupt-resume loop ──
+            # If a node called interrupt() (typically from ask_user_question
+            # propagated through task_tool), the result contains __interrupt__.
+            # We hand each interrupt to ask_user, then resume with Command.
+            while final_state and final_state.get("__interrupt__"):
+                if ask_user is None:
+                    log.warning(
+                        "agent_loop.interrupt_without_handler",
+                        thread_id=thread_id,
+                    )
+                    final_state["exit_reason"] = "no_ask_user_handler"
+                    break
+
+                interrupts = final_state["__interrupt__"]
+                # LangGraph reports interrupts as a tuple/list of Interrupt objects.
+                first = interrupts[0] if isinstance(interrupts, (list, tuple)) else interrupts
+                payload = getattr(first, "value", first)
+
+                log.info("agent_loop.interrupt", payload_type=type(payload).__name__)
+                answer = await ask_user(payload)
+                log.info("agent_loop.interrupt_resumed", answer_preview=str(answer)[:80])
+
+                final_state = await self._graph.ainvoke(
+                    Command(resume=answer),
+                    config=config,
+                )
         except Exception as e:
             log.error("agent_loop.fatal_error", error=str(e))
             final_state = {
