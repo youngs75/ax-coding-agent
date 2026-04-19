@@ -1,7 +1,13 @@
-"""MemoryMiddleware — LangGraph node functions for memory injection and extraction."""
+"""MemoryMiddleware — LangGraph node functions for memory injection and extraction.
+
+Backed by ``minyoung_mah.SqliteMemoryStore`` (async). Keeps the
+3-layer ``user`` / ``project`` / ``domain`` semantics on top of the library's
+``tier``/``scope`` schema: ``layer→tier``, ``project_id→scope``.
+"""
 
 from __future__ import annotations
 
+import asyncio
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -9,8 +15,8 @@ import structlog
 
 from coding_agent.core.state import AgentState
 from coding_agent.memory.extractor import MemoryExtractor
-from coding_agent.memory.schema import MemoryRecord
-from coding_agent.memory.store import MemoryStore
+from coding_agent.memory.schema import MemoryRecord, entry_to_record, record_to_entry
+from minyoung_mah import MemoryStore
 
 log = structlog.get_logger(__name__)
 
@@ -18,7 +24,6 @@ _TOPIC_SIMILARITY_THRESHOLD = 0.6  # below this → topic changed, re-search dom
 
 
 def _format_records(records: list[MemoryRecord]) -> str:
-    """Format a list of MemoryRecords as bullet points."""
     if not records:
         return "(none)"
     lines: list[str] = []
@@ -28,12 +33,7 @@ def _format_records(records: list[MemoryRecord]) -> str:
 
 
 class MemoryMiddleware:
-    """Provides LangGraph node functions for injecting and extracting memories.
-
-    Includes session-level caching:
-    - user/project memories are cached and only refreshed after extraction
-    - domain memories are re-searched only when the user topic changes
-    """
+    """Async LangGraph node functions for injecting and extracting memories."""
 
     def __init__(self, store: MemoryStore, extractor: MemoryExtractor) -> None:
         self._store = store
@@ -48,38 +48,29 @@ class MemoryMiddleware:
 
     # ── LangGraph node: inject ───────────────────────────────────────────
 
-    def inject(self, state: AgentState) -> dict[str, Any]:
-        """Load relevant memories and return them as an XML context block.
-
-        Uses session-level caching to avoid redundant SQLite queries:
-        - user/project: cached until new memories are extracted
-        - domain: re-searched only when the topic similarity drops below threshold
-        """
+    async def inject(self, state: AgentState) -> dict[str, Any]:
+        """Load relevant memories and return them as an XML context block."""
         try:
             project_id = state.get("project_id") or ""
 
-            # Invalidate caches if new memories were extracted since last inject
             if self._dirty:
                 self._user_cache = None
                 self._project_cache.pop(project_id, None)
                 self._dirty = False
 
-            # User-layer memories (global)
             if self._user_cache is None:
-                self._user_cache = self._store.get_by_layer("user")
+                self._user_cache = await self._list_tier("user", scope=None)
             user_memories = self._user_cache
 
-            # Project-layer memories (scoped)
             if project_id not in self._project_cache:
-                self._project_cache[project_id] = self._store.get_by_layer(
-                    "project", project_id=project_id
+                self._project_cache[project_id] = await self._list_tier(
+                    "project", scope=project_id
                 )
             project_memories = self._project_cache[project_id]
 
-            # Domain-layer: only re-search when topic changes
             messages = state.get("messages") or []
             last_user_text = self._last_user_text(messages)
-            domain_memories = self._get_domain_cached(last_user_text)
+            domain_memories = await self._get_domain_cached(last_user_text)
 
             block = self._build_xml(user_memories, project_memories, domain_memories)
             log.info(
@@ -94,12 +85,54 @@ class MemoryMiddleware:
             log.exception("memory_middleware.inject_failed")
             return {"memory_context": ""}
 
-    def _get_domain_cached(self, query: str) -> list[MemoryRecord]:
-        """Return domain memories, re-searching only when topic changes."""
+    async def _list_tier(self, tier: str, scope: str | None) -> list[MemoryRecord]:
+        """Enumerate every entry in a tier/scope.
+
+        The library's ``MemoryStore`` protocol exposes ``search`` (FTS-backed)
+        and ``read`` (by key) but deliberately omits an unfiltered list —
+        other consumers (apt-legal, prime-jennie) do not need it. ax's 3-layer
+        injector does need it, so we reach into the concrete SQLite
+        connection when the store is a ``SqliteMemoryStore``; otherwise we
+        return empty (the domain/search path still works).
+        """
+        import asyncio
+
+        conn = getattr(self._store, "_conn", None)
+        if conn is None:
+            return []
+
+        if scope is None:
+            sql = "SELECT * FROM memories WHERE tier = ? ORDER BY updated_at DESC LIMIT 200"
+            params: tuple[Any, ...] = (tier,)
+        else:
+            sql = (
+                "SELECT * FROM memories WHERE tier = ? AND scope = ? "
+                "ORDER BY updated_at DESC LIMIT 200"
+            )
+            params = (tier, scope)
+
+        try:
+            rows = await asyncio.to_thread(
+                lambda: conn.execute(sql, params).fetchall()
+            )
+        except Exception:
+            log.exception("memory_middleware.list_tier_failed", tier=tier, scope=scope)
+            return []
+
+        records: list[MemoryRecord] = []
+        from minyoung_mah.memory.store import _row_to_entry  # type: ignore[attr-defined]
+
+        for row in rows:
+            try:
+                records.append(entry_to_record(_row_to_entry(row)))
+            except Exception:
+                continue
+        return records
+
+    async def _get_domain_cached(self, query: str) -> list[MemoryRecord]:
         if not query:
             return self._domain_cache
 
-        # Check topic similarity with the last query
         if self._last_domain_query:
             similarity = SequenceMatcher(
                 None, self._last_domain_query[:200], query[:200]
@@ -107,36 +140,47 @@ class MemoryMiddleware:
             if similarity >= _TOPIC_SIMILARITY_THRESHOLD:
                 return self._domain_cache
 
-        # Topic changed — perform a new search
-        self._domain_cache = self._store.search(query, layer="domain", limit=10)
+        try:
+            entries = await self._store.search(
+                tier="domain", query=query, scope=None, limit=10
+            )
+        except Exception:
+            log.exception("memory_middleware.domain_search_failed")
+            entries = []
+        self._domain_cache = [entry_to_record(e) for e in entries]
         self._last_domain_query = query
         return self._domain_cache
 
     # ── LangGraph node: extract_and_store ────────────────────────────────
 
-    def extract_and_store(self, state: AgentState) -> dict[str, Any]:
-        """Extract durable facts from recent messages and persist them.
-
-        This function is designed to be used as a LangGraph node.  It runs
-        the extractor on recent messages, upserts new records into the store,
-        and returns an empty dict (no state mutation needed).
-        """
+    async def extract_and_store(self, state: AgentState) -> dict[str, Any]:
+        """Extract durable facts and persist them via the library store."""
         try:
             messages = state.get("messages") or []
             if not messages:
                 log.debug("memory_middleware.extract_skip_no_messages")
                 return {}
 
-            existing_keys = self._store.get_existing_keys()
+            existing_keys = self._collect_cached_keys()
             project_id = state.get("project_id")
 
-            new_records = self._extractor.extract(messages, existing_keys)
+            # Extractor is sync (LLM-based); offload to a thread so we don't
+            # block the event loop.
+            new_records = await asyncio.to_thread(
+                self._extractor.extract, messages, existing_keys
+            )
 
             for record in new_records:
-                # Attach the current project_id for project-layer memories.
                 if record.layer == "project" and project_id:
                     record.project_id = project_id
-                self._store.upsert(record)
+                entry = record_to_entry(record)
+                await self._store.write(
+                    tier=entry.tier,
+                    key=entry.key,
+                    value=entry.value,
+                    scope=entry.scope,
+                    metadata=entry.metadata,
+                )
 
             if new_records:
                 self._dirty = True
@@ -146,13 +190,27 @@ class MemoryMiddleware:
             log.exception("memory_middleware.extract_and_store_failed")
             return {}
 
+    def _collect_cached_keys(self) -> set[str]:
+        """Keys the extractor should avoid duplicating.
+
+        Sourced from the 3 tier caches — the library store has no
+        "list all keys" helper, but the caches already hold everything the
+        current session has observed, which is what the extractor hint
+        actually needs (prevent duplicate writes *this session*).
+        """
+        keys: set[str] = set()
+        if self._user_cache:
+            keys.update(r.key for r in self._user_cache)
+        for recs in self._project_cache.values():
+            keys.update(r.key for r in recs)
+        keys.update(r.key for r in self._domain_cache)
+        return keys
+
     # ── Internal helpers ─────────────────────────────────────────────────
 
     @staticmethod
     def _last_user_text(messages: list) -> str:
-        """Extract the text content of the last HumanMessage in the list."""
         for msg in reversed(messages):
-            # Support both LangChain message objects and plain dicts.
             if hasattr(msg, "type") and msg.type == "human":
                 return msg.content if isinstance(msg.content, str) else str(msg.content)
             if isinstance(msg, dict) and msg.get("role") == "user":
@@ -166,7 +224,6 @@ class MemoryMiddleware:
         project: list[MemoryRecord],
         domain: list[MemoryRecord],
     ) -> str:
-        """Assemble the three memory layers into an XML block."""
         parts = [
             "<agent_memory>",
             "<user>",

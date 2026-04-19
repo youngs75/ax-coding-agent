@@ -118,79 +118,80 @@ class TestToolCacheIntegration:
 
 # ── Memory cache tests ──────────────────────────────────────────────────────
 
+from minyoung_mah import SqliteMemoryStore
 from coding_agent.memory.middleware import MemoryMiddleware, _TOPIC_SIMILARITY_THRESHOLD
 from coding_agent.memory.schema import MemoryRecord
-from coding_agent.memory.store import MemoryStore
 
 
 class TestMemoryCaching:
-    """Tests for MemoryMiddleware session-level caching."""
+    """Tests for MemoryMiddleware session-level caching (async)."""
 
-    def _make_middleware(self, db_path: str) -> tuple[MemoryMiddleware, MemoryStore]:
-        store = MemoryStore(db_path)
+    def _make_middleware(
+        self, db_path: str
+    ) -> tuple[MemoryMiddleware, SqliteMemoryStore]:
+        store = SqliteMemoryStore(db_path, tiers=["user", "project", "domain"])
         extractor = MagicMock()
         extractor.extract.return_value = []
         mw = MemoryMiddleware(store, extractor)
         return mw, store
 
-    def test_user_cache_reuse(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_user_cache_reuse(self, tmp_path: Path):
         db = str(tmp_path / "mem.db")
         mw, store = self._make_middleware(db)
 
-        store.upsert(MemoryRecord(layer="user", category="pref", key="lang", content="Korean"))
+        await store.write(
+            tier="user", key="lang", value="Korean", metadata={"category": "pref"}
+        )
 
         state = {"messages": [], "project_id": ""}
-        mw.inject(state)
-        mw.inject(state)
+        await mw.inject(state)
+        await mw.inject(state)
         # Second call should use cached user memories without hitting DB again
         assert mw._user_cache is not None
         assert len(mw._user_cache) == 1
 
-    def test_cache_invalidation_after_extract(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_cache_invalidation_after_extract(self, tmp_path: Path):
         from langchain_core.messages import HumanMessage, AIMessage
 
         db = str(tmp_path / "mem.db")
-        mw, store = self._make_middleware(db)
+        mw, _store = self._make_middleware(db)
 
         msgs = [HumanMessage(content="hello"), AIMessage(content="hi")]
         state = {"messages": msgs, "project_id": ""}
-        mw.inject(state)
+        await mw.inject(state)
         assert mw._user_cache is not None
 
-        # Simulate extraction of new records
         new_rec = MemoryRecord(layer="user", category="pref", key="style", content="terse")
         mw._extractor.extract.return_value = [new_rec]
-        mw.extract_and_store(state)
+        await mw.extract_and_store(state)
         assert mw._dirty is True
 
-        # Next inject should refresh caches
-        mw.inject(state)
+        await mw.inject(state)
         assert mw._dirty is False
 
-    def test_domain_cache_topic_similarity(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_domain_cache_topic_similarity(self, tmp_path: Path):
         db = str(tmp_path / "mem.db")
         mw, store = self._make_middleware(db)
 
-        # Add a domain memory
-        store.upsert(
-            MemoryRecord(layer="domain", category="term", key="API", content="REST API pattern")
+        await store.write(
+            tier="domain", key="API", value="REST API pattern", metadata={"category": "term"}
         )
 
         from langchain_core.messages import HumanMessage
 
-        # First query
         state1 = {"messages": [HumanMessage(content="API 설계에 대해 알려줘")], "project_id": ""}
-        mw.inject(state1)
+        await mw.inject(state1)
         first_query = mw._last_domain_query
 
-        # Similar query — should use cache
         state2 = {"messages": [HumanMessage(content="API 설계에 대해서 알려줘")], "project_id": ""}
-        mw.inject(state2)
+        await mw.inject(state2)
         assert mw._last_domain_query == first_query  # no re-search
 
-        # Very different query — should re-search
         state3 = {"messages": [HumanMessage(content="Docker 배포 방법")], "project_id": ""}
-        mw.inject(state3)
+        await mw.inject(state3)
         assert mw._last_domain_query != first_query  # re-searched
 
 

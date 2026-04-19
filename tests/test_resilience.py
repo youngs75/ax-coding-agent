@@ -6,15 +6,18 @@ import asyncio
 
 import pytest
 
-from coding_agent.resilience.error_handler import ErrorHandler, ErrorResolution
-from coding_agent.resilience.progress_guard import GuardVerdict, ProgressGuard
-from coding_agent.resilience.retry_policy import (
-    ErrorClassifier,
-    FailureType,
+from coding_agent.resilience_compat import (
     DEFAULT_POLICIES,
+    ErrorClassifier,
+    ErrorHandler,
+    ErrorResolution,
+    FailureType,
+    GuardVerdict,
+    ProgressGuard,
+    SafeStop,
+    SafeStopError,
+    Watchdog,
 )
-from coding_agent.resilience.safe_stop import SafeStop, SafeStopError
-from coding_agent.resilience.watchdog import Watchdog
 
 
 class TestWatchdog:

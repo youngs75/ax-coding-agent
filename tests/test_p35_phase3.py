@@ -20,8 +20,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from coding_agent.core.loop import SYSTEM_PROMPT
-from coding_agent.resilience.progress_guard import GuardVerdict, ProgressGuard
+from coding_agent.core.loop import SYSTEM_PROMPT, _task_id_extractor
+from coding_agent.resilience_compat import GuardVerdict, ProgressGuard
+
+
+def _task_guard(**kwargs) -> ProgressGuard:
+    """Build a ProgressGuard wired with ax's TASK-NN key_extractor.
+
+    Mirrors the production wiring in ``AgentLoop.__init__`` so the A-2
+    task-repeat detection path is exercised under the same config.
+    """
+    kwargs.setdefault("key_extractor", _task_id_extractor)
+    return ProgressGuard(**kwargs)
 from coding_agent.subagents.factory import ROLE_TEMPLATES, SubAgentFactory
 from coding_agent.subagents.manager import SubAgentManager
 from coding_agent.subagents.registry import SubAgentRegistry
@@ -124,7 +134,7 @@ def test_auto_advance_empty_task_id_noop() -> None:
 # ── A-2: ProgressGuard task delegation repeat ───────────────
 
 def test_progress_guard_warns_on_repeated_task_id() -> None:
-    guard = ProgressGuard(task_window_size=12, task_repeat_threshold=6)
+    guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=6)
     for _ in range(6):
         guard.record_action(
             "task", {"description": "TASK-04: do something", "agent_type": "coder"}
@@ -134,7 +144,7 @@ def test_progress_guard_warns_on_repeated_task_id() -> None:
 
 
 def test_progress_guard_stops_after_warn_then_repeat() -> None:
-    guard = ProgressGuard(task_window_size=12, task_repeat_threshold=6)
+    guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=6)
     for _ in range(6):
         guard.record_action(
             "task", {"description": "TASK-04: verifier round", "agent_type": "verifier"}
@@ -148,7 +158,7 @@ def test_progress_guard_stops_after_warn_then_repeat() -> None:
 
 
 def test_progress_guard_does_not_stop_on_distinct_task_ids() -> None:
-    guard = ProgressGuard(task_window_size=12, task_repeat_threshold=6)
+    guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=6)
     for i in range(8):
         guard.record_action(
             "task",
@@ -158,19 +168,18 @@ def test_progress_guard_does_not_stop_on_distinct_task_ids() -> None:
 
 
 def test_progress_guard_ignores_non_task_tools_for_task_repeat() -> None:
-    guard = ProgressGuard(task_window_size=12, task_repeat_threshold=3)
+    guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=3)
     for _ in range(5):
         guard.record_action("read_file", {"path": "/tmp/a.txt"})
     # No task tool calls yet — task repeat path must not fire.
-    assert guard._task_history == ProgressGuard()._task_history.__class__()
-    # The action repeat path may still warn — but task repeat must not.
+    assert len(guard._secondary_history) == 0
 
 
 def test_progress_guard_reset_clears_task_history() -> None:
-    guard = ProgressGuard()
+    guard = _task_guard()
     guard.record_action("task", {"description": "TASK-04: x"})
     guard.reset()
-    assert len(guard._task_history) == 0
+    assert len(guard._secondary_history) == 0
 
 
 # ── A-1: verifier output format (smoke) ──────────────────────
@@ -354,8 +363,8 @@ def test_progress_guard_records_via_real_loop_check(monkeypatch) -> None:
                 pg.record_action(tc.get("name", ""), tc.get("args", {}))
             break
 
-    assert len(pg._task_history) == 1
-    assert pg._task_history[0] == "TASK-09"
+    assert len(pg._secondary_history) == 1
+    assert pg._secondary_history[0] == "TASK-09"
 
 
 def test_task_tool_no_task_id_does_not_touch_ledger(monkeypatch) -> None:

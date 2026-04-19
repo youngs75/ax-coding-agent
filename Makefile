@@ -8,6 +8,12 @@ setup: install
 	@echo "Setup complete."
 
 install:
+	@if [ -d ../minyoung-mah ]; then \
+	  echo "→ Installing minyoung-mah (editable sibling checkout)"; \
+	  pip install -e ../minyoung-mah; \
+	else \
+	  echo "⚠  ../minyoung-mah not found — ensure it's checked out (or published to PyPI)"; \
+	fi
 	pip install -e ".[dev]" 2>/dev/null || pip install -e .
 
 test:

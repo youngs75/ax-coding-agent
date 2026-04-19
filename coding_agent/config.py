@@ -95,7 +95,10 @@ class Config:
     memory_db_path: str = field(
         default_factory=lambda: os.getenv(
             "MEMORY_DB_PATH",
-            str(_PROJECT_ROOT / "memory_store" / "memory.db"),
+            # v2 schema (tier/scope) — incompatible with the old layer/project_id
+            # DB. Old ``memory.db`` files are left in place; a fresh file is
+            # created at ``ax.v2.db``. Per plan Phase 3 migration note.
+            str(_PROJECT_ROOT / "memory_store" / "ax.v2.db"),
         )
     )
 

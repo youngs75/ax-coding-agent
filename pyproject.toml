@@ -13,6 +13,7 @@ description = "AI Coding Agent Harness — 3계층 메모리, 동적 SubAgent, A
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "minyoung-mah>=0.1.2",
     "langchain>=0.3.0",
     "langchain-openai>=0.3.0",
     "langgraph>=0.4.0",
@@ -25,6 +26,11 @@ dependencies = [
     "prompt-toolkit>=3.0",
     "langfuse>=2.0",
 ]
+
+# minyoung-mah is not on PyPI yet — install editable from a sibling
+# checkout first (`pip install -e ../minyoung-mah`), then run
+# `pip install -e .[dev]`. The Makefile `install` target does both in
+# order. See apt-legal-agent/pyproject.toml for the same pattern.
 
 [project.scripts]
 ax-agent = "coding_agent.cli.app:main"
