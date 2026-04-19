@@ -55,7 +55,7 @@ def _get_loop():
         # Render todo ledger as Rich Panel after every write_todos / update_todo.
         # The callback receives ``list[TodoItem]`` directly from the tool.
         try:
-            _loop._manager.set_todo_change_callback(print_todo_panel)
+            _loop.set_todo_change_callback(print_todo_panel)
         except Exception:
             pass
     return _loop
@@ -91,6 +91,7 @@ def _handle_command(cmd: str) -> bool:
         return True
 
     elif command == "/memory":
+        import asyncio as _asyncio
         store = loop.get_memory_store()
         if len(parts) >= 4 and parts[1] == "add":
             layer = parts[2]
@@ -99,40 +100,45 @@ def _handle_command(cmd: str) -> bool:
                 print_error("Usage: /memory add <layer> <key> <content>")
                 return True
             key, content = rest[0], rest[1]
-            from coding_agent.memory.schema import MemoryRecord
-            store.upsert(MemoryRecord(layer=layer, category="manual", key=key, content=content))
+            _asyncio.run(
+                store.write(
+                    tier=layer, key=key, value=content,
+                    metadata={"category": "manual"},
+                )
+            )
             print_memory_event("stored", key, layer)
         elif len(parts) >= 3 and parts[1] == "delete":
-            key = parts[2]
-            for m in store.list_all():
-                if m.key == key:
-                    store.delete(m.id)
-                    print_agent_status(f"deleted: {key}")
+            # library SqliteMemoryStore 는 delete 를 노출하지 않음 — Phase 7
+            # 에서 observer/CLI 개선 시 재고. 지금은 안내만.
+            print_status("/memory delete 는 현재 지원되지 않습니다.", "dim")
             return True
         else:
-            memories = store.list_all()
+            # list — library 는 per-tier list 를 표준 API 로 주지 않으므로
+            # SqliteMemoryStore._conn 을 직접 읽어 가장 최근 항목만 표시.
+            from coding_agent.memory.schema import entry_to_record
+            from minyoung_mah.memory.store import _row_to_entry  # type: ignore
+            conn = getattr(store, "_conn", None)
+            if conn is None:
+                print_status("Memory listing unavailable for this backend.", "dim")
+                return True
+            rows = conn.execute(
+                "SELECT * FROM memories ORDER BY updated_at DESC LIMIT 50"
+            ).fetchall()
+            memories = [entry_to_record(_row_to_entry(r)) for r in rows]
             if memories:
                 print_memory_table(memories)
             else:
                 print_status("No memories stored yet.", "dim")
         return True
 
-    elif command == "/agents":
-        registry = loop.get_registry()
-        agents = registry.get_active()
-        if agents:
-            print_agents_table(agents)
-        else:
-            print_status("No active SubAgents.", "dim")
-        return True
-
-    elif command == "/events":
-        registry = loop.get_registry()
-        events = registry.event_log
-        if events:
-            print_event_log(events)
-        else:
-            print_status("No events yet.", "dim")
+    elif command in ("/agents", "/events"):
+        # SubAgent registry/event_log 는 minyoung_mah.Orchestrator 로 이전되면서
+        # 인스턴스-단위 관찰에서 이벤트-스트림(observer)으로 바뀜. Phase 7 에서
+        # Langfuse/structlog composite 로 재노출 예정.
+        print_status(
+            f"{command} 는 minyoung-mah observer 로 이전 중입니다 (Phase 7 대응).",
+            "dim",
+        )
         return True
 
     elif command == "/status":

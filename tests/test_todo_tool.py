@@ -16,9 +16,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from coding_agent.subagents.factory import SubAgentFactory
-from coding_agent.subagents.manager import SubAgentManager
-from coding_agent.subagents.registry import SubAgentRegistry
 from coding_agent.tools.todo_tool import (
     TodoItem,
     TodoStore,
@@ -26,13 +23,6 @@ from coding_agent.tools.todo_tool import (
     build_write_todos_tool,
     render_todo_summary,
 )
-
-
-def _make_manager() -> SubAgentManager:
-    registry = SubAgentRegistry()
-    llm = MagicMock()
-    factory = SubAgentFactory(registry, llm)
-    return SubAgentManager(registry, factory)
 
 
 # ── TodoStore unit tests ──────────────────────────────────────
@@ -192,58 +182,44 @@ def test_update_todo_tool_fires_on_change_callback() -> None:
     assert received[0][0].status == "completed"
 
 
-# ── Manager integration ──────────────────────────────────────
+# ── AgentLoop integration ────────────────────────────────────
+# Phase 6 refactor: TodoStore 는 이제 AgentLoop 가 직접 소유한다
+# (manager 제거). write_todos / update_todo 가 같은 store 를 공유하는지
+# + change callback 이 양쪽에서 발화되는지 검증.
 
-def test_manager_exposes_todo_store() -> None:
-    manager = _make_manager()
-    store = manager.get_todo_store()
+
+def test_loop_exposes_todo_store_and_callback() -> None:
+    from coding_agent.core.loop import AgentLoop
+
+    loop = AgentLoop()
+    store = loop.get_todo_store()
     assert isinstance(store, TodoStore)
     assert store.is_empty()
 
-
-def test_manager_build_todo_tools_returns_pair_sharing_store() -> None:
-    manager = _make_manager()
-    tools = manager.build_todo_tools()
-    names = [t.name for t in tools]
-    assert names == ["write_todos", "update_todo"]
-    # Both tools must point at the SAME manager-owned store.
-    assert tools[0].metadata["todo_store"] is manager.get_todo_store()
-    assert tools[1].metadata["todo_store"] is manager.get_todo_store()
-
-
-def test_manager_resolve_tools_wires_todo_pair() -> None:
-    manager = _make_manager()
-    write_tool = manager._resolve_tools(["write_todos"])[0]
-    update_tool = manager._resolve_tools(["update_todo"])[0]
-    assert write_tool.name == "write_todos"
-    assert update_tool.name == "update_todo"
-    assert write_tool.metadata["todo_store"] is manager.get_todo_store()
-    assert update_tool.metadata["todo_store"] is manager.get_todo_store()
-
-
-def test_manager_todo_change_callback_propagates() -> None:
-    manager = _make_manager()
     received: list = []
-    manager.set_todo_change_callback(lambda items: received.append(items))
-    tools = manager.build_todo_tools()
-    write_tool, update_tool = tools[0], tools[1]
+    loop.set_todo_change_callback(lambda items: received.append(items))
+
+    write_tool = build_write_todos_tool(
+        store=store,
+        on_change=lambda items: (
+            loop._todo_change_callback(items)
+            if loop._todo_change_callback
+            else None
+        ),
+    )
+    update_tool = build_update_todo_tool(
+        store=store,
+        on_change=lambda items: (
+            loop._todo_change_callback(items)
+            if loop._todo_change_callback
+            else None
+        ),
+    )
+
     write_tool.invoke({"todos": [{"id": "TASK-01", "content": "A"}]})
     update_tool.invoke({"id": "TASK-01", "status": "completed"})
     assert len(received) == 2
     assert received[1][0].status == "completed"
-
-
-def test_manager_todo_store_persists_across_resolve_calls() -> None:
-    """Same TodoStore must be reused across multiple _resolve_tools calls
-    so write_todos in turn N is visible to update_todo in turn N+1."""
-    manager = _make_manager()
-    write_tool = manager._resolve_tools(["write_todos"])[0]
-    write_tool.invoke({"todos": [{"id": "TASK-01", "content": "A"}]})
-
-    update_tool = manager._resolve_tools(["update_todo"])[0]
-    out = update_tool.invoke({"id": "TASK-01", "status": "in_progress"})
-    assert "REJECTED" not in out
-    assert manager.get_todo_store().counts()["in_progress"] == 1
 
 
 # ── SYSTEM_PROMPT contract ───────────────────────────────────

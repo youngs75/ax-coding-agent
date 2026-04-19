@@ -1,46 +1,89 @@
-"""Task tool — allows the main agent to delegate work to SubAgents."""
+"""Task tool — orchestrates SubAgent delegation through minyoung_mah.Orchestrator.
+
+Phase 6 refactor. The previous implementation called ``SubAgentManager.spawn``
+which owned its own inner LangGraph. This version delegates to
+``Orchestrator.invoke_role`` from the minyoung-mah library. Key responsibilities
+retained at this layer (the library deliberately stays out of them):
+
+- **Task classification** (``agent_type="auto"``) via :mod:`classifier`.
+- **Todo auto-advance** on the ax-level :class:`TodoStore`.
+- **Interrupt propagation** (plan §결정 3): the ask_user_question adapter
+  returns an ``__ax_interrupt__`` marker; we surface it via LangGraph
+  ``interrupt()`` and resume the role with the user's answer in
+  ``parent_outputs["previous_ask"]``.
+- **Verifier output formatting** — `execute(command, result)` pairing.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphInterrupt
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
+from coding_agent.subagents.classifier import resolve_role_name
+from coding_agent.tools.ask_adapter import extract_interrupt_payload
+from coding_agent.tools.ask_tool import _format_answer
+
 if TYPE_CHECKING:
-    from coding_agent.subagents.manager import SubAgentManager
+    from minyoung_mah import Orchestrator, RoleInvocationResult
+
+    from coding_agent.subagents.user_decisions import UserDecisionsLog
+    from coding_agent.tools.todo_tool import TodoStore
+
+log = structlog.get_logger("task_tool")
 
 
-# Match the *first* TASK-NN-style identifier appearing in a delegation
-# description so the manager can auto-advance the todo ledger without
-# requiring the orchestrator LLM to remember update_todo calls. We
-# anchor on word boundaries so substrings like "TASK-04-fixup" still
-# resolve to TASK-04, and we accept 2+ digit ids to be forward-compatible.
+# ---------------------------------------------------------------------------
+# TASK-NN id extraction (shared with ProgressGuard key_extractor)
+# ---------------------------------------------------------------------------
+
+
 _TASK_ID_PATTERN = re.compile(r"\bTASK-\d{2,}\b", re.IGNORECASE)
 
 
 def _extract_task_id(description: str) -> str | None:
-    """Return the first TASK-NN id found in *description*, or None.
-
-    Always normalised to upper case so the lookup matches the canonical
-    ids stored in TodoStore (which echo whatever the planner wrote).
-    """
     if not description:
         return None
     m = _TASK_ID_PATTERN.search(description)
-    if m is None:
-        return None
-    return m.group(0).upper()
+    return m.group(0).upper() if m else None
+
+
+# ---------------------------------------------------------------------------
+# Async runner (LangGraph nodes are sync; role invocation is async)
+# ---------------------------------------------------------------------------
+
+
+# One shared pool across all task_tool invocations to avoid the overhead
+# of spinning up a thread + event loop per SubAgent call.
+_shared_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _run_async(coro: Any) -> Any:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        future = _shared_pool.submit(asyncio.run, coro)
+        return future.result(timeout=600)
+    return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
+# Tool input schemas
+# ---------------------------------------------------------------------------
 
 
 class TaskToolInput(BaseModel):
-    """Input schema for the ``task`` tool."""
-
     description: str = Field(
         description="A detailed description of the task to delegate to a SubAgent."
     )
@@ -48,155 +91,245 @@ class TaskToolInput(BaseModel):
         default="auto",
         description=(
             "The type of SubAgent to spawn. "
-            "Options: 'planner', 'coder', 'reviewer', 'fixer', 'researcher', 'auto'. "
+            "Options: 'planner', 'coder', 'reviewer', 'fixer', 'researcher', 'verifier', 'auto'. "
             "Use 'auto' to let the system choose."
         ),
     )
 
 
 class ParallelTasksInput(BaseModel):
-    """Input schema for the ``parallel_tasks`` tool."""
-
     tasks: str = Field(
         description=(
             'JSON array of task objects. Each object must have "description" (str) '
-            'and optionally "agent_type" (str). '
-            'Example: [{"description": "Create models.py", "agent_type": "coder"}, '
-            '{"description": "Create views.py", "agent_type": "coder"}]'
+            'and optionally "agent_type" (str).'
         ),
     )
 
 
-import concurrent.futures
-
-# Reuse a single thread pool across all task tool invocations to avoid
-# the overhead of creating a new thread + event loop for every SubAgent call.
-_shared_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+# ---------------------------------------------------------------------------
+# Todo auto-advance (moved from SubAgentManager.auto_advance_todo)
+# ---------------------------------------------------------------------------
 
 
-def _run_async(coro):
-    """Run an async coroutine from sync context, handling running loop."""
+def _auto_advance_todo(
+    todo_store: "TodoStore | None",
+    task_id: str | None,
+    status: str,
+    todo_change_callback: Any | None,
+) -> bool:
+    if todo_store is None or not task_id:
+        return False
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+        current = todo_store.list_items()
+    except Exception:
+        return False
+    match = next((it for it in current if it.id == task_id), None)
+    if match is None:
+        return False
+    if match.status == status:
+        return False
+    if match.status == "completed" and status != "completed":
+        return False
+    try:
+        todo_store.update(task_id, status)  # type: ignore[arg-type]
+    except KeyError:
+        return False
+    if todo_change_callback is not None:
+        try:
+            todo_change_callback(todo_store.list_items())
+        except Exception:
+            pass
+    log.info("task_tool.todo.auto_advance", task_id=task_id, status=status)
+    return True
 
-    if loop is not None and loop.is_running():
-        future = _shared_pool.submit(asyncio.run, coro)
-        return future.result(timeout=600)
-    else:
-        return asyncio.run(coro)
+
+# ---------------------------------------------------------------------------
+# Result formatting
+# ---------------------------------------------------------------------------
 
 
-def build_task_tool(manager: SubAgentManager) -> StructuredTool:
-    """Build a task delegation tool that captures manager via closure."""
-    import time as _time
-    import structlog as _structlog
-    _log = _structlog.get_logger("task_tool")
+def _format_verifier_output(result: "RoleInvocationResult") -> str:
+    """Pair each ``execute`` call with its result so verifier → fixer handoff
+    carries concrete error evidence (test names, exit codes, stack traces).
+    """
+    lines: list[str] = []
+    text = _extract_text(result)
+    if text:
+        lines.append(text)
+
+    executes = [
+        (req, res)
+        for req, res in zip(result.tool_calls or [], result.tool_results or [])
+        if req.tool_name == "execute"
+    ]
+    if executes:
+        lines.append("")
+        lines.append("### execute(command, result) pairs")
+        for req, res in executes:
+            cmd = req.args.get("command", "") if isinstance(req.args, dict) else ""
+            value = res.value if res.ok else (res.error or "")
+            lines.append(f"- command: {cmd}")
+            if value:
+                snippet = (
+                    value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                )
+                snippet = snippet.strip()
+                if len(snippet) > 800:
+                    snippet = snippet[:800] + "\n... (truncated)"
+                lines.append(f"  result: {snippet}")
+    return "\n".join(lines)
+
+
+def _extract_text(result: "RoleInvocationResult") -> str:
+    output = result.output
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, BaseModel):
+        return output.model_dump_json()
+    return str(output)
+
+
+def _extract_written_files(result: "RoleInvocationResult") -> list[str]:
+    written: list[str] = []
+    for req in result.tool_calls or []:
+        if req.tool_name not in ("write_file", "edit_file"):
+            continue
+        if isinstance(req.args, dict):
+            path = req.args.get("path")
+            if isinstance(path, str) and path not in written:
+                written.append(path)
+    return written
+
+
+def _find_pending_interrupt(result: "RoleInvocationResult") -> dict[str, Any] | None:
+    """Return the first ``__ax_interrupt__`` payload in the role's tool
+    results, or None. The marker is inserted by
+    ``coding_agent.tools.ask_adapter.AskUserQuestionAdapter``.
+    """
+    for res in result.tool_results or []:
+        if not res.ok:
+            continue
+        payload = extract_interrupt_payload(res.value)
+        if payload is not None:
+            return payload
+    return None
+
+
+# ---------------------------------------------------------------------------
+# build_task_tool — the LangGraph tool the orchestrator LLM sees
+# ---------------------------------------------------------------------------
+
+
+def build_task_tool(
+    orchestrator: "Orchestrator",
+    user_decisions: "UserDecisionsLog",
+    todo_store: "TodoStore | None" = None,
+    todo_change_callback: Any | None = None,
+) -> StructuredTool:
+    """Build a ``task`` tool bound to a minyoung_mah Orchestrator.
+
+    ``orchestrator`` is the one assembled in
+    :func:`coding_agent.subagents.orchestrator_factory.build_orchestrator`.
+    ``user_decisions`` carries ``ask_user_question`` answers across SubAgent
+    invocations so coder/verifier/fixer all see the same hard constraints.
+    """
 
     def _run_task(description: str, agent_type: str = "auto") -> str:
-        """Spawn a SubAgent to handle the described task and return its output.
+        from minyoung_mah import InvocationContext, RoleStatus
 
-        Interrupt-aware: if the SubAgent pauses on a LangGraph interrupt
-        (e.g. ask_user_question called from a planner), this function
-        propagates the interrupt up to the orchestrator graph by calling
-        ``interrupt()`` itself. The orchestrator pauses too, the user
-        answers via the CLI, and on resume the *same* SubAgent run picks
-        up where it left off — no re-spawn, no duplicate LLM call.
-        """
+        t0 = time.monotonic()
+        role_name = resolve_role_name(agent_type, description)
+        log.info(
+            "timing.task_tool.start",
+            agent_type=agent_type,
+            role=role_name,
+            desc=description[:80],
+        )
 
-        def _spawn() -> Any:
-            return _run_async(manager.spawn(description, agent_type=agent_type))
+        # B-1: flip the ledger to in_progress before delegation.
+        task_id = _extract_task_id(description)
+        if task_id:
+            _auto_advance_todo(todo_store, task_id, "in_progress", todo_change_callback)
 
-        def _resume(answer: Any) -> Any:
-            return _run_async(
-                manager.spawn(
-                    description,
-                    agent_type=agent_type,
-                    resume_value=answer,
-                )
-            )
+        parent_outputs: dict[str, Any] = {}
 
         try:
-            t0 = _time.monotonic()
-            _log.info(
-                "timing.task_tool.start",
-                agent_type=agent_type,
-                desc=description[:80],
-            )
-
-            # B-1: auto-advance the todo ledger so the orchestrator LLM
-            # does not have to remember update_todo on every delegation.
-            # Silently no-ops if the id is not in the ledger.
-            task_id = _extract_task_id(description)
-            if task_id:
-                manager.auto_advance_todo(task_id, "in_progress")
-
-            result = _spawn()
-
-            # ── Interrupt propagation loop ──
-            # The SubAgent may pause on any number of ask_user_question
-            # interrupts. Each one is forwarded up to the orchestrator
-            # graph via interrupt(); the resume value comes back here
-            # and we hand it to the SubAgent via _resume().
-            while result.interrupt_payload is not None:
-                _log.info(
-                    "task_tool.propagate_interrupt",
-                    agent_type=agent_type,
-                    thread_id=result.thread_id,
+            while True:
+                ctx = InvocationContext(
+                    task_summary=description,
+                    user_request="",
+                    parent_outputs=dict(parent_outputs),
                 )
-                # interrupt() raises GraphInterrupt the first time the
-                # tool node runs; the second time (after Command(resume=))
-                # it returns the answer immediately.
-                user_answer = interrupt(result.interrupt_payload)
-                _log.info(
-                    "task_tool.received_answer",
-                    answer_preview=str(user_answer)[:80],
-                )
-                result = _resume(user_answer)
+                result = _run_async(orchestrator.invoke_role(role_name, ctx))
 
-            elapsed = _time.monotonic() - t0
+                # HITL path (plan §결정 3) — role reported an ask via marker.
+                pending = _find_pending_interrupt(result)
+                if pending is not None:
+                    log.info(
+                        "task_tool.propagate_interrupt",
+                        role=role_name,
+                        payload_preview=str(pending)[:120],
+                    )
+                    user_answer = interrupt(pending)
+                    log.info(
+                        "task_tool.received_answer",
+                        answer_preview=str(user_answer)[:80],
+                    )
+                    formatted = _format_answer(pending, user_answer)
+                    user_decisions.record(formatted)
+                    parent_outputs["previous_ask"] = formatted
+                    continue  # re-invoke with the answer prepended
 
-            _log.info(
+                # Terminal — either COMPLETED / INCOMPLETE / FAILED / ABORTED.
+                break
+
+            elapsed = time.monotonic() - t0
+            log.info(
                 "timing.task_tool.done",
-                success=result.success,
-                duration_s=round(result.duration_s, 1),
-                roundtrip_s=round(elapsed, 1),
-                overhead_s=round(elapsed - result.duration_s, 1),
-                files=len(result.written_files),
+                role=role_name,
+                status=result.status.name,
+                duration_s=round(elapsed, 1),
+                role_duration_ms=result.duration_ms,
+                iterations=result.iterations,
             )
 
-            if result.success:
-                # Fix 3: Return structured summary, not raw SubAgent output.
-                # Distinguish COMPLETED vs INCOMPLETE so the Orchestrator
-                # knows whether to continue the same phase or move on.
-                is_incomplete = "[INCOMPLETE" in result.output
-                status = "INCOMPLETE" if is_incomplete else "COMPLETED"
-                # B-1: when a coder finishes successfully (and not flagged
-                # as incomplete), promote the todo to completed. verifier/
-                # fixer keep it at in_progress so the cycle is visible.
+            if result.status in (RoleStatus.COMPLETED, RoleStatus.INCOMPLETE):
+                status_tag = (
+                    "INCOMPLETE" if result.status is RoleStatus.INCOMPLETE else "COMPLETED"
+                )
+                if role_name == "verifier":
+                    body = _format_verifier_output(result)
+                else:
+                    body = _extract_text(result)
+
+                # B-1: coder success → mark completed. verifier/fixer keep
+                # the todo at in_progress so the orchestrator LLM can decide.
                 if (
                     task_id
-                    and not is_incomplete
-                    and agent_type in ("coder", "auto")
+                    and status_tag == "COMPLETED"
+                    and role_name in ("coder",)
                 ):
-                    manager.auto_advance_todo(task_id, "completed")
-                parts = [
-                    f"[Task {status} — {agent_type}]",
-                    result.output,
-                ]
-                if result.written_files:
-                    parts.append(f"Files written: {', '.join(result.written_files)}")
-                parts.append(f"[Duration: {result.duration_s:.1f}s]")
+                    _auto_advance_todo(
+                        todo_store, task_id, "completed", todo_change_callback
+                    )
+
+                written = _extract_written_files(result)
+                parts = [f"[Task {status_tag} — {role_name}]", body]
+                if written:
+                    parts.append(f"Files written: {', '.join(written)}")
+                parts.append(f"[Duration: {elapsed:.1f}s]")
                 return "\n".join(parts)
-            else:
-                return f"SubAgent failed: {result.error or 'unknown error'}"
+
+            # FAILED / ABORTED
+            err = result.error or f"role '{role_name}' terminated with {result.status.name}"
+            return f"SubAgent failed: {err}"
 
         except GraphInterrupt:
-            # Must propagate so the outer graph pauses for the user.
             raise
         except Exception as exc:
-            return f"Error spawning SubAgent: {exc}"
+            return f"Error running SubAgent: {exc}"
 
     return StructuredTool.from_function(
         func=_run_task,
@@ -210,53 +343,64 @@ def build_task_tool(manager: SubAgentManager) -> StructuredTool:
     )
 
 
-def build_parallel_tasks_tool(manager: SubAgentManager) -> StructuredTool:
-    """Build a parallel task delegation tool that runs multiple SubAgents concurrently."""
+# ---------------------------------------------------------------------------
+# build_parallel_tasks_tool — optional, currently unused by the top loop
+# ---------------------------------------------------------------------------
+
+
+def build_parallel_tasks_tool(
+    orchestrator: "Orchestrator",
+    user_decisions: "UserDecisionsLog",
+    todo_store: "TodoStore | None" = None,
+    todo_change_callback: Any | None = None,
+) -> StructuredTool:
+    """Parallel variant — runs each task through :func:`build_task_tool`
+    concurrently. Interrupt propagation is NOT supported in the parallel
+    path (it would serialize users across N simultaneous asks), so the
+    orchestrator LLM should avoid this tool for tasks that might call
+    ``ask_user_question``. Kept for future activation once dependency
+    analysis lands — currently AgentLoop does not bind it.
+    """
+    single_tool = build_task_tool(
+        orchestrator, user_decisions, todo_store, todo_change_callback
+    )
 
     def _run_parallel_tasks(tasks: str) -> str:
-        """Spawn multiple SubAgents in parallel and return combined results."""
         try:
             task_list = json.loads(tasks)
             if not isinstance(task_list, list) or len(task_list) == 0:
                 return "Error: tasks must be a non-empty JSON array."
             if len(task_list) == 1:
-                # Single task — just use normal spawn
                 t = task_list[0]
-                return _run_async(
-                    manager.spawn(t["description"], agent_type=t.get("agent_type", "auto"))
-                ).__str__()
+                return single_tool.invoke(
+                    {
+                        "description": t["description"],
+                        "agent_type": t.get("agent_type", "auto"),
+                    }
+                )
 
-            results = _run_async(manager.spawn_parallel(task_list))
+            async def _run_all() -> list[str]:
+                return await asyncio.gather(
+                    *(
+                        asyncio.to_thread(
+                            single_tool.invoke,
+                            {
+                                "description": t["description"],
+                                "agent_type": t.get("agent_type", "auto"),
+                            },
+                        )
+                        for t in task_list
+                    )
+                )
 
+            outputs = _run_async(_run_all())
             parts: list[str] = []
-            total_duration = 0.0
-            all_files: list[str] = []
-            failures = 0
-            for i, r in enumerate(results):
+            for i, out in enumerate(outputs):
                 header = f"## Task {i + 1}: {task_list[i]['description'][:60]}"
-                if r.success:
-                    parts.append(f"{header}\nStatus: SUCCESS ({r.duration_s:.1f}s)")
-                    if r.written_files:
-                        all_files.extend(r.written_files)
-                        parts.append(f"Files: {', '.join(r.written_files)}")
-                    parts.append(r.output)
-                else:
-                    failures += 1
-                    parts.append(f"{header}\nStatus: FAILED — {r.error}")
-                total_duration = max(total_duration, r.duration_s)
-
-            summary = (
-                f"\n---\nParallel execution: {len(results)} tasks, "
-                f"{len(results) - failures} succeeded, {failures} failed, "
-                f"wall time {total_duration:.1f}s"
-            )
-            if all_files:
-                summary += f"\nAll files written: {', '.join(all_files)}"
-            parts.append(summary)
+                parts.append(f"{header}\n{out}")
             return "\n\n".join(parts)
-
-        except json.JSONDecodeError as e:
-            return f"Error: invalid JSON in tasks parameter — {e}"
+        except json.JSONDecodeError as exc:
+            return f"Error: invalid JSON in tasks parameter — {exc}"
         except Exception as exc:
             return f"Error running parallel tasks: {exc}"
 
@@ -271,3 +415,11 @@ def build_parallel_tasks_tool(manager: SubAgentManager) -> StructuredTool:
         ),
         args_schema=ParallelTasksInput,
     )
+
+
+__all__ = [
+    "build_task_tool",
+    "build_parallel_tasks_tool",
+    "_extract_task_id",
+    "_auto_advance_todo",
+]

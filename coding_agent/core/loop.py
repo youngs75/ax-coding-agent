@@ -45,17 +45,16 @@ from coding_agent.resilience_compat import (
     SafeStop,
     Watchdog,
 )
-from coding_agent.subagents import (
-    SubAgentFactory,
-    SubAgentManager,
-    SubAgentRegistry,
-)
+from coding_agent.subagents.orchestrator_factory import build_orchestrator
+from coding_agent.subagents.user_decisions import UserDecisionsLog
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
-from coding_agent.tools.task_tool import build_task_tool, build_parallel_tasks_tool
-
-# Note: FILE_TOOLS and SHELL_TOOLS are still imported for SubAgent use
-# via manager.py. Orchestrator only uses read-only subset (see __init__).
+from coding_agent.tools.task_tool import build_task_tool
+from coding_agent.tools.todo_tool import (
+    TodoStore,
+    build_update_todo_tool,
+    build_write_todos_tool,
+)
 
 # Async callback type for satisfying ask_user_question interrupts.
 # Receives the interrupt payload (dict) and returns the user's answer.
@@ -153,10 +152,14 @@ class AgentLoop:
         self._extractor = MemoryExtractor(get_model("fast"))
         self._memory_mw = MemoryMiddleware(self._store, self._extractor)
 
-        # SubAgent 시스템
-        self._registry = SubAgentRegistry()
-        self._factory = SubAgentFactory(self._registry, get_model("fast"))
-        self._manager = SubAgentManager(self._registry, self._factory)
+        # SubAgent 시스템 — minyoung_mah.Orchestrator 기반.
+        self._user_decisions = UserDecisionsLog()
+        self._todo_store = TodoStore()
+        self._todo_change_callback: Any | None = None
+        self._orchestrator = build_orchestrator(
+            memory_store=self._store,
+            user_decisions=self._user_decisions,
+        )
 
         # 복원력 시스템
         self._watchdog = Watchdog(timeout_sec=cfg.llm_timeout)
@@ -168,19 +171,39 @@ class AgentLoop:
         self._error_handler = ErrorHandler(fallback_enabled=True)
 
         # 도구
-        task_tool = build_task_tool(self._manager)
-        # parallel_tool은 구현은 유지하되, Orchestrator가 의존성을 정확히
-        # 판단하기 어려운 현재 단계에서는 비활성화.  의존성 분석이 추가되면 재활성화.
-        # parallel_tool = build_parallel_tasks_tool(self._manager)
+        task_tool = build_task_tool(
+            self._orchestrator,
+            self._user_decisions,
+            todo_store=self._todo_store,
+            todo_change_callback=lambda items: (
+                self._todo_change_callback(items)
+                if self._todo_change_callback
+                else None
+            ),
+        )
 
-        # Orchestrator에는 읽기 전용 도구 + task 위임 도구 + todo ledger만 바인딩.
-        # write_file, edit_file, execute는 SubAgent 전용 — Orchestrator가
-        # 직접 코드를 작성/수정/실행하면 23회 이상 직접 도구 호출이 발생하는
-        # 문제가 E2E에서 확인됨.  SubAgent는 manager.py에서 별도로 도구를 resolve.
-        # write_todos / update_todo는 manager-owned TodoStore에 바인딩되어
-        # SPEC atomic task의 진행 상황을 명시적으로 추적한다.
+        # Orchestrator 에는 읽기 전용 도구 + task 위임 도구 + todo ledger 만 바인딩.
+        # write_file/edit_file/execute 는 SubAgent 전용 — orchestrator LLM 이 직접
+        # 코드를 쓰면 23회 이상 직접 도구 호출이 발생하는 이슈가 E2E 에서 관찰됐음.
         from coding_agent.tools.file_ops import read_file, glob_files, grep
-        todo_tools = self._manager.build_todo_tools()
+        todo_tools = [
+            build_write_todos_tool(
+                store=self._todo_store,
+                on_change=lambda items: (
+                    self._todo_change_callback(items)
+                    if self._todo_change_callback
+                    else None
+                ),
+            ),
+            build_update_todo_tool(
+                store=self._todo_store,
+                on_change=lambda items: (
+                    self._todo_change_callback(items)
+                    if self._todo_change_callback
+                    else None
+                ),
+            ),
+        ]
         self._tools = [read_file, glob_files, grep, task_tool, *todo_tools]
 
         # 그래프
@@ -639,8 +662,8 @@ class AgentLoop:
             exit_reason=final_state.get("exit_reason", "completed"),
         )
 
-        # SubAgent 정리
-        self._manager.cleanup()
+        # SubAgent 정리 — minyoung_mah.Orchestrator 는 stateless 라 별도
+        # cleanup 불필요. (기존 manager.cleanup 은 in-memory 인스턴스 gc 목적이었음.)
 
         return final_state
 
@@ -648,9 +671,17 @@ class AgentLoop:
         """메모리 스토어 인스턴스 반환 (CLI 용)."""
         return self._store
 
-    def get_registry(self) -> SubAgentRegistry:
-        """SubAgent 레지스트리 반환 (CLI 용)."""
-        return self._registry
+    def get_orchestrator(self):
+        """minyoung_mah Orchestrator 인스턴스 반환 (CLI 용)."""
+        return self._orchestrator
+
+    def get_todo_store(self) -> TodoStore:
+        """Todo ledger 인스턴스 반환 (CLI 용)."""
+        return self._todo_store
+
+    def set_todo_change_callback(self, callback) -> None:
+        """CLI 가 rendered panel 을 갱신하도록 콜백 등록."""
+        self._todo_change_callback = callback
 
     # ── Resume 기능 ──
 

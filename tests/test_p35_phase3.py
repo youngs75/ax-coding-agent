@@ -1,52 +1,32 @@
-"""Phase 3 회귀 — A/B/C 패치 검증.
+"""Phase 3 회귀 — Phase 6 refactor 에 맞춰 단순화.
 
-A. verifier 무한 사이클 차단
-   A-1: verifier 출력에 execute(command, result) 블록 포함
-   A-2: ProgressGuard가 동일 TASK-NN 반복 위임을 stop으로 판정
+남은 회귀 검증 대상:
+- TASK-NN 추출(`_extract_task_id`)
+- A-2 ProgressGuard (library ProgressGuard + ax key_extractor)
+- check_progress 메시지 스캔 (v8 핫픽스: messages[-1] → reverse scan)
+- SYSTEM_PROMPT 에 핵심 지침이 남아 있는지
 
-B. update_todo 자동화
-   B-1: task 도구가 description의 TASK-NN을 인식해 manager.auto_advance_todo 호출
-        - delegation 시작 시 in_progress, coder 성공 시 completed
-        - verifier/fixer는 in_progress 유지
-
-C. planner/orchestrator 가이드 업데이트
-   C-1: planner 프롬프트에 의존성 순서 작성 가이드
-   C-2: SYSTEM_PROMPT에 등록 순서대로 진행 명시
+manager/factory/registry 기반 B-1 테스트는 Phase 6 에서 task_tool 로직이
+``_auto_advance_todo`` 헬퍼로 이관되면서 새 단위 테스트로 대체했다.
 """
 
 from __future__ import annotations
-
-from unittest.mock import MagicMock
 
 import pytest
 
 from coding_agent.core.loop import SYSTEM_PROMPT, _task_id_extractor
 from coding_agent.resilience_compat import GuardVerdict, ProgressGuard
+from coding_agent.tools.task_tool import _auto_advance_todo, _extract_task_id
+from coding_agent.tools.todo_tool import TodoItem, TodoStore
 
 
 def _task_guard(**kwargs) -> ProgressGuard:
-    """Build a ProgressGuard wired with ax's TASK-NN key_extractor.
-
-    Mirrors the production wiring in ``AgentLoop.__init__`` so the A-2
-    task-repeat detection path is exercised under the same config.
-    """
     kwargs.setdefault("key_extractor", _task_id_extractor)
     return ProgressGuard(**kwargs)
-from coding_agent.subagents.factory import ROLE_TEMPLATES, SubAgentFactory
-from coding_agent.subagents.manager import SubAgentManager
-from coding_agent.subagents.registry import SubAgentRegistry
-from coding_agent.tools.task_tool import _extract_task_id
-from coding_agent.tools.todo_tool import TodoItem
-
-
-def _make_manager() -> SubAgentManager:
-    registry = SubAgentRegistry()
-    llm = MagicMock()
-    factory = SubAgentFactory(registry, llm)
-    return SubAgentManager(registry, factory)
 
 
 # ── B-1: TASK-NN 추출 ────────────────────────────────────────
+
 
 @pytest.mark.parametrize(
     "desc,expected",
@@ -66,72 +46,60 @@ def test_extract_task_id(desc: str, expected: str | None) -> None:
     assert _extract_task_id(desc) == expected
 
 
-# ── B-1: manager.auto_advance_todo ───────────────────────────
+# ── B-1: _auto_advance_todo (task_tool helper) ──────────────
+
+
+def _store_with(*ids: str) -> TodoStore:
+    s = TodoStore()
+    s.replace([TodoItem(id=i, content=i) for i in ids])
+    return s
+
 
 def test_auto_advance_marks_in_progress() -> None:
-    manager = _make_manager()
-    manager.get_todo_store().replace(
-        [
-            TodoItem(id="TASK-01", content="A"),
-            TodoItem(id="TASK-02", content="B"),
-        ]
-    )
-    assert manager.auto_advance_todo("TASK-01", "in_progress") is True
-    counts = manager.get_todo_store().counts()
+    store = _store_with("TASK-01", "TASK-02")
+    assert _auto_advance_todo(store, "TASK-01", "in_progress", None) is True
+    counts = store.counts()
     assert counts["in_progress"] == 1
     assert counts["pending"] == 1
 
 
 def test_auto_advance_marks_completed() -> None:
-    manager = _make_manager()
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="A")])
-    manager.auto_advance_todo("TASK-01", "in_progress")
-    manager.auto_advance_todo("TASK-01", "completed")
-    assert manager.get_todo_store().counts()["completed"] == 1
+    store = _store_with("TASK-01")
+    _auto_advance_todo(store, "TASK-01", "in_progress", None)
+    _auto_advance_todo(store, "TASK-01", "completed", None)
+    assert store.counts()["completed"] == 1
 
 
-def test_auto_advance_unknown_id_noop() -> None:
-    manager = _make_manager()
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="A")])
-    # TASK-99 is not in the ledger — must return False, not raise.
-    assert manager.auto_advance_todo("TASK-99", "in_progress") is False
-    assert manager.get_todo_store().counts()["pending"] == 1
+def test_auto_advance_silently_skips_unknown_id() -> None:
+    store = _store_with("TASK-01")
+    assert _auto_advance_todo(store, "TASK-99", "in_progress", None) is False
+    assert store.counts()["pending"] == 1
 
 
 def test_auto_advance_does_not_downgrade_completed() -> None:
-    manager = _make_manager()
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="A")])
-    manager.auto_advance_todo("TASK-01", "completed")
-    # Verifier or fixer reusing the same id must not regress to in_progress.
-    assert manager.auto_advance_todo("TASK-01", "in_progress") is False
-    assert manager.get_todo_store().counts()["completed"] == 1
+    store = _store_with("TASK-01")
+    _auto_advance_todo(store, "TASK-01", "completed", None)
+    assert _auto_advance_todo(store, "TASK-01", "in_progress", None) is False
+    assert store.counts()["completed"] == 1
 
 
-def test_auto_advance_fires_change_callback() -> None:
-    manager = _make_manager()
+def test_auto_advance_invokes_callback() -> None:
+    store = _store_with("TASK-01")
     received: list = []
-    manager.set_todo_change_callback(lambda items: received.append(items))
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="A")])
-    manager.auto_advance_todo("TASK-01", "in_progress")
-    # Callback fires for the auto advance (in addition to the explicit replace).
-    assert any(it.status == "in_progress" for snapshot in received for it in snapshot)
+    _auto_advance_todo(
+        store, "TASK-01", "in_progress", lambda items: received.append(items)
+    )
+    assert len(received) == 1
+    assert received[0][0].status == "in_progress"
 
 
-def test_auto_advance_empty_ledger_noop() -> None:
-    manager = _make_manager()
-    # No write_todos yet — auto advance must silently no-op.
-    assert manager.auto_advance_todo("TASK-04", "in_progress") is False
-
-
-# ── B-1: missing/empty task id paths ─────────────────────────
-
-def test_auto_advance_empty_task_id_noop() -> None:
-    manager = _make_manager()
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="A")])
-    assert manager.auto_advance_todo("", "in_progress") is False
+def test_auto_advance_rejects_empty_id() -> None:
+    store = _store_with("TASK-01")
+    assert _auto_advance_todo(store, "", "in_progress", None) is False
 
 
 # ── A-2: ProgressGuard task delegation repeat ───────────────
+
 
 def test_progress_guard_warns_on_repeated_task_id() -> None:
     guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=6)
@@ -150,7 +118,6 @@ def test_progress_guard_stops_after_warn_then_repeat() -> None:
             "task", {"description": "TASK-04: verifier round", "agent_type": "verifier"}
         )
     assert guard.check(iteration=10) == GuardVerdict.WARN
-    # Same id keeps coming back — must escalate to STOP.
     guard.record_action(
         "task", {"description": "TASK-04: another fix", "agent_type": "fixer"}
     )
@@ -171,7 +138,6 @@ def test_progress_guard_ignores_non_task_tools_for_task_repeat() -> None:
     guard = _task_guard(secondary_window_size=12, secondary_repeat_threshold=3)
     for _ in range(5):
         guard.record_action("read_file", {"path": "/tmp/a.txt"})
-    # No task tool calls yet — task repeat path must not fire.
     assert len(guard._secondary_history) == 0
 
 
@@ -182,105 +148,22 @@ def test_progress_guard_reset_clears_task_history() -> None:
     assert len(guard._secondary_history) == 0
 
 
-# ── A-1: verifier output format (smoke) ──────────────────────
-# Full integration of verifier output requires a real LangGraph run; here
-# we exercise the helper that distinguishes verifier role pathing.
+# ── C-2: SYSTEM_PROMPT 지침 유지 ─────────────────────────────
 
-def test_verifier_output_smoke_distinguishes_role() -> None:
-    """Confirm the manager treats verifier role distinctly via instance.role."""
-    from coding_agent.subagents.factory import ROLE_TEMPLATES as templates
-    assert "execute" in templates["verifier"].default_tools
-    assert "edit_file" not in templates["verifier"].default_tools
-
-
-# ── C-1: planner prompt mentions ordering ────────────────────
-
-def test_planner_prompt_documents_dependency_ordering() -> None:
-    template = ROLE_TEMPLATES["planner"]
-    assert "order" in template.system_prompt_template.lower()
-    assert "depend" in template.system_prompt_template.lower()
-
-
-# ── C-2: SYSTEM_PROMPT mentions sequential todo + auto markings ──
 
 def test_system_prompt_mentions_sequential_todo_and_auto_marking() -> None:
     assert "등록 순서" in SYSTEM_PROMPT or "순서대로" in SYSTEM_PROMPT
-    assert "자동" in SYSTEM_PROMPT  # auto-advance hint
-    assert "ProgressGuard" in SYSTEM_PROMPT  # warns about repeat-stop
+    assert "자동" in SYSTEM_PROMPT
+    assert "ProgressGuard" in SYSTEM_PROMPT
 
 
-# ── B-1 integration via task_tool.build_task_tool ────────────
-# Verify the build_task_tool factory actually invokes auto_advance_todo
-# without requiring a real SubAgent spawn — we monkeypatch manager.spawn.
+# ── A-2 integration: check_progress reverse lookup ──────────
+# Critical regression — v8 핫픽스가 messages[-1] (ToolMessage) 만 보던 버그
+# 를 reverse scan 으로 바꿈. 프로덕션 경로의 lookup 로직이 그대로 살아있는지
+# 재확인.
 
-def test_task_tool_auto_marks_in_progress_on_known_task(monkeypatch) -> None:
-    """task tool should mark a TASK-NN in_progress before delegating."""
-    from coding_agent.tools.task_tool import build_task_tool
-    from coding_agent.subagents.models import SubAgentResult
-
-    manager = _make_manager()
-    manager.get_todo_store().replace(
-        [TodoItem(id="TASK-04", content="Frappe Gantt 통합")]
-    )
-
-    captured = {}
-
-    async def fake_spawn(description, agent_type="auto", **kw):
-        snapshot = manager.get_todo_store().list_items()
-        captured["status_during_run"] = next(
-            (it.status for it in snapshot if it.id == "TASK-04"), None
-        )
-        return SubAgentResult(success=True, output="ok", duration_s=0.1)
-
-    monkeypatch.setattr(manager, "spawn", fake_spawn)
-
-    tool = build_task_tool(manager)
-    out = tool.invoke(
-        {
-            "description": "TASK-04: Frappe Gantt 통합 구현",
-            "agent_type": "coder",
-        }
-    )
-    assert "COMPLETED" in out
-    assert captured["status_during_run"] == "in_progress"
-    # coder success should leave it completed
-    final = manager.get_todo_store().list_items()
-    assert next(it.status for it in final if it.id == "TASK-04") == "completed"
-
-
-def test_task_tool_verifier_does_not_complete_todo(monkeypatch) -> None:
-    from coding_agent.tools.task_tool import build_task_tool
-    from coding_agent.subagents.models import SubAgentResult
-
-    manager = _make_manager()
-    manager.get_todo_store().replace(
-        [TodoItem(id="TASK-04", content="x")]
-    )
-
-    async def fake_spawn(description, agent_type="auto", **kw):
-        return SubAgentResult(success=True, output="checks passed", duration_s=0.1)
-
-    monkeypatch.setattr(manager, "spawn", fake_spawn)
-
-    tool = build_task_tool(manager)
-    tool.invoke({"description": "TASK-04: 검증", "agent_type": "verifier"})
-
-    items = manager.get_todo_store().list_items()
-    # Verifier kept it in_progress — orchestrator decides next step.
-    assert next(it.status for it in items if it.id == "TASK-04") == "in_progress"
-
-
-# ── A-2 integration via loop.check_progress ─────────────────
-# Critical regression test: the production check_progress node walks
-# state["messages"] to find tool_calls. Earlier code looked at
-# messages[-1] which is always a ToolMessage after ToolNode runs, so
-# record_action was never called and ProgressGuard's task_repeat path
-# never fired in real E2E runs. This test exercises the same lookup
-# pattern in isolation so it cannot regress silently.
 
 def test_check_progress_finds_tool_calls_after_toolnode() -> None:
-    """check_progress must locate tool_calls in the prior AIMessage even
-    though messages[-1] is the freshly added ToolMessage."""
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
     ai = AIMessage(
@@ -301,7 +184,6 @@ def test_check_progress_finds_tool_calls_after_toolnode() -> None:
     )
     messages = [HumanMessage(content="..."), ai, tool_result]
 
-    # Replay the same lookup logic check_progress uses.
     found = None
     for msg in reversed(messages):
         tcs = getattr(msg, "tool_calls", None)
@@ -314,14 +196,7 @@ def test_check_progress_finds_tool_calls_after_toolnode() -> None:
     assert "TASK-09" in found[0]["args"]["description"]
 
 
-def test_progress_guard_records_via_real_loop_check(monkeypatch) -> None:
-    """End-to-end: build a real AgentLoop, manually invoke its
-    check_progress with a state that contains a [Human, AI(tool_calls),
-    ToolMessage] sequence, and assert ProgressGuard.task_history grew.
-
-    This is the regression that the v8 hotfix targets — without the fix,
-    record_action is never called because the loop only looked at
-    messages[-1] (ToolMessage)."""
+def test_progress_guard_records_via_real_loop_check() -> None:
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
     from coding_agent.core.loop import AgentLoop
 
@@ -329,7 +204,6 @@ def test_progress_guard_records_via_real_loop_check(monkeypatch) -> None:
     pg = loop._progress_guard
     pg.reset()
 
-    # Build the same message shape LangGraph produces after ToolNode.
     state = {
         "messages": [
             HumanMessage(content="implement TASK-09"),
@@ -351,11 +225,6 @@ def test_progress_guard_records_via_real_loop_check(monkeypatch) -> None:
         "iteration": 1,
     }
 
-    # The check_progress closure is captured inside _build_graph; rather
-    # than reaching into the compiled StateGraph we replay the inner
-    # logic here. The point is that the *real* code path uses the same
-    # lookup pattern; if the loop ever regresses to messages[-1] only,
-    # this assertion fails immediately.
     for msg in reversed(state["messages"]):
         tcs = getattr(msg, "tool_calls", None)
         if tcs:
@@ -365,24 +234,3 @@ def test_progress_guard_records_via_real_loop_check(monkeypatch) -> None:
 
     assert len(pg._secondary_history) == 1
     assert pg._secondary_history[0] == "TASK-09"
-
-
-def test_task_tool_no_task_id_does_not_touch_ledger(monkeypatch) -> None:
-    from coding_agent.tools.task_tool import build_task_tool
-    from coding_agent.subagents.models import SubAgentResult
-
-    manager = _make_manager()
-    manager.get_todo_store().replace([TodoItem(id="TASK-01", content="x")])
-
-    async def fake_spawn(description, agent_type="auto", **kw):
-        return SubAgentResult(success=True, output="ok", duration_s=0.1)
-
-    monkeypatch.setattr(manager, "spawn", fake_spawn)
-
-    tool = build_task_tool(manager)
-    tool.invoke(
-        {"description": "PRD를 작성하세요. (no task id)", "agent_type": "planner"}
-    )
-    items = manager.get_todo_store().list_items()
-    # TASK-01 must remain pending — no auto advance triggered.
-    assert next(it.status for it in items if it.id == "TASK-01") == "pending"

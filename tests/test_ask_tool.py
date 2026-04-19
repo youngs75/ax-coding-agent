@@ -236,19 +236,21 @@ def test_renderer_invalid_then_valid():
 # ── Tool registration sanity ───────────────────────────────────────
 
 
-def test_tool_is_registered_in_manager_resolver():
-    from unittest.mock import MagicMock
+def test_ask_adapter_registered_in_orchestrator_tool_registry():
+    """Phase 6: ask_user_question 은 minyoung_mah.ToolAdapter 로 등록되어야
+    SubAgent role 들이 bind_tools 에서 실제로 볼 수 있다."""
+    from minyoung_mah import SqliteMemoryStore
 
-    from coding_agent.subagents.factory import SubAgentFactory
-    from coding_agent.subagents.manager import SubAgentManager
-    from coding_agent.subagents.registry import SubAgentRegistry
+    from coding_agent.subagents.orchestrator_factory import build_orchestrator
+    from coding_agent.subagents.user_decisions import UserDecisionsLog
 
-    manager = SubAgentManager(SubAgentRegistry(), SubAgentFactory(SubAgentRegistry(), MagicMock()))
-    resolved = manager._resolve_tools(["ask_user_question"])
-    assert len(resolved) == 1
-    assert resolved[0].name == "ask_user_question"
+    store = SqliteMemoryStore(":memory:", tiers=["user", "project", "domain"])
+    orch = build_orchestrator(memory_store=store, user_decisions=UserDecisionsLog())
+    assert "ask_user_question" in orch.tools.names()
 
 
-def test_planner_has_ask_user_question():
-    from coding_agent.subagents.factory import ROLE_TEMPLATES
-    assert "ask_user_question" in ROLE_TEMPLATES["planner"].default_tools
+def test_planner_role_has_ask_user_question():
+    from coding_agent.subagents.roles import planner_role
+
+    role = planner_role()
+    assert "ask_user_question" in role.tool_allowlist

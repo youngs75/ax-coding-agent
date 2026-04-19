@@ -195,83 +195,9 @@ class TestMemoryCaching:
         assert mw._last_domain_query != first_query  # re-searched
 
 
-# ── Parallel spawn tests ────────────────────────────────────────────────────
-
-from coding_agent.subagents.manager import SubAgentManager
-from coding_agent.subagents.models import SubAgentResult
-
-
-class TestParallelSpawn:
-    """Tests for SubAgentManager.spawn_parallel."""
-
-    @pytest.mark.asyncio
-    async def test_spawn_parallel_returns_all_results(self):
-        registry = MagicMock()
-        factory = MagicMock()
-        manager = SubAgentManager(registry, factory)
-
-        results = [
-            SubAgentResult(success=True, output="file1 done", written_files=["a.py"]),
-            SubAgentResult(success=True, output="file2 done", written_files=["b.py"]),
-        ]
-
-        with patch.object(manager, "spawn", new_callable=AsyncMock) as mock_spawn:
-            mock_spawn.side_effect = results
-
-            tasks = [
-                {"description": "create a.py", "agent_type": "coder"},
-                {"description": "create b.py", "agent_type": "coder"},
-            ]
-            out = await manager.spawn_parallel(tasks)
-
-        assert len(out) == 2
-        assert out[0].success is True
-        assert out[1].success is True
-        assert mock_spawn.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_spawn_parallel_handles_exceptions(self):
-        registry = MagicMock()
-        factory = MagicMock()
-        manager = SubAgentManager(registry, factory)
-
-        async def side_effect(task_description, agent_type="auto"):
-            if "fail" in task_description:
-                raise RuntimeError("boom")
-            return SubAgentResult(success=True, output="ok")
-
-        with patch.object(manager, "spawn", side_effect=side_effect):
-            tasks = [
-                {"description": "create ok.py"},
-                {"description": "fail this task"},
-            ]
-            out = await manager.spawn_parallel(tasks)
-
-        assert len(out) == 2
-        assert out[0].success is True
-        assert out[1].success is False
-        assert "boom" in out[1].error
-
-
-# ── Parallel tasks tool tests ───────────────────────────────────────────────
-
-from coding_agent.tools.task_tool import build_parallel_tasks_tool
-
-
-class TestParallelTasksTool:
-    """Tests for the parallel_tasks tool input validation."""
-
-    def test_invalid_json(self):
-        manager = MagicMock()
-        tool = build_parallel_tasks_tool(manager)
-        result = tool.invoke({"tasks": "not json"})
-        assert "Error" in result
-
-    def test_empty_array(self):
-        manager = MagicMock()
-        tool = build_parallel_tasks_tool(manager)
-        result = tool.invoke({"tasks": "[]"})
-        assert "Error" in result
+# Parallel spawn / parallel_tasks 테스트는 Phase 6 리팩터와 함께 삭제 —
+# 로직은 이제 minyoung-mah Orchestrator 위의 task_tool.build_parallel_tasks_tool
+# 이 담당한다. 새 contract 에 맞는 테스트는 Phase 8/E2E 레이어에서 재작성.
 
 
 # ── Early termination tests ─────────────────────────────────────────────────
