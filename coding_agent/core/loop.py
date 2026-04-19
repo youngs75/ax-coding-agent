@@ -50,11 +50,7 @@ from coding_agent.subagents.user_decisions import UserDecisionsLog
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
 from coding_agent.tools.task_tool import build_task_tool
-from coding_agent.tools.todo_tool import (
-    TodoStore,
-    build_update_todo_tool,
-    build_write_todos_tool,
-)
+from coding_agent.tools.todo_tool import TodoStore
 
 # Async callback type for satisfying ask_user_question interrupts.
 # Receives the interrupt payload (dict) and returns the user's answer.
@@ -80,62 +76,84 @@ def _task_id_extractor(tool_name: str, tool_args: dict) -> str | None:
     m = _TASK_ID_PATTERN.search(desc)
     return m.group(0).upper() if m else None
 
+def _render_ledger_snapshot(todo_store: "TodoStore") -> str:
+    """Compact ledger view injected into the orchestrator system prompt.
+
+    Keeps the orchestrator aware of pending/in_progress/completed counts and
+    the first few actionable rows so it can judge the termination condition
+    without holding write_todos/update_todo directly.
+    """
+    items = todo_store.list_items()
+    if not items:
+        return "## Ledger snapshot\n(empty — no todos registered yet)"
+    counts = todo_store.counts()
+    lines = [
+        "## Ledger snapshot",
+        (
+            f"totals: pending={counts.get('pending', 0)}, "
+            f"in_progress={counts.get('in_progress', 0)}, "
+            f"completed={counts.get('completed', 0)} "
+            f"(of {len(items)})"
+        ),
+    ]
+    status_glyph = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    for it in items:
+        lines.append(f"  {status_glyph.get(it.status, '[?]')} {it.id}: {it.content}")
+    return "\n".join(lines)
+
+
 SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
-직접 코드를 작성하지 않고, task 도구로 전문 SubAgent에게 위임합니다.
+직접 코드를 작성하거나 작업을 분해·설계하지 않고, task 도구로 전문
+SubAgent에게 위임합니다. orchestrator 의 책임은 SubAgent 간 조율과
+진행 관리입니다 — 요구사항 분석·task 분해·산출물 설계는 planner 에게,
+ledger 기록은 ledger 에게 위임하세요.
 
 ## 사용 가능한 도구
 - read_file / glob_files / grep: 결과물 확인용
-- task: SubAgent 위임 (코드 작성/수정/실행은 모두 이 경로)
-- write_todos / update_todo: 진행 상황 ledger
+- task: SubAgent 위임 (코드 작성/수정/실행, ledger 기록 모두 이 경로)
 
 ## SubAgent 역할
-- planner: 요구사항 분석, PRD/SPEC 작성
-- coder: 코드 생성, 파일 작성, 패키지 설치, 테스트 작성
-- verifier: 테스트 실행, 빌드 확인 (수정 없음)
-- fixer: 버그 수정, 에러 해결
+- planner: 요구사항 분석, PRD/SPEC 등 기획 산출물 작성, 원자 단위 task 분해
+- coder: 코드 작성·수정·실행
+- verifier: 테스트/빌드 검증 (수정 금지)
+- fixer: 지정된 실패 지점을 타겟팅해 수정
 - reviewer: 코드 품질 검토
-- researcher: 탐색/조사
-
-## 작업 흐름 (복잡한 개발 요청)
-1. **PRD 위임** — task(planner, "PRD를 작성하세요. ...") 단독 호출. 사용자가 지정한
-   요구사항·구조·범위를 그대로 description에 전달합니다. PRD와 다른 산출물을
-   같은 호출에 섞지 마세요.
-2. **SPEC 위임** — PRD 완료 후 별도 task(planner, "SPEC/SDD를 작성하세요. docs/PRD.md를
-   먼저 읽고 작성"). 사용자가 SPEC 구조(섹션 목록, Phase 분할 등)를 명시했다면
-   그 구조를 description에 그대로 전달하세요. harness는 SPEC 형식을 강제하지
-   않으므로 planner가 자율적으로 작성합니다.
-3. **Todo 등록** — SPEC을 read_file로 읽은 직후 **반드시 write_todos를 한 번 호출**해
-   SPEC의 모든 atomic task를 **SPEC에 등장한 순서 그대로** ledger에 등록합니다.
-   todo id는 SPEC에서 사용된 task 식별자(TASK-01 등)를 그대로 사용합니다.
-   임의로 순서를 바꾸거나 일부만 등록하지 마세요.
-4. **구현 루프** — todo가 남아 있는 동안:
-   - **항상 pending 중에서 가장 첫 번째 todo부터 진행**합니다 (등록 순서 = 의존성 순서).
-   - 위임 시 task description의 첫 줄에 반드시 `TASK-NN: ...` 형식을 포함하면
-     harness가 자동으로 해당 todo를 in_progress로 마킹합니다 (update_todo 호출 불필요).
-   - coder가 성공적으로 마무리하면 harness가 자동으로 todo를 completed로 마킹합니다.
-     verifier/fixer 사이클은 todo를 in_progress로 유지합니다.
-   - update_todo는 자동 진행에서 누락된 경우(예: planner/researcher 위임)에만
-     수동으로 호출하면 됩니다.
-   - **pending과 in_progress가 모두 0이 될 때까지 멈추지 말고 다음 todo로 진행**합니다.
-     자연어로 "이제 SPEC을 확인하겠습니다" 같은 응답만 하고 멈추면 안 됩니다 —
-     항상 도구 호출(write_todos / task)로 다음 단계를 시작하세요.
-   - 같은 TASK-NN을 여러 번 verifier↔fixer로 반복하지 마세요. **harness가 동일
-     TASK-NN을 6회 이상 재위임하면 ProgressGuard가 강제 종료합니다**. fixer가
-     실패한 verifier 결과를 받았다면 verifier 출력의 구체적 에러(exit code,
-     stack trace, 실패 테스트명)를 fixer description에 그대로 복사해 1회 안에
-     해결되도록 하세요.
-5. **검증** — 코드 변경이 있을 때마다 **반드시 verifier를 먼저 호출**합니다.
-   fixer를 직접 부르지 마세요. verifier가 실패를 보고하면, 그 다음에만 fixer를
-   호출하되 **verifier가 보고한 구체적 실패 내용(에러 메시지/실패 테스트명/스택 트레이스)을
-   fixer의 task description에 반드시 복사해서 넣으세요**. fixer는 테스트를 직접
-   돌리지 못하고 코드만 수정합니다 — 수정 후 다시 verifier를 호출해 통과를 확인합니다.
-   전체 구현이 끝나면 reviewer를 한 번 호출해 품질을 점검합니다.
+- researcher: 코드/문서 탐색
+- ledger: planner 가 돌려준 분해 결과를 todo ledger 에 등록하거나, 특정
+  task 의 상태를 수동으로 업데이트. 내용을 생성하지 않는 registrar.
 
 ## 원칙
-- 사용자가 요청하지 않은 기능을 임의로 추가하지 마세요.
-- 모호한 요구사항(기술 스택/플랫폼/인증 범위/저장소 등)은 planner가 ask_user_question
-  으로 먼저 확인합니다. harness는 산출물 형식이나 섹션 구조를 강제하지 않습니다 —
-  사용자 입력에 충실히 따르되, 빠진 부분만 질문으로 채웁니다.
+- 사용자가 요청하지 않은 기능·산출물·도구를 임의로 추가하지 마세요.
+- 사용자가 명시하지 않은 기술·아키텍처·산출물 포맷을 todo 제목·설명이나
+  task 위임 description 에 포함하면 안 됩니다. 그런 결정이 필요하면
+  planner 가 확인 후 산출물에 반영하게 하세요.
+- 사용자 요청에 요구사항 모호성(구현 범위·산출물 포맷·기술 스택 미지정
+  등)이 있으면 task 위임 전에 planner 에게 위임해 ask_user_question 으로
+  확정하세요. harness 는 빠진 부분을 임의로 채우지 않습니다.
+- 어떤 SubAgent에게 무엇을 어떤 순서로 위임할지, 얼마나 나눠서 위임할지,
+  어떤 산출물을 먼저 만들지는 모두 orchestrator인 당신이 판단합니다.
+  harness 는 특정 워크플로·산출물 형식·섹션 구조를 강제하지 않습니다.
+
+## Todo ledger 운용
+- ledger 기록은 orchestrator 가 직접 하지 않고 ledger SubAgent 에게 위임
+  합니다. 초기 등록은 planner 가 돌려준 분해 결과를 ledger 에게 넘겨
+  write_todos 로 등록하도록 하세요.
+- 등록 순서 = 작업 순서. pending 첫 항목부터 진행하세요.
+- task description 첫 줄에 `TASK-NN: ...` 을 포함하면 harness 가 자동으로
+  in_progress/completed 마킹합니다. 수동 update 가 필요하면 ledger 에게
+  "TASK-NN 을 <status> 로" 와 같은 task 로 위임하세요.
+- 같은 TASK-NN 을 verifier↔fixer 로 6 회 이상 반복하면 ProgressGuard 가
+  강제 종료합니다. verifier 가 보고한 실패(에러 메시지·테스트명·스택)를
+  fixer description 에 그대로 복사하세요.
+
+## 종료
+- 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시
+  자연어 요약 한 번으로 응답을 마무리하세요. 새 task 위임을 만들면 안
+  됩니다.
+- todo ledger 를 쓰지 않는 짧은 요청의 경우에도, 사용자 요청이 충족되면
+  동일하게 자연어 요약으로 종료합니다.
+
+{ledger_snapshot}
 
 {memory_context}
 """
@@ -156,9 +174,17 @@ class AgentLoop:
         self._user_decisions = UserDecisionsLog()
         self._todo_store = TodoStore()
         self._todo_change_callback: Any | None = None
+        # ledger SubAgent 가 write_todos/update_todo 도구를 소유 — orchestrator
+        # 직접 바인딩은 제거됨. todo_store 를 factory 에 넘겨 adapter 등록.
         self._orchestrator = build_orchestrator(
             memory_store=self._store,
             user_decisions=self._user_decisions,
+            todo_store=self._todo_store,
+            todo_change_callback=lambda items: (
+                self._todo_change_callback(items)
+                if self._todo_change_callback
+                else None
+            ),
         )
 
         # 복원력 시스템
@@ -182,29 +208,12 @@ class AgentLoop:
             ),
         )
 
-        # Orchestrator 에는 읽기 전용 도구 + task 위임 도구 + todo ledger 만 바인딩.
-        # write_file/edit_file/execute 는 SubAgent 전용 — orchestrator LLM 이 직접
-        # 코드를 쓰면 23회 이상 직접 도구 호출이 발생하는 이슈가 E2E 에서 관찰됐음.
+        # Orchestrator 에는 읽기 전용 도구 + task 위임 도구만 바인딩.
+        # write_todos/update_todo 는 ledger SubAgent 전용 — orchestrator 가 직접
+        # ledger 를 조작하면 "선제적 task 분해" 현상이 발생해 도구 권한 수준에서
+        # 차단한다. write_file/edit/execute 도 SubAgent 전용.
         from coding_agent.tools.file_ops import read_file, glob_files, grep
-        todo_tools = [
-            build_write_todos_tool(
-                store=self._todo_store,
-                on_change=lambda items: (
-                    self._todo_change_callback(items)
-                    if self._todo_change_callback
-                    else None
-                ),
-            ),
-            build_update_todo_tool(
-                store=self._todo_store,
-                on_change=lambda items: (
-                    self._todo_change_callback(items)
-                    if self._todo_change_callback
-                    else None
-                ),
-            ),
-        ]
-        self._tools = [read_file, glob_files, grep, task_tool, *todo_tools]
+        self._tools = [read_file, glob_files, grep, task_tool]
 
         # 그래프
         self._graph = self._build_graph()
@@ -253,9 +262,10 @@ class AgentLoop:
                 "memory_context": result.get("memory_context", ""),
             }
             if "iteration" not in state or state.get("iteration") is None:
+                cfg = get_config()
                 updates["iteration"] = 0
-                updates["max_iterations"] = get_config().max_iterations
-                updates["current_tier"] = "strong"
+                updates["max_iterations"] = cfg.max_iterations
+                updates["current_tier"] = cfg.orchestrator_tier
                 updates["stall_count"] = 0
             log.debug("timing.inject_memory", elapsed_s=round(time.monotonic() - t0, 3))
             return updates
@@ -295,7 +305,7 @@ class AgentLoop:
             4. Fix 1: 메시지 윈도우 적용 (토큰 증가 방지)
             """
             t0 = time.monotonic()
-            tier = state.get("current_tier", "strong")
+            tier = state.get("current_tier") or get_config().orchestrator_tier
             iteration = (state.get("iteration") or 0) + 1
             model, use_prompt_tools = get_bound_model(tier)
 
@@ -304,7 +314,11 @@ class AgentLoop:
 
             # 시스템 프롬프트 구성
             memory_ctx = state.get("memory_context", "")
-            sys_prompt = SYSTEM_PROMPT.format(memory_context=memory_ctx)
+            ledger_snapshot = _render_ledger_snapshot(self._todo_store)
+            sys_prompt = SYSTEM_PROMPT.format(
+                memory_context=memory_ctx,
+                ledger_snapshot=ledger_snapshot,
+            )
 
             # 프롬프트 기반 도구 호출 모드면 도구 스키마를 시스템 프롬프트에 추가
             if use_prompt_tools:
@@ -717,7 +731,7 @@ class AgentLoop:
             "progress_summary": last_ai_content[:2000],
             "iteration": state.get("iteration", 0),
             "exit_reason": exit_reason,
-            "current_tier": state.get("current_tier", "strong"),
+            "current_tier": state.get("current_tier") or get_config().orchestrator_tier,
             "project_id": state.get("project_id", ""),
         }
 

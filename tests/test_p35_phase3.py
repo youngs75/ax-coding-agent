@@ -14,9 +14,20 @@ from __future__ import annotations
 
 import pytest
 
+from minyoung_mah import RoleStatus
+from minyoung_mah.core.types import (
+    RoleInvocationResult,
+    ToolCallRequest,
+    ToolResult,
+)
+
 from coding_agent.core.loop import SYSTEM_PROMPT, _task_id_extractor
 from coding_agent.resilience_compat import GuardVerdict, ProgressGuard
-from coding_agent.tools.task_tool import _auto_advance_todo, _extract_task_id
+from coding_agent.tools.task_tool import (
+    _auto_advance_todo,
+    _extract_task_id,
+    _verifier_signals_success,
+)
 from coding_agent.tools.todo_tool import TodoItem, TodoStore
 
 
@@ -96,6 +107,90 @@ def test_auto_advance_invokes_callback() -> None:
 def test_auto_advance_rejects_empty_id() -> None:
     store = _store_with("TASK-01")
     assert _auto_advance_todo(store, "", "in_progress", None) is False
+
+
+# ── P2: _verifier_signals_success — verifier auto-advance gate ──────
+
+
+def _verifier_result(
+    *executes: tuple[str, bool, str],
+    extra_calls: list[tuple[str, bool, str]] | None = None,
+) -> RoleInvocationResult:
+    """Helper: build a verifier RoleInvocationResult.
+
+    *executes* — list of ``(command, ok, value)`` triples for execute calls.
+    *extra_calls* — non-execute tool calls (e.g. read_file) appended after.
+    """
+    calls: list[ToolCallRequest] = []
+    results: list[ToolResult] = []
+    for i, (cmd, ok, value) in enumerate(executes):
+        calls.append(
+            ToolCallRequest(call_id=f"e{i}", tool_name="execute", args={"command": cmd})
+        )
+        results.append(ToolResult(ok=ok, value=value))
+    for j, (name, ok, value) in enumerate(extra_calls or []):
+        calls.append(ToolCallRequest(call_id=f"x{j}", tool_name=name, args={}))
+        results.append(ToolResult(ok=ok, value=value))
+    return RoleInvocationResult(
+        role_name="verifier",
+        status=RoleStatus.COMPLETED,
+        output="Scope: ran tests\nResult: pass",
+        tool_calls=calls,
+        tool_results=results,
+    )
+
+
+def test_verifier_success_when_all_executes_clean() -> None:
+    result = _verifier_result(
+        ("pytest -q", True, "5 passed in 0.42s"),
+        ("ruff check .", True, "All checks passed!"),
+    )
+    assert _verifier_signals_success(result) is True
+
+
+def test_verifier_failure_when_exit_code_marker_present() -> None:
+    # shell.execute embeds non-zero exits as "[exit code: N]" without raising,
+    # so ToolResult.ok stays True even though the test actually failed.
+    result = _verifier_result(
+        ("pytest -q", True, "1 failed, 4 passed\n[exit code: 1]"),
+    )
+    assert _verifier_signals_success(result) is False
+
+
+def test_verifier_failure_on_timeout_marker() -> None:
+    result = _verifier_result(
+        ("pytest -q", True, "[TIMEOUT] Command exceeded 90s and was terminated."),
+    )
+    assert _verifier_signals_success(result) is False
+
+
+def test_verifier_failure_on_rejected_marker() -> None:
+    result = _verifier_result(
+        ("vitest", True, "REJECTED: the harness does not run watch/daemon commands"),
+    )
+    assert _verifier_signals_success(result) is False
+
+
+def test_verifier_failure_when_adapter_ok_false() -> None:
+    result = _verifier_result(
+        ("pytest -q", False, ""),
+    )
+    assert _verifier_signals_success(result) is False
+
+
+def test_verifier_no_executes_does_not_signal_success() -> None:
+    # A verifier that only read files but never ran a command did not actually
+    # verify anything — refuse to auto-advance.
+    result = _verifier_result(extra_calls=[("read_file", True, "...")])
+    assert _verifier_signals_success(result) is False
+
+
+def test_verifier_mixed_executes_one_failing_blocks_advance() -> None:
+    result = _verifier_result(
+        ("pytest -q", True, "5 passed"),
+        ("npm test", True, "FAIL src/foo.test.ts\n[exit code: 1]"),
+    )
+    assert _verifier_signals_success(result) is False
 
 
 # ── A-2: ProgressGuard task delegation repeat ───────────────

@@ -13,6 +13,10 @@ import sys
 import time
 from typing import Any
 
+import structlog
+
+log = structlog.get_logger("cli")
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -204,7 +208,12 @@ async def _run_agent_streaming(user_input: str) -> None:
     loop._progress_guard.reset()
     start_time = time.time()
     final_content = ""
-    iteration = 0
+    # iter_count: number of agent_node entries (== state.iteration).
+    # llm_call_in_iter: LLM calls within the current iter (includes fallback retries).
+    # llm_call_total: cumulative LLM calls (what was labeled "step N" before).
+    iter_count = 0
+    llm_call_in_iter = 0
+    llm_call_total = 0
     shown_tools = set()
     _sa_info: dict = {"start_time": 0.0, "steps": 0, "tools": 0}
     spinner = get_spinner()
@@ -285,6 +294,13 @@ async def _run_agent_streaming(user_input: str) -> None:
                         spinner.update(f"{name} {brief}".strip()[:60])
                     continue
 
+                # ── agent_node 진입: state.iteration 과 동기화 ──
+                # Orchestrator 의 "agent" 노드가 새로 실행되면 iter 경계.
+                # on_chain_start 는 노드 단위로 한 번만 발생하므로 신뢰 가능.
+                if kind == "on_chain_start" and name == "agent":
+                    iter_count += 1
+                    llm_call_in_iter = 0
+
                 # ── 도구 호출 시작 (Orchestrator only) ──
                 if kind == "on_tool_start":
                     tool_input = data.get("input", {})
@@ -309,9 +325,17 @@ async def _run_agent_streaming(user_input: str) -> None:
 
                 # ── LLM 호출 시작 (Orchestrator only) ──
                 elif kind == "on_chat_model_start":
-                    iteration += 1
+                    llm_call_total += 1
+                    llm_call_in_iter += 1
                     final_content = ""
-                    console.print(f"\r  [dim]{ICON_AGENT} Orchestrator · step {iteration}[/dim]", end="\r")
+                    # iter M · llm_call N: state.iteration 과 해당 iter 내부 LLM 호출 횟수.
+                    # 한 iter 내 llm_call 이 2 이상이면 invoke_with_tool_fallback 재시도.
+                    label_iter = iter_count if iter_count > 0 else 1
+                    console.print(
+                        f"\r  [dim]{ICON_AGENT} Orchestrator · iter {label_iter} · "
+                        f"llm_call {llm_call_in_iter}[/dim]",
+                        end="\r",
+                    )
 
                 # ── LLM 스트리밍 토큰 (Orchestrator only) ──
                 elif kind == "on_chat_model_stream":
@@ -384,17 +408,14 @@ async def _run_agent_streaming(user_input: str) -> None:
         except Exception:
             state = None
 
-    # ── 메모리 저장 이벤트 표시 ──
-    memories = store.list_all()
-    if memories:
-        recent = [m for m in memories if m.updated_at and m.updated_at > ""]
-        # 최근 저장된 메모리 수만 표시
-        new_count = min(len(recent), 5)
-        if new_count > 0:
-            print_memory_event("extracted", f"{new_count} memories", "auto")
-
     # ── 완료 정보 ──
-    print_agent_status("completed", f"{elapsed:.1f}s · {iteration} steps")
+    # iter_count 가 0 이면 agent_node 가 한 번도 돌지 않은 경우(예: 조기 interrupt).
+    # 그땐 llm_call_total 로라도 표기.
+    if iter_count > 0:
+        status_detail = f"{elapsed:.1f}s · {iter_count} iters · {llm_call_total} llm_calls"
+    else:
+        status_detail = f"{elapsed:.1f}s · {llm_call_total} llm_calls"
+    print_agent_status("completed", status_detail)
 
 
 # ── 폴백: 비스트리밍 실행 ──
@@ -478,12 +499,17 @@ async def _async_main() -> None:
 
         try:
             await _run_agent_streaming(user_input)
-        except Exception:
-            # 스트리밍 실패 시 폴백
-            try:
-                await _run_agent_simple(user_input)
-            except Exception as e:
-                print_error(str(e))
+        except Exception as e:
+            # 이전에 있던 simple 폴백은 같은 user_input 을 처음부터 다시
+            # 돌리기 때문에, streaming 이 이미 상당 부분 진행된 뒤의 후처리
+            # 단계에서 에러가 나면 전체 agent_loop 이 중복 실행되는 치명적
+            # 경로가 됐다. 이제는 에러를 표면화만 하고 재실행은 하지 않는다.
+            import traceback
+            log.exception("cli.streaming_error", error=str(e))
+            print_error(f"{type(e).__name__}: {e}")
+            console.print(
+                f"  [dim]{traceback.format_exc().splitlines()[-1]}[/dim]"
+            )
 
 
 def main() -> None:

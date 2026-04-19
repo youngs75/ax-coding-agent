@@ -3,6 +3,12 @@
        lint demo clean up down logs \
        docker-build docker-run docker-up docker-down docker-logs traces trace
 
+# Use the interpreter actually on PATH. WSL / Debian-based hosts typically
+# ship only `python3`; override with `make test PYTHON=.venv/bin/python`
+# for pinned venvs or CI.
+PYTHON ?= python3
+PIP    ?= $(PYTHON) -m pip
+
 # ── 로컬 개발 ──
 
 setup: install
@@ -11,33 +17,33 @@ setup: install
 install:
 	@if [ -d ../minyoung-mah ]; then \
 	  echo "→ Installing minyoung-mah (editable sibling checkout)"; \
-	  pip install -e ../minyoung-mah; \
+	  $(PIP) install -e ../minyoung-mah; \
 	else \
 	  echo "⚠  ../minyoung-mah not found — ensure it's checked out (or published to PyPI)"; \
 	fi
-	pip install -e ".[dev]" 2>/dev/null || pip install -e .
+	$(PIP) install -e ".[dev]" 2>/dev/null || $(PIP) install -e .
 
 test:
-	python -m pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 test-memory:
-	python -m pytest tests/test_memory.py -v
+	$(PYTHON) -m pytest tests/test_memory.py -v
 
 test-roles:
-	python -m pytest tests/test_user_decisions.py tests/test_ask_adapter.py -v
+	$(PYTHON) -m pytest tests/test_user_decisions.py tests/test_ask_adapter.py -v
 
 test-resilience:
-	python -m pytest tests/test_resilience.py -v
+	$(PYTHON) -m pytest tests/test_resilience.py -v
 
 test-performance:
-	python -m pytest tests/test_performance.py -v
+	$(PYTHON) -m pytest tests/test_performance.py -v
 
 lint:
 	ruff check coding_agent/ tests/
 	ruff format --check coding_agent/ tests/
 
 demo:
-	python -m coding_agent.cli.app
+	$(PYTHON) -m coding_agent.cli.app
 
 clean:
 	rm -rf memory_store/*.db
@@ -111,8 +117,8 @@ docker-logs:
 # ── Langfuse 트레이스 ──
 
 traces:
-	python -m coding_agent.utils.langfuse_trace_exporter --list-traces 10
+	$(PYTHON) -m coding_agent.utils.langfuse_trace_exporter --list-traces 10
 
 trace:
 	@echo "Usage: make trace ID=<trace-id>"
-	python -m coding_agent.utils.langfuse_trace_exporter --trace $(ID) -v
+	$(PYTHON) -m coding_agent.utils.langfuse_trace_exporter --trace $(ID) -v

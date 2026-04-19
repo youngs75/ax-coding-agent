@@ -72,7 +72,28 @@ SHELL_ADAPTERS: list[_LangChainToolAdapter] = [
     _LangChainToolAdapter(t) for t in SHELL_TOOLS
 ]
 
+
+def build_todo_adapters(
+    store: Any,
+    on_change: Any = None,
+) -> list[_LangChainToolAdapter]:
+    """Wrap write_todos/update_todo as ToolAdapters bound to *store*.
+
+    The ledger SubAgent role receives these via the shared ToolRegistry — the
+    orchestrator no longer binds them at the top level.
+    """
+    from coding_agent.tools.todo_tool import (
+        build_update_todo_tool,
+        build_write_todos_tool,
+    )
+
+    write_tool = build_write_todos_tool(store, on_change=on_change)
+    update_tool = build_update_todo_tool(store, on_change=on_change)
+    return [_LangChainToolAdapter(write_tool), _LangChainToolAdapter(update_tool)]
+
+
 __all__ = [
     "FILE_ADAPTERS",
     "SHELL_ADAPTERS",
+    "build_todo_adapters",
 ]

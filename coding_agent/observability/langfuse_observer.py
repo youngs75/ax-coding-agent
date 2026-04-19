@@ -58,9 +58,10 @@ class LangfuseForwardObserver:
             return
         try:
             self._handle(event)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             # Observer failures must never break the main flow.
-            log.exception("langfuse_observer.emit_failed", name=event.name)
+            # Keep at debug to avoid log flooding when SDK API drifts.
+            log.debug("langfuse_observer.emit_failed", name=event.name, error=str(exc))
 
     def _handle(self, event: "ObserverEvent") -> None:
         name = event.name
@@ -68,7 +69,7 @@ class LangfuseForwardObserver:
         key = self._event_key(event)
 
         if name.endswith(".start"):
-            span = self._client.span(
+            span = self._client.start_observation(
                 name=name,
                 input=meta,
                 metadata={"role": event.role, "tool": event.tool},
@@ -79,7 +80,7 @@ class LangfuseForwardObserver:
             span = self._spans.pop(key, None) if key else None
             if span is None:
                 # No matching start — record a point-in-time event instead.
-                self._client.event(
+                self._client.create_event(
                     name=name,
                     metadata={
                         "role": event.role,
@@ -91,11 +92,12 @@ class LangfuseForwardObserver:
                 )
                 return
             try:
-                span.end(
+                span.update(
                     output={"ok": event.ok, "duration_ms": event.duration_ms, **meta},
                 )
-            except Exception:
-                log.exception("langfuse_observer.span_end_failed", name=name)
+                span.end()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("langfuse_observer.span_end_failed", name=name, error=str(exc))
 
     @staticmethod
     def _event_key(event: "ObserverEvent") -> str | None:

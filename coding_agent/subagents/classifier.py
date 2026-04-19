@@ -39,6 +39,10 @@ _ROLE_KEYWORDS: dict[str, list[str]] = {
         "테스트", "검증", "확인", "빌드", "실행",
         "test", "verify", "check", "build", "run test", "validate",
     ],
+    "ledger": [
+        "ledger", "todo", "write_todos", "update_todo",
+        "todo 등록", "todo 업데이트", "진행 마킹",
+    ],
 }
 
 _KNOWN_ROLES = set(_ROLE_KEYWORDS.keys())
@@ -53,6 +57,7 @@ agent role from the following list:
 - fixer: for tasks that require debugging, fixing bugs, or resolving errors
 - researcher: for tasks that require searching, reading, or gathering information
 - verifier: for tasks that require running tests, checking builds, or verifying implementations
+- ledger: for tasks that only register a given task list in the todo ledger or flip a status — no content decisions
 
 Respond with ONLY the role name (one word, lowercase). No explanation.
 

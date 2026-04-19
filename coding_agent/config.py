@@ -87,7 +87,7 @@ class Config:
 
     # 에이전트 설정
     max_iterations: int = field(
-        default_factory=lambda: int(os.getenv("MAX_ITERATIONS", "50"))
+        default_factory=lambda: int(os.getenv("MAX_ITERATIONS", "150"))
     )
     llm_timeout: int = field(
         default_factory=lambda: int(os.getenv("LLM_TIMEOUT", "60"))
@@ -108,6 +108,13 @@ class Config:
     # 빈 문자열이면 legacy 모드 (세션 간 공유).
     project_id: str = field(
         default_factory=lambda: os.getenv("AX_PROJECT_ID", "")
+    )
+
+    # Orchestrator tier — 최상위 ReAct 드라이버가 사용할 model tier.
+    # "reasoning" (조율/플래닝 중심, 권장) / "strong" (도구 호출 중심, 기존 동작) /
+    # "default" / "fast" 중 하나.
+    orchestrator_tier: str = field(
+        default_factory=lambda: os.getenv("ORCHESTRATOR_TIER", "reasoning")
     )
 
     # 프로젝트 경로

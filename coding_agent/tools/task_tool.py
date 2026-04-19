@@ -21,10 +21,10 @@ import concurrent.futures
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import structlog
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import InjectedToolCallId, StructuredTool
 from langgraph.errors import GraphInterrupt
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
@@ -67,6 +67,15 @@ def _extract_task_id(description: str) -> str | None:
 _shared_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
+# Module-level cache for LangGraph interrupt replay-safety.
+# Keyed by ``tool_call_id`` (injected by LangGraph per tool call), inner dict
+# maps ``iter_idx`` → ``RoleInvocationResult`` so replayed executions of the
+# same tool call reuse the exact same role invocation result instead of
+# re-calling the nondeterministic LLM. Entries are cleared when a tool call
+# reaches a terminal state (both success and failure paths).
+_TOOL_CALL_CACHE: dict[str, dict[int, Any]] = {}
+
+
 def _run_async(coro: Any) -> Any:
     try:
         loop = asyncio.get_running_loop()
@@ -91,10 +100,15 @@ class TaskToolInput(BaseModel):
         default="auto",
         description=(
             "The type of SubAgent to spawn. "
-            "Options: 'planner', 'coder', 'reviewer', 'fixer', 'researcher', 'verifier', 'auto'. "
+            "Options: 'planner', 'coder', 'reviewer', 'fixer', 'researcher', "
+            "'verifier', 'ledger', 'auto'. "
             "Use 'auto' to let the system choose."
         ),
     )
+    # Injected by LangGraph at call time; excluded from LLM schema so the model
+    # does not try to supply it. Used as cache key for interrupt replay-safety
+    # inside ``_run_task`` (see P1 LangGraph replay pitfall).
+    tool_call_id: Annotated[str, InjectedToolCallId] = ""
 
 
 class ParallelTasksInput(BaseModel):
@@ -259,6 +273,45 @@ def _find_pending_interrupt(result: "RoleInvocationResult") -> dict[str, Any] | 
 
 
 # ---------------------------------------------------------------------------
+# Verifier success detection — gate for auto-advancing todos on verifier path
+# ---------------------------------------------------------------------------
+
+# coding_agent.tools.shell.execute never raises; non-zero exits, timeouts,
+# guard rejections, and adapter errors are all encoded as substrings in the
+# returned text. So ToolResult.ok=True alone is not a strong enough signal —
+# we also scan the value for these markers before declaring "verified".
+_EXECUTE_FAILURE_MARKERS = (
+    "[exit code:",
+    "[TIMEOUT]",
+    "REJECTED:",
+    "Error:",
+)
+
+
+def _verifier_signals_success(result: "RoleInvocationResult") -> bool:
+    """True iff the verifier ran at least one ``execute`` call and every
+    one of them succeeded — both at the adapter layer (``ok=True``) and
+    at the shell layer (no failure markers in the captured output).
+
+    Why both checks: ``execute`` swallows non-zero exit codes and prints
+    them as ``[exit code: N]`` text instead of raising. A test failure
+    therefore round-trips as ``ToolResult(ok=True, value="...[exit code: 1]")``,
+    so ``ok`` alone would auto-advance even when tests fail.
+    """
+    saw_execute = False
+    for req, res in zip(result.tool_calls or [], result.tool_results or []):
+        if req.tool_name != "execute":
+            continue
+        saw_execute = True
+        if not res.ok:
+            return False
+        text = res.value if isinstance(res.value, str) else ""
+        if any(marker in text for marker in _EXECUTE_FAILURE_MARKERS):
+            return False
+    return saw_execute
+
+
+# ---------------------------------------------------------------------------
 # build_task_tool — the LangGraph tool the orchestrator LLM sees
 # ---------------------------------------------------------------------------
 
@@ -275,9 +328,33 @@ def build_task_tool(
     :func:`coding_agent.subagents.orchestrator_factory.build_orchestrator`.
     ``user_decisions`` carries ``ask_user_question`` answers across SubAgent
     invocations so coder/verifier/fixer all see the same hard constraints.
+
+    Interrupt replay-safety (LangGraph 공식 경고)
+    ---------------------------------------------
+    ``interrupt()`` causes the entire tool function to be *re-executed* on
+    resume — every side effect before the interrupt runs again. ``_run_task``
+    pairs each iteration's ``orchestrator.invoke_role`` (nondeterministic LLM
+    call) with an ``interrupt()`` call, so a naive implementation drifts by
+    one round on every resume (new pending generated on replay gets matched
+    to the previously saved answer).
+
+    To stay compliant with LangGraph's replay semantics we memoise each
+    iteration's ``RoleInvocationResult`` in ``_TOOL_CALL_CACHE`` keyed by
+    ``(tool_call_id, iter_idx)``:
+
+    * fresh call  → cache miss → invoke → cache write → interrupt
+    * replay      → cache hit  → skip invoke → interrupt returns stored
+                    answer immediately → loop proceeds deterministically
+
+    The entry is cleared in ``finally`` so tool calls that eventually
+    terminate do not leak cache memory.
     """
 
-    def _run_task(description: str, agent_type: str = "auto") -> str:
+    def _run_task(
+        description: str,
+        agent_type: str = "auto",
+        tool_call_id: str = "",
+    ) -> str:
         from minyoung_mah import InvocationContext, RoleStatus
 
         t0 = time.monotonic()
@@ -287,6 +364,7 @@ def build_task_tool(
             agent_type=agent_type,
             role=role_name,
             desc=description[:80],
+            tool_call_id=tool_call_id[:16] if tool_call_id else "",
         )
 
         # B-1: flip the ledger to in_progress before delegation.
@@ -295,15 +373,30 @@ def build_task_tool(
             _auto_advance_todo(todo_store, task_id, "in_progress", todo_change_callback)
 
         parent_outputs: dict[str, Any] = {}
+        # Replay-safety cache for this tool call. tool_call_id is injected by
+        # LangGraph; anonymous fallback "" still works for non-LangGraph tests
+        # (each test gets its own slot since the finally block clears it).
+        cache_bucket: dict[int, Any] = _TOOL_CALL_CACHE.setdefault(tool_call_id, {})
+        iter_idx = 0
 
         try:
             while True:
-                ctx = InvocationContext(
-                    task_summary=description,
-                    user_request="",
-                    parent_outputs=dict(parent_outputs),
-                )
-                result = _run_async(orchestrator.invoke_role(role_name, ctx))
+                cached = cache_bucket.get(iter_idx)
+                if cached is not None:
+                    result = cached
+                    log.debug(
+                        "task_tool.replay_cache_hit",
+                        role=role_name,
+                        iter_idx=iter_idx,
+                    )
+                else:
+                    ctx = InvocationContext(
+                        task_summary=description,
+                        user_request="",
+                        parent_outputs=dict(parent_outputs),
+                    )
+                    result = _run_async(orchestrator.invoke_role(role_name, ctx))
+                    cache_bucket[iter_idx] = result
 
                 # HITL path (plan §결정 3) — role reported an ask via marker.
                 pending = _find_pending_interrupt(result)
@@ -312,15 +405,18 @@ def build_task_tool(
                         "task_tool.propagate_interrupt",
                         role=role_name,
                         payload_preview=str(pending)[:120],
+                        iter_idx=iter_idx,
                     )
                     user_answer = interrupt(pending)
                     log.info(
                         "task_tool.received_answer",
                         answer_preview=str(user_answer)[:80],
+                        iter_idx=iter_idx,
                     )
                     formatted = _format_answer(pending, user_answer)
                     user_decisions.record(formatted)
                     parent_outputs["previous_ask"] = formatted
+                    iter_idx += 1
                     continue  # re-invoke with the answer prepended
 
                 # Terminal — either COMPLETED / INCOMPLETE / FAILED / ABORTED.
@@ -345,12 +441,17 @@ def build_task_tool(
                 else:
                     body = _extract_text(result)
 
-                # B-1: coder success → mark completed. verifier/fixer keep
-                # the todo at in_progress so the orchestrator LLM can decide.
-                if (
-                    task_id
-                    and status_tag == "COMPLETED"
-                    and role_name in ("coder",)
+                # B-1: coder success → mark completed.
+                # P2: verifier success (COMPLETED + every execute call ok and
+                # without failure markers) → mark completed. Fixer never
+                # auto-advances — fix success/failure is judged by the next
+                # verifier round, so the orchestrator LLM keeps the call.
+                if task_id and status_tag == "COMPLETED" and (
+                    role_name == "coder"
+                    or (
+                        role_name == "verifier"
+                        and _verifier_signals_success(result)
+                    )
                 ):
                     _auto_advance_todo(
                         todo_store, task_id, "completed", todo_change_callback
@@ -361,15 +462,21 @@ def build_task_tool(
                 if written:
                     parts.append(f"Files written: {', '.join(written)}")
                 parts.append(f"[Duration: {elapsed:.1f}s]")
+                _TOOL_CALL_CACHE.pop(tool_call_id, None)
                 return "\n".join(parts)
 
             # FAILED / ABORTED
             err = result.error or f"role '{role_name}' terminated with {result.status.name}"
+            _TOOL_CALL_CACHE.pop(tool_call_id, None)
             return f"SubAgent failed: {err}"
 
         except GraphInterrupt:
+            # Do NOT clear cache — LangGraph will replay this tool call on
+            # resume and the stored invocation results are what make the
+            # replay return the previously-saved answers deterministically.
             raise
         except Exception as exc:
+            _TOOL_CALL_CACHE.pop(tool_call_id, None)
             return f"Error running SubAgent: {exc}"
 
     return StructuredTool.from_function(
@@ -463,4 +570,5 @@ __all__ = [
     "build_parallel_tasks_tool",
     "_extract_task_id",
     "_auto_advance_todo",
+    "_verifier_signals_success",
 ]

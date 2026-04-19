@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 
 from langchain_core.tools import tool
@@ -271,6 +272,44 @@ def _build_env() -> dict[str, str]:
     return env
 
 
+# ── Process-group reaper ────────────────────────────────────────────
+#
+# When a shell command times out we cannot rely on killing the shell
+# alone: backgrounded jobs (`npm run dev &`) and forked build tools
+# (esbuild workers, npm install's node children) survive the shell's
+# death and get re-parented to init, leaving dozens of orphans in the
+# container.  To stop that, ``execute`` runs the child in a *new
+# process group* (start_new_session=True) and this reaper sends
+# SIGTERM to the whole group on timeout, escalating to SIGKILL if any
+# process is still alive after a short grace period.
+
+_TERM_GRACE_SECONDS = 2.0
+
+
+def _reap_process_group(
+    proc: subprocess.Popen, grace: float = _TERM_GRACE_SECONDS
+) -> None:
+    """TERM the whole process group of *proc*, then KILL survivors.
+
+    Best-effort: safe to call even if the process has already exited
+    (os.getpgid / killpg raise ProcessLookupError, which we swallow).
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 # ── Execute tool ────────────────────────────────────────────────────
 
 
@@ -325,31 +364,35 @@ def execute(command: str, working_directory: str = ".") -> str:
         )
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             fixed_command,
             shell=True,
             cwd=working_directory,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            text=True,
             env=_build_env(),
+            # New session → new process group rooted at /bin/sh. On
+            # timeout we killpg() the whole group so backgrounded
+            # grandchildren (esbuild workers, npm install's node
+            # children, `sleep 60 &`) do not survive as orphans.
+            start_new_session=True,
         )
-        output = ""
-        if result.stdout:
-            output += result.stdout
-        if result.stderr:
-            output += f"\n[stderr]\n{result.stderr}"
-        if result.returncode != 0:
-            output += f"\n[exit code: {result.returncode}]"
+    except Exception as e:
+        return notice + f"Error: {e}"
 
-        max_chars = 10000
-        if len(output) > max_chars:
-            output = output[:max_chars] + f"\n... (truncated, {len(output)} total chars)"
-
-        return (notice + output.strip()) or "(no output)"
-
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _reap_process_group(proc)
+        # Drain any buffered output. By now the group is dead so
+        # communicate() returns promptly; the bounded timeout is
+        # purely defensive.
+        try:
+            stdout, stderr = proc.communicate(timeout=_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
         return (
             notice
             + f"[TIMEOUT] Command exceeded {timeout}s and was terminated.\n"
@@ -362,7 +405,22 @@ def execute(command: str, working_directory: str = ".") -> str:
             + f"Command was: {fixed_command}"
         )
     except Exception as e:
+        _reap_process_group(proc)
         return notice + f"Error: {e}"
+
+    output = ""
+    if stdout:
+        output += stdout
+    if stderr:
+        output += f"\n[stderr]\n{stderr}"
+    if proc.returncode != 0:
+        output += f"\n[exit code: {proc.returncode}]"
+
+    max_chars = 10000
+    if len(output) > max_chars:
+        output = output[:max_chars] + f"\n... (truncated, {len(output)} total chars)"
+
+    return (notice + output.strip()) or "(no output)"
 
 
 SHELL_TOOLS = [execute]

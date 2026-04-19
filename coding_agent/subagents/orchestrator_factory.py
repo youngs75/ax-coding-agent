@@ -27,23 +27,33 @@ from coding_agent.models import get_model
 from coding_agent.subagents.roles import (
     coder_role,
     fixer_role,
+    ledger_role,
     planner_role,
     researcher_role,
     reviewer_role,
     verifier_role,
 )
-from coding_agent.tools.adapters import FILE_ADAPTERS, SHELL_ADAPTERS
+from coding_agent.tools.adapters import (
+    FILE_ADAPTERS,
+    SHELL_ADAPTERS,
+    build_todo_adapters,
+)
 from coding_agent.tools.ask_adapter import ask_user_question_adapter
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from minyoung_mah.core.protocols import ToolAdapter
 
     from coding_agent.subagents.user_decisions import UserDecisionsLog
+    from coding_agent.tools.todo_tool import TodoItem, TodoStore
 
 
 def build_orchestrator(
     memory_store: MemoryStore,
     user_decisions: "UserDecisionsLog",
+    todo_store: "TodoStore | None" = None,
+    todo_change_callback: "Callable[[list[TodoItem]], None] | None" = None,
     extra_adapters: "list[ToolAdapter] | None" = None,
     role_timeouts: dict[str, float] | None = None,
 ) -> Orchestrator:
@@ -70,6 +80,9 @@ def build_orchestrator(
     tool_registry = ToolRegistry()
     for adapter in (*FILE_ADAPTERS, *SHELL_ADAPTERS, ask_user_question_adapter):
         tool_registry.register(adapter)
+    if todo_store is not None:
+        for adapter in build_todo_adapters(todo_store, on_change=todo_change_callback):
+            tool_registry.register(adapter)
     for adapter in extra_adapters or []:
         tool_registry.register(adapter)
 
@@ -80,6 +93,8 @@ def build_orchestrator(
     role_registry.register(fixer_role(user_decisions=user_decisions))
     role_registry.register(researcher_role(user_decisions=user_decisions))
     role_registry.register(verifier_role(user_decisions=user_decisions))
+    if todo_store is not None:
+        role_registry.register(ledger_role(user_decisions=user_decisions))
 
     # ── Model router: one shared model per tier ──
     # Building the ChatOpenAI instances here keeps the Orchestrator wiring
@@ -105,6 +120,7 @@ def build_orchestrator(
         "fixer": 90.0,
         "researcher": 120.0,
         "verifier": 90.0,
+        "ledger": 30.0,
     }
     resilience = default_resilience(role_timeouts=timeouts)
 

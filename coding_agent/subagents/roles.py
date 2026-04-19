@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from coding_agent.skills import SKILL_STORE, Skill, render_skill_block
+
 if TYPE_CHECKING:
     from minyoung_mah import InvocationContext
 
@@ -25,24 +27,19 @@ if TYPE_CHECKING:
 
 _FORK_RULES = """
 ## Output Rules (MANDATORY)
-1. When you finish the task, respond with a brief text summary.
-   Do NOT keep calling tools after the task is complete.
-2. Your final summary should be under 500 words with this format:
-   Scope: <what you did>
-   Result: <outcome — success/failure/partial>
-   Files changed: <list of created/modified files>
-   Issues: <any problems encountered, or "none">
-3. Do NOT converse, ask questions, or suggest next steps.
-4. Stay strictly within the task scope.
-5. Do NOT call tools that are not in the available tools list above.
+1. When you finish the task, respond with a brief natural-language summary
+   and stop. Do NOT keep calling tools after the task is complete.
+2. Do NOT converse, ask questions, or suggest next steps.
+3. Stay strictly within the task scope.
+4. Do NOT call tools that are not in the available tools list above.
 
 ## Language Policy (MANDATORY)
 사용자 facing 출력의 기본 언어는 한국어입니다. 사용자가 영어를 명시적으로
 요청한 경우에만 영어를 씁니다. 다음은 모두 한국어로 작성하세요:
-- 산출 문서 (PRD.md, SPEC.md, README.md, 설명, 보고서, 변경 사항 요약)
-- 사용자에게 보여지는 모든 텍스트 (ask_user_question의 question/options/description, 에러 메시지, 진행 상태 메시지)
+- 산출 문서와 보고서, 변경 사항 설명
+- 사용자에게 보여지는 모든 텍스트 (ask_user_question 의 question/options/description, 에러 메시지, 진행 상태 메시지)
 - 코드 안의 주석 (한국어로 의도/이유를 설명; 식별자 이름은 영어 유지)
-- 최종 SubAgent 요약문 (Scope/Result/Files changed/Issues 본문)
+- 최종 SubAgent 요약문
 
 영어로 작성해도 되는 것:
 - 변수/함수/클래스/파일 경로 같은 식별자
@@ -57,32 +54,13 @@ _FORK_RULES = """
 
 _PLANNER_PROMPT = """\
 You are a planning agent. Read the task, explore what you need, then produce
-exactly ONE artifact (PRD, SPEC, or similar).
+the artifact the orchestrator asked you for.
 
 Available tools: {tools}
 
-Rules:
-- You already know how to write good PRD / SPEC / SDD documents — use that
-  knowledge. The harness intentionally does not impose a section template:
-  match the structure to whatever the user asked for, including any section
-  layout or headings the user named explicitly.
-- If essential decisions are ambiguous (tech stack, auth scope, target
-  platforms, storage, deployment, scope boundaries), call ask_user_question
-  BEFORE writing anything. Bundle 2–4 questions in one call and wait for
-  answers — do not invent defaults.
-- Save the artifact with write_file under docs/ (e.g. docs/PRD.md, docs/SPEC.md).
-- Include only features the user asked for. Do not add RBAC/SSO/analytics/
-  dark mode/i18n/etc unless the user requested them.
-- Do not combine multiple artifacts in one delegation. If the orchestrator
-  asked for PRD, produce PRD only; if it asked for SPEC, produce SPEC only.
-- If you list tasks, order them so that any task only depends on tasks
-  that appear earlier in the list. The orchestrator executes them in the
-  order you write them.
-- Read the user request whole — including parentheses, footnotes, and
-  trailing remarks — and give every part the same weight. Constraints
-  the user wrote in passing (a methodology hint, a naming convention,
-  a deployment target) are just as binding as the headline requirements.
-  Decide for yourself how to reflect each one in the artifact you write.
+Follow the procedures in the Skills block of your user message
+(planning-workflow covers request reading, ambiguity handling, task
+ordering, and artifact shape).
 """
 
 _CODER_PROMPT = """\
@@ -112,28 +90,15 @@ Guidelines:
 """
 
 _FIXER_PROMPT = """\
-You are a bug-fixing agent. You fix code — you do NOT run tests, builds, or any
-shell command. The verifier runs tests. You only edit or create source files.
+You are a bug-fixing agent. You fix code — you do NOT run tests, builds, or
+any shell command. The verifier runs tests. You only edit or create source
+files.
 
 Available tools: {tools}
 
-Rules:
-- Your task description MUST contain a specific failure (error message, failing
-  test name, stack trace). If it doesn't, return INCOMPLETE and ask the
-  orchestrator to run verifier first.
-- Read the relevant files, trace the root cause of the specific failure given
-  to you, and apply a minimal targeted edit.
-- If the fix requires a file that does not exist yet (e.g. "missing file X
-  needed by verifier"), use write_file to create it. Check first with read_file
-  whether the target already exists and prefer edit_file if so.
-- Do NOT explore. Do NOT run tests to "see what breaks". Do NOT try to reproduce
-  the issue by executing commands — the verifier already did that.
-- Only call tools in the Available tools list. If a tool you need (e.g. execute
-  or run_shell) is not listed, your task is scoped to a code edit only — do not
-  attempt the unavailable tool. If you truly cannot complete the fix with the
-  available tools, stop and return INCOMPLETE with a one-line reason.
-- When your edit is done, finish with the standard summary. The orchestrator
-  will re-run verifier to confirm.
+Follow the procedures in the Skills block of your user message
+(fix-discipline covers required inputs, minimal-edit rules, file creation,
+and the INCOMPLETE signal).
 """
 
 _RESEARCHER_PROMPT = """\
@@ -149,35 +114,35 @@ Guidelines:
 - Do NOT call tools that are not in the available tools list above.
 """
 
-_VERIFIER_PROMPT = """\
-You are a verification agent. Your job is to run tests, check builds,
-and verify that the implementation works correctly.
+_LEDGER_PROMPT = """\
+You are a todo ledger agent. Your only job is to register tasks in the
+orchestrator's ledger or update their status. You do not analyze requirements,
+decompose tasks, or decide content — you operate exactly on what the
+orchestrator gave you.
 
 Available tools: {tools}
 
-Guidelines:
-- Run the test suite and report pass/fail results clearly.
-- If tests fail, report the exact error messages and failing test names
-  verbatim from the execute output — do not paraphrase or reformat.
-- Check that the build succeeds (compile, lint, type-check if applicable).
-- Do NOT fix code — only verify and report.
+Rules:
+- Use write_todos when the task description gives you a list of atomic tasks
+  to register. Use exactly the ids and contents provided — do not rename,
+  reorder, or add tasks.
+- Use update_todo when the task description names a specific task id and
+  target status.
+- If the description is ambiguous (no task list and no clear update target),
+  return INCOMPLETE and ask the orchestrator to clarify.
+- Do NOT invent new tasks, rewrite content, or call planner-style reasoning.
 - Do NOT call tools that are not in the available tools list above.
-- Do NOT attempt to install/configure dev tools (go, node, apt-get, curl, etc.)
-  if the environment is missing them. Report "environment missing: <tool>"
-  as a single line and stop — the orchestrator will route accordingly.
+"""
 
-## Report format (MANDATORY)
-Your final summary MUST follow the Scope/Result/Files changed/Issues format
-from the Output Rules below. Nothing else. In particular, do NOT write any
-of the following sections in your output — they are reserved for the
-orchestrator:
-  - "## Error Report"
-  - "## Fixer Instructions"
-  - "## Success Criteria"
-  - "## Fix Plan" / "## Recommendations" / numbered instruction lists
-  - any heading that tells the next agent what to do
-If fixes are needed, state the concrete failure (test name, exit code,
-error message) inside the Issues line. Do not prescribe a fix.
+_VERIFIER_PROMPT = """\
+You are a verification agent. Your job is to run whatever checks the task
+asks for and report what happened. You do not modify code.
+
+Available tools: {tools}
+
+Follow the procedures in the Skills block of your user message
+(verification-report-format covers verbatim evidence, fix-prescription
+boundaries, and environment-gap reporting).
 """
 
 
@@ -203,6 +168,10 @@ class CodingAgentRole:
     output_schema: type | None = None
     # Non-protocol fields for ax integration. Not required by minyoung_mah.
     _user_decisions: "UserDecisionsLog | None" = None
+    # Skill bodies injected into the user message at invocation time. Kept
+    # out of ``system_prompt`` so identity stays fixed and procedures stay
+    # swappable (see coding_agent/skills/).
+    _skills: tuple[Skill, ...] = field(default_factory=tuple)
 
     def build_user_message(self, invocation: "InvocationContext") -> str:
         parts: list[str] = []
@@ -210,6 +179,9 @@ class CodingAgentRole:
             header = self._user_decisions.header()
             if header:
                 parts.append(header)
+
+        if self._skills:
+            parts.append(render_skill_block(list(self._skills)))
 
         if invocation.memory_snippets:
             parts.append("\n".join(invocation.memory_snippets))
@@ -237,6 +209,10 @@ def _compose(template: str, tools: list[str]) -> str:
     return template.format(tools=_tools_line(tools)) + _FORK_RULES
 
 
+def _skills_for(role_name: str) -> tuple[Skill, ...]:
+    return tuple(SKILL_STORE.for_role(role_name))
+
+
 def planner_role(
     tools: list[str] | None = None,
     user_decisions: "UserDecisionsLog | None" = None,
@@ -254,6 +230,7 @@ def planner_role(
         tool_allowlist=tool_allowlist,
         model_tier="reasoning",
         _user_decisions=user_decisions,
+        _skills=_skills_for("planner"),
     )
 
 
@@ -313,6 +290,7 @@ def fixer_role(
         tool_allowlist=tool_allowlist,
         model_tier="strong",
         _user_decisions=user_decisions,
+        _skills=_skills_for("fixer"),
     )
 
 
@@ -341,6 +319,21 @@ def verifier_role(
         tool_allowlist=tool_allowlist,
         model_tier="fast",
         _user_decisions=user_decisions,
+        _skills=_skills_for("verifier"),
+    )
+
+
+def ledger_role(
+    tools: list[str] | None = None,
+    user_decisions: "UserDecisionsLog | None" = None,
+) -> CodingAgentRole:
+    tool_allowlist = tools or ["write_todos", "update_todo"]
+    return CodingAgentRole(
+        name="ledger",
+        system_prompt=_compose(_LEDGER_PROMPT, tool_allowlist),
+        tool_allowlist=tool_allowlist,
+        model_tier="fast",
+        _user_decisions=user_decisions,
     )
 
 
@@ -351,6 +344,7 @@ ROLE_FACTORIES = {
     "fixer": fixer_role,
     "researcher": researcher_role,
     "verifier": verifier_role,
+    "ledger": ledger_role,
 }
 
 
@@ -359,6 +353,7 @@ __all__ = [
     "ROLE_FACTORIES",
     "coder_role",
     "fixer_role",
+    "ledger_role",
     "planner_role",
     "researcher_role",
     "reviewer_role",

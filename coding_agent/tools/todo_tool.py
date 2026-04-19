@@ -95,8 +95,23 @@ class TodoStore:
     # ── Public API ────────────────────────────────────────────
 
     def replace(self, todos: list[TodoItem]) -> list[TodoItem]:
-        """Replace the entire ledger. Returns the new ordered list."""
+        """Replace the entire ledger. Returns the new ordered list.
+
+        Raises ``ValueError`` if the current ledger already contains any
+        ``completed`` entry. Strategy: hard-reject rather than append-only,
+        so the orchestrator surfaces the mistake instead of silently losing
+        prior progress when it tries to re-register a fresh SPEC mid-run.
+        """
         with self._lock:
+            if any(item.status == "completed" for item in self._items.values()):
+                completed_ids = [
+                    i for i in self._order if self._items[i].status == "completed"
+                ]
+                raise ValueError(
+                    "ledger already has completed entries "
+                    f"({', '.join(completed_ids)}); use update_todo to "
+                    "advance existing tasks instead of replacing the ledger."
+                )
             self._items = {}
             self._order = []
             for t in todos:
@@ -190,7 +205,12 @@ def build_write_todos_tool(
     """
 
     def _run(todos: list[TodoItem]) -> str:
-        items = store.replace(todos)
+        try:
+            items = store.replace(todos)
+        except ValueError as e:
+            # Guard: ledger already has completed entries. Refuse to clobber
+            # prior progress; orchestrator must use update_todo to advance.
+            return f"REJECTED: {e}"
         if on_change is not None:
             try:
                 on_change(items)

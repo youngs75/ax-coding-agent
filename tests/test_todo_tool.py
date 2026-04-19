@@ -78,6 +78,35 @@ def test_store_reset_clears_everything() -> None:
     assert store.is_empty()
 
 
+def test_store_replace_refuses_when_completed_entries_exist() -> None:
+    # Guard: orchestrator must not wipe prior progress mid-run.
+    store = TodoStore()
+    store.replace([TodoItem(id="TASK-01", content="A")])
+    store.update("TASK-01", "completed")
+    with pytest.raises(ValueError, match="completed"):
+        store.replace([TodoItem(id="TASK-09", content="Fresh SPEC")])
+    # Prior ledger must remain intact.
+    items = store.list_items()
+    assert len(items) == 1
+    assert items[0].id == "TASK-01"
+    assert items[0].status == "completed"
+
+
+def test_write_todos_tool_returns_rejected_when_completed_exists() -> None:
+    store = TodoStore()
+    write = build_write_todos_tool(store=store)
+    update = build_update_todo_tool(store=store)
+    write.invoke({"todos": [{"id": "TASK-01", "content": "A"}]})
+    update.invoke({"id": "TASK-01", "status": "completed"})
+    out = write.invoke({"todos": [{"id": "TASK-09", "content": "Fresh SPEC"}]})
+    assert "REJECTED" in out
+    assert "update_todo" in out
+    # Ledger must be untouched.
+    items = store.list_items()
+    assert len(items) == 1
+    assert items[0].id == "TASK-01"
+
+
 # ── render helper ─────────────────────────────────────────────
 
 def test_render_summary_includes_counts_and_glyphs() -> None:
@@ -224,12 +253,13 @@ def test_loop_exposes_todo_store_and_callback() -> None:
 
 # ── SYSTEM_PROMPT contract ───────────────────────────────────
 
-def test_system_prompt_documents_write_todos_step() -> None:
-    """Ensure the orchestrator prompt actually instructs the model to use
-    write_todos / update_todo. Without this, the slim prompt era shows
-    the model never discovers the tools."""
+def test_system_prompt_delegates_ledger_ops_to_ledger_subagent() -> None:
+    """Orchestrator no longer owns write_todos/update_todo directly — it
+    delegates to the ledger SubAgent. The prompt must still reference
+    write_todos (as the ledger's action) and the ledger role, and must
+    gate termination on pending == 0."""
     from coding_agent.core.loop import SYSTEM_PROMPT
     assert "write_todos" in SYSTEM_PROMPT
-    assert "update_todo" in SYSTEM_PROMPT
+    assert "ledger" in SYSTEM_PROMPT
     # Must explicitly tell the model to keep going until pending == 0.
     assert "pending" in SYSTEM_PROMPT

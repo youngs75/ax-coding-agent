@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from coding_agent.tools.shell import (
     _build_env,
     _is_dangerous,
     _is_watch_command,
+    _reap_process_group,
     _resolve_timeout,
     execute,
 )
@@ -325,3 +328,78 @@ def test_execute_subprocess_receives_ci_env(tmp_path: Path):
     assert "NO_COLOR=1" in result
     assert "DEBIAN_FRONTEND=noninteractive" in result
     assert "TERM=dumb" in result
+
+
+# ── Process-group reaper (P5) ────────────────────────────────────────
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff *pid* still exists (signal 0 probes without delivering)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_reap_process_group_is_safe_on_exited_process():
+    """Reaper must swallow ProcessLookupError — the child may already be gone."""
+    proc = subprocess.Popen(["true"], start_new_session=True)
+    proc.wait()
+    # Must not raise even though the group no longer exists.
+    _reap_process_group(proc)
+
+
+def test_execute_timeout_kills_backgrounded_grandchildren(
+    tmp_path: Path, monkeypatch
+):
+    """`sleep 30 &` spawned under a timing-out command must not outlive it.
+
+    Before the Popen + killpg refactor, subprocess.run only killed the
+    shell itself; backgrounded jobs got re-parented to init and stayed
+    alive (observed as dangling esbuild/node/npm install processes
+    after the E2E run). With start_new_session=True the shell is the
+    group leader and killpg takes out the whole subtree.
+    """
+    import coding_agent.tools.shell as shell_mod
+
+    pidfile = tmp_path / "child.pid"
+    # Bash backgrounds the sleep, records its PID, then waits — so the
+    # shell will still be alive when the harness times out.
+    cmd = f"sleep 30 & echo $! > {pidfile.as_posix()}; wait"
+    monkeypatch.setattr(shell_mod, "_resolve_timeout", lambda: 1)
+
+    out = execute.invoke({"command": cmd, "working_directory": str(tmp_path)})
+    assert "[TIMEOUT]" in out
+
+    # PID file is written before `wait`, so it should exist by now.
+    assert pidfile.exists(), "shell never recorded the backgrounded PID"
+    child_pid = int(pidfile.read_text().strip())
+
+    # Allow SIGTERM → SIGKILL to propagate and the kernel to reap.
+    deadline = time.monotonic() + 5.0
+    while _pid_alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+    assert not _pid_alive(child_pid), (
+        f"grandchild pid {child_pid} survived process-group kill"
+    )
+
+
+def test_execute_normal_completion_still_returns_output(tmp_path: Path):
+    """Popen refactor must not regress the happy path."""
+    out = execute.invoke(
+        {"command": "printf 'first\\nsecond'", "working_directory": str(tmp_path)}
+    )
+    assert "first" in out
+    assert "second" in out
+
+
+def test_execute_nonzero_exit_code_is_reported(tmp_path: Path):
+    """Popen path must preserve the exit-code annotation."""
+    out = execute.invoke(
+        {"command": "sh -c 'exit 7'", "working_directory": str(tmp_path)}
+    )
+    assert "[exit code: 7]" in out
