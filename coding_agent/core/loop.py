@@ -76,6 +76,49 @@ def _task_id_extractor(tool_name: str, tool_args: dict) -> str | None:
     m = _TASK_ID_PATTERN.search(desc)
     return m.group(0).upper() if m else None
 
+def _should_nudge_pending(
+    counts: dict[str, int],
+    nudges_so_far: int,
+    max_nudges: int,
+) -> bool:
+    """True iff the orchestrator should be nudged instead of terminated.
+
+    Extracted from ``route_after_agent`` so the decision is unit-testable
+    without standing up a real LangGraph. ``counts`` is :meth:`TodoStore.counts`.
+    """
+    unfinished = counts.get("pending", 0) + counts.get("in_progress", 0)
+    return unfinished > 0 and nudges_so_far < max_nudges
+
+
+def _build_pending_nudge_message(
+    first_item: Any,
+    counts: dict[str, int],
+) -> str:
+    """Render the HumanMessage content injected when nudging.
+
+    ``first_item`` is the next pending/in_progress :class:`TodoItem` (or None
+    if the ledger was cleared between the route decision and the nudge node).
+    Kept as a pure function so tests can snapshot the output.
+    """
+    pending = counts.get("pending", 0)
+    in_progress = counts.get("in_progress", 0)
+    if first_item is not None:
+        return (
+            f"⚠ Termination blocked: ledger 에 pending={pending}, "
+            f"in_progress={in_progress} 작업이 남아있습니다. "
+            f"자연어 요약으로 끝내지 말고, 지금 바로 `task` 도구를 호출해서 "
+            f"첫 번째 항목을 진행하세요:\n\n"
+            f"    {first_item.id}: {first_item.content}\n\n"
+            f"coder / verifier / fixer 중 적합한 agent_type 을 골라 "
+            f"task description 첫 줄에 `{first_item.id}: ...` 을 포함시키면 "
+            f"harness 가 자동으로 in_progress/completed 를 마킹합니다."
+        )
+    return (
+        "⚠ Termination blocked: ledger 에 처리되지 않은 todo 가 "
+        "남아있습니다. task 도구를 호출해서 진행하세요."
+    )
+
+
 def _render_ledger_snapshot(todo_store: "TodoStore") -> str:
     """Compact ledger view injected into the orchestrator system prompt.
 
@@ -428,6 +471,12 @@ class AgentLoop:
 
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
+        # Termination-with-pending-todos 재시도 횟수 상한.
+        # 3회까지 허용 — nudge 가 너무 보수적이면 정말 할 일 없는 상황에서도
+        # 세션을 못 끝내고, 너무 관대하면 의미없는 "계속해도 이미 나 자연어로만
+        # 답해" 루프가 남는다. 3 은 "모델이 한 번 실수하고, 한 번 더 실수해도
+        # 결국 따라오는" 여유. 여전히 안 따라오면 정상 종료 경로로 내린다.
+        _MAX_PENDING_NUDGES = 3
 
         def handle_error(state: AgentState) -> dict[str, Any]:
             """에러 처리 노드.
@@ -482,6 +531,38 @@ class AgentLoop:
 
             return result
 
+        def nudge_pending_todos_node(state: AgentState) -> dict[str, Any]:
+            """Inject a reminder when orchestrator tries to terminate with
+            pending todos still on the ledger.
+
+            Qwen3-max observed in v12 E2E: after ledger registers 62 todos,
+            orchestrator emits a natural-language summary with ``tool_calls=None``
+            ("이제 등록된 작업들을 순차적으로 수행하여 시스템을 개발할 수
+            있습니다") despite the system prompt stating pending > 0 cannot
+            terminate. The termination rule is not reliably enforced across
+            models, so the harness backstops it by re-prompting with the
+            first pending task as an explicit directive.
+            """
+            items = self._todo_store.list_items()
+            counts = self._todo_store.counts()
+            first = next(
+                (it for it in items if it.status in ("pending", "in_progress")),
+                None,
+            )
+            nudges = (state.get("pending_nudges") or 0) + 1
+            reminder = _build_pending_nudge_message(first, counts)
+            log.warning(
+                "orchestrator.pending_nudge_injected",
+                pending=counts.get("pending", 0),
+                in_progress=counts.get("in_progress", 0),
+                first_task=(first.id if first else None),
+                nudge_count=nudges,
+            )
+            return {
+                "messages": [HumanMessage(content=reminder)],
+                "pending_nudges": nudges,
+            }
+
         def safe_stop_node(state: AgentState) -> dict[str, Any]:
             """안전 중단 노드. 진행 상태를 파일로 저장하여 이어서 작업 가능."""
             exit_reason = state.get("exit_reason", "safe_stop")
@@ -522,7 +603,17 @@ class AgentLoop:
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                     return "tools"
 
-            # 도구 호출 없음 = 응답 완료
+            # 도구 호출 없음 = 응답 완료 — 단, ledger 에 pending 이 남아있으면
+            # 한두 번 nudge 를 주입해서 orchestrator 가 종료 규칙을 지키도록
+            # 강제한다. 모델 순종도 차이로 자연어만 뱉고 끝내는 경로 방어
+            # (v12 E2E 관찰, Qwen3-max).
+            if _should_nudge_pending(
+                self._todo_store.counts(),
+                state.get("pending_nudges") or 0,
+                _MAX_PENDING_NUDGES,
+            ):
+                return "nudge_pending_todos"
+
             return "extract_memory_final"
 
         def route_after_check(state: AgentState) -> str:
@@ -544,6 +635,7 @@ class AgentLoop:
         builder.add_node("inject_memory", inject_memory)
         builder.add_node("agent", agent_node)
         builder.add_node("tools", tool_node)
+        builder.add_node("nudge_pending_todos", nudge_pending_todos_node)
         builder.add_node("extract_memory_final", extract_memory)
         builder.add_node("check_progress", check_progress)
         builder.add_node("handle_error", handle_error)
@@ -558,11 +650,16 @@ class AgentLoop:
             route_after_agent,
             {
                 "tools": "tools",
+                "nudge_pending_todos": "nudge_pending_todos",
                 "extract_memory_final": "extract_memory_final",
                 "handle_error": "handle_error",
                 "safe_stop": "safe_stop",
             },
         )
+
+        # Nudge 후 곧바로 agent 재호출 — injected HumanMessage 를 읽고
+        # 이번엔 task 도구를 호출하도록 재촉한다.
+        builder.add_edge("nudge_pending_todos", "agent")
 
         # 루프 중간에는 메모리 추출 없이 바로 진전 확인
         builder.add_edge("tools", "check_progress")

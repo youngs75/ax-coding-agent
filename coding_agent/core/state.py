@@ -39,5 +39,12 @@ class AgentState(TypedDict, total=False):
     # ── SubAgent ──
     subagent_results: dict[str, Any]  # SubAgent 결과 저장소
 
+    # ── Pending-todo 종료 방어 ──
+    # orchestrator 가 tool_calls=None 으로 종료 시도했는데 ledger 에 pending
+    # 항목이 남아있으면 harness 가 nudge 메시지를 주입해 재시도시킨다.
+    # 이 필드는 누적된 nudge 횟수 — OrchestratorLoop._MAX_PENDING_NUDGES 에
+    # 도달하면 재시도를 포기하고 정상 종료 경로로 빠진다.
+    pending_nudges: int
+
     # ── 작업 디렉토리 ──
     working_directory: str  # 현재 작업 디렉토리
