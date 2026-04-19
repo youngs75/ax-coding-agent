@@ -197,7 +197,7 @@ async def _run_agent_streaming(user_input: str) -> None:
 
     initial_state = {
         "messages": [HumanMessage(content=user_input)],
-        "project_id": "",
+        "project_id": get_config().project_id or "",
         "working_directory": os.getcwd(),
     }
 

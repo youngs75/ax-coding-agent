@@ -102,6 +102,14 @@ class Config:
         )
     )
 
+    # 프로젝트 격리 키 — workspace 경로 해시로 ax-agent.sh 에서 주입됨.
+    # 모든 메모리 tier (user/project/domain) 의 scope 로 사용되어 다른
+    # 워크스페이스 세션과 DB 를 공유하더라도 교차 오염을 차단한다.
+    # 빈 문자열이면 legacy 모드 (세션 간 공유).
+    project_id: str = field(
+        default_factory=lambda: os.getenv("AX_PROJECT_ID", "")
+    )
+
     # 프로젝트 경로
     project_root: Path = field(default_factory=lambda: _PROJECT_ROOT)
 

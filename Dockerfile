@@ -30,7 +30,14 @@ COPY .env.example ./
 COPY .env* ./
 COPY entrypoint.sh ./
 
-RUN pip install --no-cache-dir -e . \
+# minyoung-mah 라이브러리는 PyPI 미공개 — sibling checkout 을 BuildKit
+# named context 로 주입한다. 빌드 명령:
+#   docker buildx build --build-context minyoung_mah=../minyoung-mah \
+#     -t ax-coding-agent .
+COPY --from=minyoung_mah . /opt/minyoung_mah/
+
+RUN pip install --no-cache-dir -e /opt/minyoung_mah \
+    && pip install --no-cache-dir -e . \
     && mkdir -p /app/memory_store /workspace \
     && chmod +x /app/entrypoint.sh \
     && if [ ! -f /app/.env ] && [ -f /app/.env.example ]; then \

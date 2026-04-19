@@ -49,17 +49,26 @@ class MemoryMiddleware:
     # ── LangGraph node: inject ───────────────────────────────────────────
 
     async def inject(self, state: AgentState) -> dict[str, Any]:
-        """Load relevant memories and return them as an XML context block."""
+        """Load relevant memories and return them as an XML context block.
+
+        모든 tier 조회는 ``project_id`` scope 로 격리된다. 빈 ``project_id``
+        (AX_PROJECT_ID 미주입) 는 legacy 공유 동작으로 떨어지되 경고 로그를
+        남긴다 — 프로덕션 실행은 항상 project_id 가 있어야 한다.
+        """
         try:
             project_id = state.get("project_id") or ""
+            if not project_id:
+                log.warning("memory_middleware.inject_no_project_id")
 
             if self._dirty:
                 self._user_cache = None
                 self._project_cache.pop(project_id, None)
+                self._domain_cache = []
+                self._last_domain_query = ""
                 self._dirty = False
 
             if self._user_cache is None:
-                self._user_cache = await self._list_tier("user", scope=None)
+                self._user_cache = await self._list_tier("user", scope=project_id)
             user_memories = self._user_cache
 
             if project_id not in self._project_cache:
@@ -70,11 +79,12 @@ class MemoryMiddleware:
 
             messages = state.get("messages") or []
             last_user_text = self._last_user_text(messages)
-            domain_memories = await self._get_domain_cached(last_user_text)
+            domain_memories = await self._get_domain_cached(last_user_text, project_id)
 
             block = self._build_xml(user_memories, project_memories, domain_memories)
             log.info(
                 "memory_middleware.injected",
+                project_id=project_id or "(none)",
                 user=len(user_memories),
                 project=len(project_memories),
                 domain=len(domain_memories),
@@ -129,7 +139,9 @@ class MemoryMiddleware:
                 continue
         return records
 
-    async def _get_domain_cached(self, query: str) -> list[MemoryRecord]:
+    async def _get_domain_cached(
+        self, query: str, project_id: str
+    ) -> list[MemoryRecord]:
         if not query:
             return self._domain_cache
 
@@ -142,7 +154,7 @@ class MemoryMiddleware:
 
         try:
             entries = await self._store.search(
-                tier="domain", query=query, scope=None, limit=10
+                tier="domain", query=query, scope=project_id, limit=10
             )
         except Exception:
             log.exception("memory_middleware.domain_search_failed")
@@ -154,7 +166,12 @@ class MemoryMiddleware:
     # ── LangGraph node: extract_and_store ────────────────────────────────
 
     async def extract_and_store(self, state: AgentState) -> dict[str, Any]:
-        """Extract durable facts and persist them via the library store."""
+        """Extract durable facts and persist them via the library store.
+
+        모든 record 는 현재 세션의 ``project_id`` scope 로 저장된다 — layer
+        (user/project/domain) 는 카테고리 라벨로만 유지되고 격리 경계는
+        project_id 가 유일한 축이다.
+        """
         try:
             messages = state.get("messages") or []
             if not messages:
@@ -162,7 +179,7 @@ class MemoryMiddleware:
                 return {}
 
             existing_keys = self._collect_cached_keys()
-            project_id = state.get("project_id")
+            project_id = state.get("project_id") or ""
 
             # Extractor is sync (LLM-based); offload to a thread so we don't
             # block the event loop.
@@ -171,8 +188,8 @@ class MemoryMiddleware:
             )
 
             for record in new_records:
-                if record.layer == "project" and project_id:
-                    record.project_id = project_id
+                # 모든 tier 를 project_id 로 격리. layer 무관.
+                record.project_id = project_id
                 entry = record_to_entry(record)
                 await self._store.write(
                     tier=entry.tier,
@@ -184,7 +201,11 @@ class MemoryMiddleware:
 
             if new_records:
                 self._dirty = True
-            log.info("memory_middleware.extracted_and_stored", count=len(new_records))
+            log.info(
+                "memory_middleware.extracted_and_stored",
+                count=len(new_records),
+                project_id=project_id or "(none)",
+            )
             return {}
         except Exception:
             log.exception("memory_middleware.extract_and_store_failed")

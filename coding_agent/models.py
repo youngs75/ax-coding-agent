@@ -29,6 +29,31 @@ TierName = Literal["reasoning", "strong", "default", "fast"]
 
 
 # ═══════════════════════════════════════════════════════════════
+# 티어별 max_tokens (출력 상한)
+# ═══════════════════════════════════════════════════════════════
+#
+# Anthropic Messages API는 max_tokens가 필수 파라미터. LiteLLM 프록시가
+# default를 넣어주지만 값이 작으면 tool_use 블록(특히 write_todos 같이
+# args가 큰 도구)이 중간에 잘려 tool_calls=None으로 루프가 종료되는
+# 회귀가 v10 Claude E2E에서 관찰됨.
+#
+# Claude 4.6 세대 표준 상한 (beta 헤더 없음):
+#   claude-opus-4-6   : 128K output
+#   claude-sonnet-4-6 :  64K output
+#   claude-haiku-4-5  :  64K output
+#
+# qwen3 계열은 DashScope default가 충분하지만, 일관성을 위해 tier별로
+# 동일한 상한을 전 provider에 적용. 상한은 실제 응답 길이를 강제하지
+# 않고(모델이 알아서 조절) 잘림 방지용 천장만 제공.
+_TIER_MAX_TOKENS: dict[str, int] = {
+    "reasoning": 32_768,  # planner — opus 급 설계 작업
+    "strong":    32_768,  # coder/orchestrator — 큰 tool_use args 여유
+    "default":   16_384,
+    "fast":       8_192,  # verifier/extractor — 짧은 구조화 응답
+}
+
+
+# ═══════════════════════════════════════════════════════════════
 # 모델별 tool calling 호환성 프로필
 # ═══════════════════════════════════════════════════════════════
 
@@ -117,6 +142,7 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
     cfg = get_config()
     model_tier = cfg.model_tier
     raw_model_name = getattr(model_tier, tier)
+    max_tokens = _TIER_MAX_TOKENS.get(tier)
 
     # LiteLLM Proxy 모드: Docker 하니스로 LLM Gateway 경유
     # → 모든 호출이 LiteLLM을 거치며 Langfuse로 자동 트레이싱됨
@@ -125,7 +151,13 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         api_key = cfg.litellm_master_key or "sk-harness-local-dev"
         base_url = cfg.litellm_proxy_url
 
-        log.debug("models.get_model.litellm_proxy", tier=tier, model=model_name, proxy=base_url)
+        log.debug(
+            "models.get_model.litellm_proxy",
+            tier=tier,
+            model=model_name,
+            proxy=base_url,
+            max_tokens=max_tokens,
+        )
 
         instance = ChatOpenAI(
             model=model_name,
@@ -133,6 +165,7 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
             base_url=base_url,
             temperature=temperature,
             timeout=cfg.llm_timeout,
+            max_tokens=max_tokens,
         )
         _model_instance_cache[cache_key] = instance
         return instance
@@ -149,7 +182,13 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         api_key = cfg.openrouter_api_key
         base_url = "https://openrouter.ai/api/v1"
 
-    log.debug("models.get_model", tier=tier, model=model_name, provider=cfg.provider)
+    log.debug(
+        "models.get_model",
+        tier=tier,
+        model=model_name,
+        provider=cfg.provider,
+        max_tokens=max_tokens,
+    )
 
     instance = ChatOpenAI(
         model=model_name,
@@ -157,6 +196,7 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         base_url=base_url,
         temperature=temperature,
         timeout=cfg.llm_timeout,
+        max_tokens=max_tokens,
     )
     _model_instance_cache[cache_key] = instance
     return instance

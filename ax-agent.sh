@@ -12,8 +12,15 @@ if docker ps -aq -f name="^${CONTAINER_NAME}$" | grep -q .; then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1
 fi
 
+# workspace 호스트 경로를 안정적 project_id로 해시.
+# 메모리 격리(프로젝트 단위) 용도 — 같은 workspace 재방문 시에만 이전 메모리가 주입된다.
+WORKSPACE_ABS="$(cd "$WORKSPACE" && pwd)"
+PROJECT_ID="$(printf '%s' "$WORKSPACE_ABS" | md5sum | cut -c1-12)"
+
 docker run -it --rm --network host \
   --name "$CONTAINER_NAME" \
   -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
+  -e AX_PROJECT_ID="$PROJECT_ID" \
   -v "$WORKSPACE":/workspace \
+  -v ax-agent-memory:/app/memory_store \
   ax-coding-agent

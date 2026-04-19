@@ -591,7 +591,7 @@ class AgentLoop:
 
         initial_state: dict[str, Any] = {
             "messages": [HumanMessage(content=user_message)],
-            "project_id": project_id or "",
+            "project_id": project_id or get_config().project_id or "",
             "working_directory": get_config().project_root.as_posix(),
         }
 
