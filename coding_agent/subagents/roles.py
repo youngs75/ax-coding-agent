@@ -113,7 +113,7 @@ Guidelines:
 
 _FIXER_PROMPT = """\
 You are a bug-fixing agent. You fix code — you do NOT run tests, builds, or any
-shell command. The verifier runs tests. You only edit source files.
+shell command. The verifier runs tests. You only edit or create source files.
 
 Available tools: {tools}
 
@@ -123,8 +123,15 @@ Rules:
   orchestrator to run verifier first.
 - Read the relevant files, trace the root cause of the specific failure given
   to you, and apply a minimal targeted edit.
+- If the fix requires a file that does not exist yet (e.g. "missing file X
+  needed by verifier"), use write_file to create it. Check first with read_file
+  whether the target already exists and prefer edit_file if so.
 - Do NOT explore. Do NOT run tests to "see what breaks". Do NOT try to reproduce
   the issue by executing commands — the verifier already did that.
+- Only call tools in the Available tools list. If a tool you need (e.g. execute
+  or run_shell) is not listed, your task is scoped to a code edit only — do not
+  attempt the unavailable tool. If you truly cannot complete the fix with the
+  available tools, stop and return INCOMPLETE with a one-line reason.
 - When your edit is done, finish with the standard summary. The orchestrator
   will re-run verifier to confirm.
 """
@@ -150,10 +157,27 @@ Available tools: {tools}
 
 Guidelines:
 - Run the test suite and report pass/fail results clearly.
-- If tests fail, report the exact error messages and failing test names.
+- If tests fail, report the exact error messages and failing test names
+  verbatim from the execute output — do not paraphrase or reformat.
 - Check that the build succeeds (compile, lint, type-check if applicable).
-- Do NOT fix code — only verify and report. If fixes are needed, say so.
+- Do NOT fix code — only verify and report.
 - Do NOT call tools that are not in the available tools list above.
+- Do NOT attempt to install/configure dev tools (go, node, apt-get, curl, etc.)
+  if the environment is missing them. Report "environment missing: <tool>"
+  as a single line and stop — the orchestrator will route accordingly.
+
+## Report format (MANDATORY)
+Your final summary MUST follow the Scope/Result/Files changed/Issues format
+from the Output Rules below. Nothing else. In particular, do NOT write any
+of the following sections in your output — they are reserved for the
+orchestrator:
+  - "## Error Report"
+  - "## Fixer Instructions"
+  - "## Success Criteria"
+  - "## Fix Plan" / "## Recommendations" / numbered instruction lists
+  - any heading that tells the next agent what to do
+If fixes are needed, state the concrete failure (test name, exit code,
+error message) inside the Issues line. Do not prescribe a fix.
 """
 
 
@@ -273,9 +297,16 @@ def fixer_role(
     user_decisions: "UserDecisionsLog | None" = None,
 ) -> CodingAgentRole:
     # NOTE: no 'execute' — fixer may NOT run tests/commands. The orchestrator
-    # runs verifier separately. fixer only edits code to address a specific
-    # failure listed in its task description.
-    tool_allowlist = tools or ["read_file", "edit_file", "glob_files", "grep"]
+    # runs verifier separately. fixer edits existing files (edit_file) and
+    # creates missing ones (write_file) to address a specific failure listed
+    # in its task description.
+    tool_allowlist = tools or [
+        "read_file",
+        "edit_file",
+        "write_file",
+        "glob_files",
+        "grep",
+    ]
     return CodingAgentRole(
         name="fixer",
         system_prompt=_compose(_FIXER_PROMPT, tool_allowlist),

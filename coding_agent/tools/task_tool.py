@@ -148,12 +148,53 @@ def _auto_advance_todo(
 # ---------------------------------------------------------------------------
 
 
+_VERIFIER_SUMMARY_HEAD_LIMIT = 400
+_VERIFIER_FORBIDDEN_HEADINGS = (
+    "## Error Report",
+    "## Fixer Instructions",
+    "## Success Criteria",
+    "## Fix Plan",
+    "## Recommendations",
+)
+
+
+def _sanitize_verifier_text(text: str) -> str:
+    """Drop instruction-style markdown sections that would steer the top-level
+    LLM into continuation mode (pasting "## Fixer Instructions" verbatim
+    instead of calling ``task(fixer)``).
+
+    We keep only the prefix up to the first forbidden heading, then truncate
+    to ``_VERIFIER_SUMMARY_HEAD_LIMIT`` chars. The structured evidence the
+    orchestrator actually needs lives in the execute(command, result) pairs
+    appended separately.
+    """
+    if not text:
+        return ""
+    cut = len(text)
+    for heading in _VERIFIER_FORBIDDEN_HEADINGS:
+        idx = text.find(heading)
+        if idx != -1 and idx < cut:
+            cut = idx
+    head = text[:cut].rstrip()
+    if len(head) > _VERIFIER_SUMMARY_HEAD_LIMIT:
+        head = head[:_VERIFIER_SUMMARY_HEAD_LIMIT].rstrip() + " … (truncated)"
+    return head
+
+
 def _format_verifier_output(result: "RoleInvocationResult") -> str:
-    """Pair each ``execute`` call with its result so verifier → fixer handoff
-    carries concrete error evidence (test names, exit codes, stack traces).
+    """Emit only the machine-readable verifier evidence.
+
+    Composition:
+      1. Sanitized head of the verifier's own summary (Scope/Result/Issues).
+         Instruction-style sections ("## Fixer Instructions" etc.) are
+         stripped — they hijack the orchestrator LLM into a continuation
+         response with no tool_calls (observed in v10 E2E).
+      2. ``execute(command, result)`` pairs for every shell invocation —
+         this is the concrete evidence fixer needs (test names, exit codes,
+         stack traces).
     """
     lines: list[str] = []
-    text = _extract_text(result)
+    text = _sanitize_verifier_text(_extract_text(result))
     if text:
         lines.append(text)
 
