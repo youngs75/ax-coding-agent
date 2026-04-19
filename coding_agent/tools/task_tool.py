@@ -1,36 +1,43 @@
-"""Task tool — orchestrates SubAgent delegation through minyoung_mah.Orchestrator.
+"""Task tool — thin ax wrapper over ``minyoung_mah.langgraph.build_subagent_task_tool``.
 
-Phase 6 refactor. The previous implementation called ``SubAgentManager.spawn``
-which owned its own inner LangGraph. This version delegates to
-``Orchestrator.invoke_role`` from the minyoung-mah library. Key responsibilities
-retained at this layer (the library deliberately stays out of them):
+Phase 7 refactor (2026-04-19). The previous version owned the replay-safety
+cache and the HITL propagation loop directly. Both now live in the library:
+
+- **Replay safety** (``_TOOL_CALL_CACHE`` + ``replay_safe_tool_call``) —
+  :mod:`minyoung_mah.langgraph.subagent_task_tool`.
+- **HITL marker protocol** (``HITL_INTERRUPT_MARKER`` constant +
+  ``extract_interrupt_payload``) — :mod:`minyoung_mah.hitl.interrupt`.
+
+This module retains the ax-specific concerns the library stays out of:
 
 - **Task classification** (``agent_type="auto"``) via :mod:`classifier`.
-- **Todo auto-advance** on the ax-level :class:`TodoStore`.
-- **Interrupt propagation** (plan §결정 3): the ask_user_question adapter
-  returns an ``__ax_interrupt__`` marker; we surface it via LangGraph
-  ``interrupt()`` and resume the role with the user's answer in
-  ``parent_outputs["previous_ask"]``.
-- **Verifier output formatting** — `execute(command, result)` pairing.
+- **Todo auto-advance** on the ax-level :class:`TodoStore`
+  (pre-flip to ``in_progress``, post-flip to ``completed`` for coder +
+  successful verifier).
+- **Verifier output formatting** — sanitizing and ``execute(command, result)``
+  pairing so the orchestrator LLM sees evidence rather than continuation-style
+  markdown sections.
+- **Written-files footer** — cumulative list of ``write_file`` / ``edit_file``
+  targets appended to successful terminal output.
+
+These are plugged into the library via hooks (``resolve_role``,
+``format_result``, ``on_tool_call_start``, ``on_tool_call_end``,
+``on_user_answer``).
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import re
-import time
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from langchain_core.tools import InjectedToolCallId, StructuredTool
-from langgraph.errors import GraphInterrupt
-from langgraph.types import interrupt
+from langchain_core.tools import StructuredTool
+from minyoung_mah.langgraph import build_subagent_task_tool
 from pydantic import BaseModel, Field
 
 from coding_agent.subagents.classifier import resolve_role_name
-from coding_agent.tools.ask_adapter import extract_interrupt_payload
 from coding_agent.tools.ask_tool import _format_answer
 
 if TYPE_CHECKING:
@@ -58,70 +65,7 @@ def _extract_task_id(description: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Async runner (LangGraph nodes are sync; role invocation is async)
-# ---------------------------------------------------------------------------
-
-
-# One shared pool across all task_tool invocations to avoid the overhead
-# of spinning up a thread + event loop per SubAgent call.
-_shared_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-
-
-# Module-level cache for LangGraph interrupt replay-safety.
-# Keyed by ``tool_call_id`` (injected by LangGraph per tool call), inner dict
-# maps ``iter_idx`` → ``RoleInvocationResult`` so replayed executions of the
-# same tool call reuse the exact same role invocation result instead of
-# re-calling the nondeterministic LLM. Entries are cleared when a tool call
-# reaches a terminal state (both success and failure paths).
-_TOOL_CALL_CACHE: dict[str, dict[int, Any]] = {}
-
-
-def _run_async(coro: Any) -> Any:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is not None and loop.is_running():
-        future = _shared_pool.submit(asyncio.run, coro)
-        return future.result(timeout=600)
-    return asyncio.run(coro)
-
-
-# ---------------------------------------------------------------------------
-# Tool input schemas
-# ---------------------------------------------------------------------------
-
-
-class TaskToolInput(BaseModel):
-    description: str = Field(
-        description="A detailed description of the task to delegate to a SubAgent."
-    )
-    agent_type: str = Field(
-        default="auto",
-        description=(
-            "The type of SubAgent to spawn. "
-            "Options: 'planner', 'coder', 'reviewer', 'fixer', 'researcher', "
-            "'verifier', 'ledger', 'auto'. "
-            "Use 'auto' to let the system choose."
-        ),
-    )
-    # Injected by LangGraph at call time; excluded from LLM schema so the model
-    # does not try to supply it. Used as cache key for interrupt replay-safety
-    # inside ``_run_task`` (see P1 LangGraph replay pitfall).
-    tool_call_id: Annotated[str, InjectedToolCallId] = ""
-
-
-class ParallelTasksInput(BaseModel):
-    tasks: str = Field(
-        description=(
-            'JSON array of task objects. Each object must have "description" (str) '
-            'and optionally "agent_type" (str).'
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Todo auto-advance (moved from SubAgentManager.auto_advance_todo)
+# Todo auto-advance (ax-specific — library stays out of the ledger)
 # ---------------------------------------------------------------------------
 
 
@@ -158,7 +102,8 @@ def _auto_advance_todo(
 
 
 # ---------------------------------------------------------------------------
-# Result formatting
+# Verifier output formatting — strip instruction-style sections and append
+# execute evidence pairs.
 # ---------------------------------------------------------------------------
 
 
@@ -193,6 +138,17 @@ def _sanitize_verifier_text(text: str) -> str:
     if len(head) > _VERIFIER_SUMMARY_HEAD_LIMIT:
         head = head[:_VERIFIER_SUMMARY_HEAD_LIMIT].rstrip() + " … (truncated)"
     return head
+
+
+def _extract_text(result: "RoleInvocationResult") -> str:
+    output = result.output
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, BaseModel):
+        return output.model_dump_json()
+    return str(output)
 
 
 def _format_verifier_output(result: "RoleInvocationResult") -> str:
@@ -235,17 +191,6 @@ def _format_verifier_output(result: "RoleInvocationResult") -> str:
     return "\n".join(lines)
 
 
-def _extract_text(result: "RoleInvocationResult") -> str:
-    output = result.output
-    if output is None:
-        return ""
-    if isinstance(output, str):
-        return output
-    if isinstance(output, BaseModel):
-        return output.model_dump_json()
-    return str(output)
-
-
 def _extract_written_files(result: "RoleInvocationResult") -> list[str]:
     written: list[str] = []
     for req in result.tool_calls or []:
@@ -256,20 +201,6 @@ def _extract_written_files(result: "RoleInvocationResult") -> list[str]:
             if isinstance(path, str) and path not in written:
                 written.append(path)
     return written
-
-
-def _find_pending_interrupt(result: "RoleInvocationResult") -> dict[str, Any] | None:
-    """Return the first ``__ax_interrupt__`` payload in the role's tool
-    results, or None. The marker is inserted by
-    ``coding_agent.tools.ask_adapter.AskUserQuestionAdapter``.
-    """
-    for res in result.tool_results or []:
-        if not res.ok:
-            continue
-        payload = extract_interrupt_payload(res.value)
-        if payload is not None:
-            return payload
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +243,7 @@ def _verifier_signals_success(result: "RoleInvocationResult") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# build_task_tool — the LangGraph tool the orchestrator LLM sees
+# build_task_tool — hooks into ``minyoung_mah.langgraph.build_subagent_task_tool``
 # ---------------------------------------------------------------------------
 
 
@@ -324,176 +255,95 @@ def build_task_tool(
 ) -> StructuredTool:
     """Build a ``task`` tool bound to a minyoung_mah Orchestrator.
 
-    ``orchestrator`` is the one assembled in
-    :func:`coding_agent.subagents.orchestrator_factory.build_orchestrator`.
-    ``user_decisions`` carries ``ask_user_question`` answers across SubAgent
-    invocations so coder/verifier/fixer all see the same hard constraints.
+    The library owns the replay-safety cache, HITL interrupt propagation,
+    and the role-invocation loop. This wrapper injects ax-specific hooks:
 
-    Interrupt replay-safety (LangGraph 공식 경고)
-    ---------------------------------------------
-    ``interrupt()`` causes the entire tool function to be *re-executed* on
-    resume — every side effect before the interrupt runs again. ``_run_task``
-    pairs each iteration's ``orchestrator.invoke_role`` (nondeterministic LLM
-    call) with an ``interrupt()`` call, so a naive implementation drifts by
-    one round on every resume (new pending generated on replay gets matched
-    to the previously saved answer).
+    * ``resolve_role`` → classifier's ``resolve_role_name``
+    * ``on_tool_call_start`` → flip matching TASK-NN todo to ``in_progress``
+    * ``on_tool_call_end`` → flip to ``completed`` for successful coder runs
+      and verifier runs whose ``execute`` calls all succeeded
+    * ``format_result`` → verifier evidence formatting + written-files
+      footer + duration tag
+    * ``format_hitl_answer`` / ``on_user_answer`` → ask_tool formatter +
+      :class:`UserDecisionsLog` persistence
 
-    To stay compliant with LangGraph's replay semantics we memoise each
-    iteration's ``RoleInvocationResult`` in ``_TOOL_CALL_CACHE`` keyed by
-    ``(tool_call_id, iter_idx)``:
-
-    * fresh call  → cache miss → invoke → cache write → interrupt
-    * replay      → cache hit  → skip invoke → interrupt returns stored
-                    answer immediately → loop proceeds deterministically
-
-    The entry is cleared in ``finally`` so tool calls that eventually
-    terminate do not leak cache memory.
+    Fixer is NOT auto-advanced — fix success/failure is judged by the next
+    verifier round, so the orchestrator LLM keeps the call.
     """
 
-    def _run_task(
-        description: str,
-        agent_type: str = "auto",
-        tool_call_id: str = "",
-    ) -> str:
-        from minyoung_mah import InvocationContext, RoleStatus
-
-        t0 = time.monotonic()
-        role_name = resolve_role_name(agent_type, description)
-        log.info(
-            "timing.task_tool.start",
-            agent_type=agent_type,
-            role=role_name,
-            desc=description[:80],
-            tool_call_id=tool_call_id[:16] if tool_call_id else "",
-        )
-
-        # B-1: flip the ledger to in_progress before delegation.
+    def _on_start(role_name: str, description: str) -> None:
         task_id = _extract_task_id(description)
         if task_id:
-            _auto_advance_todo(todo_store, task_id, "in_progress", todo_change_callback)
-
-        parent_outputs: dict[str, Any] = {}
-        # Replay-safety cache for this tool call. tool_call_id is injected by
-        # LangGraph; anonymous fallback "" still works for non-LangGraph tests
-        # (each test gets its own slot since the finally block clears it).
-        cache_bucket: dict[int, Any] = _TOOL_CALL_CACHE.setdefault(tool_call_id, {})
-        iter_idx = 0
-
-        try:
-            while True:
-                cached = cache_bucket.get(iter_idx)
-                if cached is not None:
-                    result = cached
-                    log.debug(
-                        "task_tool.replay_cache_hit",
-                        role=role_name,
-                        iter_idx=iter_idx,
-                    )
-                else:
-                    ctx = InvocationContext(
-                        task_summary=description,
-                        user_request="",
-                        parent_outputs=dict(parent_outputs),
-                    )
-                    result = _run_async(orchestrator.invoke_role(role_name, ctx))
-                    cache_bucket[iter_idx] = result
-
-                # HITL path (plan §결정 3) — role reported an ask via marker.
-                pending = _find_pending_interrupt(result)
-                if pending is not None:
-                    log.info(
-                        "task_tool.propagate_interrupt",
-                        role=role_name,
-                        payload_preview=str(pending)[:120],
-                        iter_idx=iter_idx,
-                    )
-                    user_answer = interrupt(pending)
-                    log.info(
-                        "task_tool.received_answer",
-                        answer_preview=str(user_answer)[:80],
-                        iter_idx=iter_idx,
-                    )
-                    formatted = _format_answer(pending, user_answer)
-                    user_decisions.record(formatted)
-                    parent_outputs["previous_ask"] = formatted
-                    iter_idx += 1
-                    continue  # re-invoke with the answer prepended
-
-                # Terminal — either COMPLETED / INCOMPLETE / FAILED / ABORTED.
-                break
-
-            elapsed = time.monotonic() - t0
-            log.info(
-                "timing.task_tool.done",
-                role=role_name,
-                status=result.status.name,
-                duration_s=round(elapsed, 1),
-                role_duration_ms=result.duration_ms,
-                iterations=result.iterations,
+            _auto_advance_todo(
+                todo_store, task_id, "in_progress", todo_change_callback
             )
 
-            if result.status in (RoleStatus.COMPLETED, RoleStatus.INCOMPLETE):
-                status_tag = (
-                    "INCOMPLETE" if result.status is RoleStatus.INCOMPLETE else "COMPLETED"
-                )
-                if role_name == "verifier":
-                    body = _format_verifier_output(result)
-                else:
-                    body = _extract_text(result)
+    def _on_end(
+        role_name: str,
+        description: str,
+        result: "RoleInvocationResult",
+        status_tag: str,
+    ) -> None:
+        if status_tag != "COMPLETED":
+            return
+        task_id = _extract_task_id(description)
+        if not task_id:
+            return
+        if role_name == "coder" or (
+            role_name == "verifier" and _verifier_signals_success(result)
+        ):
+            _auto_advance_todo(
+                todo_store, task_id, "completed", todo_change_callback
+            )
 
-                # B-1: coder success → mark completed.
-                # P2: verifier success (COMPLETED + every execute call ok and
-                # without failure markers) → mark completed. Fixer never
-                # auto-advances — fix success/failure is judged by the next
-                # verifier round, so the orchestrator LLM keeps the call.
-                if task_id and status_tag == "COMPLETED" and (
-                    role_name == "coder"
-                    or (
-                        role_name == "verifier"
-                        and _verifier_signals_success(result)
-                    )
-                ):
-                    _auto_advance_todo(
-                        todo_store, task_id, "completed", todo_change_callback
-                    )
+    def _format_result(
+        *,
+        role_name: str,
+        description: str,  # noqa: ARG001
+        result: "RoleInvocationResult",
+        elapsed_s: float,
+        status_tag: str,
+    ) -> str:
+        if role_name == "verifier":
+            body = _format_verifier_output(result)
+        else:
+            body = _extract_text(result)
+        written = _extract_written_files(result)
+        parts = [f"[Task {status_tag} — {role_name}]", body]
+        if written:
+            parts.append(f"Files written: {', '.join(written)}")
+        parts.append(f"[Duration: {elapsed_s:.1f}s]")
+        return "\n".join(parts)
 
-                written = _extract_written_files(result)
-                parts = [f"[Task {status_tag} — {role_name}]", body]
-                if written:
-                    parts.append(f"Files written: {', '.join(written)}")
-                parts.append(f"[Duration: {elapsed:.1f}s]")
-                _TOOL_CALL_CACHE.pop(tool_call_id, None)
-                return "\n".join(parts)
-
-            # FAILED / ABORTED
-            err = result.error or f"role '{role_name}' terminated with {result.status.name}"
-            _TOOL_CALL_CACHE.pop(tool_call_id, None)
-            return f"SubAgent failed: {err}"
-
-        except GraphInterrupt:
-            # Do NOT clear cache — LangGraph will replay this tool call on
-            # resume and the stored invocation results are what make the
-            # replay return the previously-saved answers deterministically.
-            raise
-        except Exception as exc:
-            _TOOL_CALL_CACHE.pop(tool_call_id, None)
-            return f"Error running SubAgent: {exc}"
-
-    return StructuredTool.from_function(
-        func=_run_task,
-        name="task",
-        description=(
+    return build_subagent_task_tool(
+        orchestrator,
+        resolve_role=resolve_role_name,
+        format_result=_format_result,
+        format_hitl_answer=_format_answer,
+        on_tool_call_start=_on_start,
+        on_tool_call_end=_on_end,
+        on_user_answer=user_decisions.record,
+        tool_name="task",
+        tool_description=(
             "Delegate a task to a specialized SubAgent. "
-            "Use this when a task is complex enough to benefit from a dedicated agent "
-            "with its own tool access and reasoning loop."
+            "Use this when a task is complex enough to benefit from a dedicated "
+            "agent with its own tool access and reasoning loop."
         ),
-        args_schema=TaskToolInput,
     )
 
 
 # ---------------------------------------------------------------------------
 # build_parallel_tasks_tool — optional, currently unused by the top loop
 # ---------------------------------------------------------------------------
+
+
+class ParallelTasksInput(BaseModel):
+    tasks: str = Field(
+        description=(
+            'JSON array of task objects. Each object must have "description" (str) '
+            'and optionally "agent_type" (str).'
+        ),
+    )
 
 
 def build_parallel_tasks_tool(
@@ -518,34 +368,52 @@ def build_parallel_tasks_tool(
             task_list = json.loads(tasks)
             if not isinstance(task_list, list) or len(task_list) == 0:
                 return "Error: tasks must be a non-empty JSON array."
-            if len(task_list) == 1:
-                t = task_list[0]
+
+            def _invoke_one(t: dict[str, Any], idx: int) -> Any:
+                # InjectedToolCallId on the single_tool schema requires a full
+                # ToolCall envelope — synthesize a synthetic id per parallel
+                # slot so replay-safety caches don't collide across workers.
                 return single_tool.invoke(
                     {
-                        "description": t["description"],
-                        "agent_type": t.get("agent_type", "auto"),
+                        "name": "task",
+                        "args": {
+                            "description": t["description"],
+                            "agent_type": t.get("agent_type", "auto"),
+                        },
+                        "type": "tool_call",
+                        "id": f"parallel-{idx}",
                     }
                 )
 
-            async def _run_all() -> list[str]:
+            if len(task_list) == 1:
+                result = _invoke_one(task_list[0], 0)
+                return result if isinstance(result, str) else result.content
+
+            async def _run_all() -> list[Any]:
                 return await asyncio.gather(
                     *(
-                        asyncio.to_thread(
-                            single_tool.invoke,
-                            {
-                                "description": t["description"],
-                                "agent_type": t.get("agent_type", "auto"),
-                            },
-                        )
-                        for t in task_list
+                        asyncio.to_thread(_invoke_one, t, i)
+                        for i, t in enumerate(task_list)
                     )
                 )
 
-            outputs = _run_async(_run_all())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and loop.is_running():
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    outputs = pool.submit(asyncio.run, _run_all()).result(timeout=600)
+            else:
+                outputs = asyncio.run(_run_all())
+
             parts: list[str] = []
             for i, out in enumerate(outputs):
+                text = out if isinstance(out, str) else out.content
                 header = f"## Task {i + 1}: {task_list[i]['description'][:60]}"
-                parts.append(f"{header}\n{out}")
+                parts.append(f"{header}\n{text}")
             return "\n\n".join(parts)
         except json.JSONDecodeError as exc:
             return f"Error: invalid JSON in tasks parameter — {exc}"
@@ -566,9 +434,9 @@ def build_parallel_tasks_tool(
 
 
 __all__ = [
-    "build_task_tool",
-    "build_parallel_tasks_tool",
-    "_extract_task_id",
     "_auto_advance_todo",
+    "_extract_task_id",
     "_verifier_signals_success",
+    "build_parallel_tasks_tool",
+    "build_task_tool",
 ]

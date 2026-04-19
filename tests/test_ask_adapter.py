@@ -1,16 +1,16 @@
 """AskUserQuestionAdapter — HITL interrupt marker 경로 검증 (plan §결정 3).
 
 Role 내부에서 실제 langgraph ``interrupt()`` 를 호출하지 않고
-``ToolResult.value = {"__ax_interrupt__": True, "payload": ...}`` 마커만
-리턴하는지, task_tool 이 그 마커를 detect 할 수 있는지 검증.
+:data:`minyoung_mah.HITL_INTERRUPT_MARKER` 마커 envelope 만 리턴하는지,
+task_tool 이 그 마커를 detect 할 수 있는지 검증.
 """
 
 from __future__ import annotations
 
 import pytest
+from minyoung_mah import HITL_INTERRUPT_MARKER
 
 from coding_agent.tools.ask_adapter import (
-    AskUserQuestionAdapter,
     ask_user_question_adapter,
     extract_interrupt_payload,
 )
@@ -37,7 +37,7 @@ async def test_adapter_returns_interrupt_marker_instead_of_raising():
     result = await ask_user_question_adapter.call(_make_input())
     assert result.ok is True
     assert isinstance(result.value, dict)
-    assert result.value.get("__ax_interrupt__") is True
+    assert result.value.get(HITL_INTERRUPT_MARKER) is True
     assert "payload" in result.value
 
 
@@ -53,7 +53,7 @@ async def test_adapter_payload_shape_matches_cli_expectation():
 
 
 def test_extract_interrupt_payload_recovers_dict():
-    value = {"__ax_interrupt__": True, "payload": {"kind": "ask_user_question"}}
+    value = {HITL_INTERRUPT_MARKER: True, "payload": {"kind": "ask_user_question"}}
     assert extract_interrupt_payload(value) == {"kind": "ask_user_question"}
 
 
