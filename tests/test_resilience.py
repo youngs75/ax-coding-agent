@@ -12,8 +12,6 @@ from coding_agent.resilience_compat import (
     ErrorHandler,
     ErrorResolution,
     FailureType,
-    GuardVerdict,
-    ProgressGuard,
     SafeStop,
     SafeStopError,
     Watchdog,
@@ -72,42 +70,9 @@ class TestErrorClassifier:
         assert result == FailureType.MODEL_TIMEOUT  # 기본 폴백
 
 
-class TestProgressGuard:
-    def test_ok_on_normal(self):
-        pg = ProgressGuard(window_size=5, stall_threshold=3, max_iterations=50)
-        pg.record_action("read_file", {"path": "/a.py"})
-        pg.record_action("write_file", {"path": "/b.py"})
-
-        assert pg.check(2) == GuardVerdict.OK
-
-    def test_warn_on_stall(self):
-        pg = ProgressGuard(window_size=5, stall_threshold=3, max_iterations=50)
-        # 같은 액션 3번 반복
-        for _ in range(3):
-            pg.record_action("read_file", {"path": "/same.py"})
-
-        verdict = pg.check(3)
-        assert verdict in (GuardVerdict.WARN, GuardVerdict.STOP)
-
-    def test_stop_on_max_iterations(self):
-        pg = ProgressGuard(max_iterations=10)
-        assert pg.check(10) == GuardVerdict.STOP
-        assert pg.check(11) == GuardVerdict.STOP
-
-    def test_reset(self):
-        pg = ProgressGuard(window_size=5, stall_threshold=3, max_iterations=50)
-        for _ in range(3):
-            pg.record_action("read_file", {"path": "/same.py"})
-        pg.reset()
-        assert pg.check(0) == GuardVerdict.OK
-
-    def test_stall_summary(self):
-        pg = ProgressGuard()
-        pg.record_action("read_file", {"path": "/a.py"})
-        pg.record_action("write_file", {"path": "/b.py"})
-
-        summary = pg.get_stall_summary()
-        assert "history_len" in summary
+# ProgressGuard 단위 테스트는 minyoung-mah 라이브러리가 소유.
+# ax-specific 한 A-2 secondary-key (_task_id_extractor) 회귀는
+# tests/test_p35_phase3.py 가 덮는다.
 
 
 class TestSafeStop:

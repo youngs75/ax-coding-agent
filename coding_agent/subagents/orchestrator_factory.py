@@ -16,11 +16,12 @@ from minyoung_mah import (
     NullHITLChannel,
     Orchestrator,
     RoleRegistry,
-    StructlogObserver,
     TieredModelRouter,
     ToolRegistry,
     default_resilience,
 )
+
+from coding_agent.observability import build_default_observer
 
 from coding_agent.models import get_model
 from coding_agent.subagents.roles import (
@@ -113,7 +114,7 @@ def build_orchestrator(
         model_router=model_router,
         memory=memory_store,
         hitl=NullHITLChannel(),  # plan §결정 3 — interrupt path stays on LangGraph
-        observer=StructlogObserver(),
+        observer=build_default_observer(),
         resilience=resilience,
     )
 

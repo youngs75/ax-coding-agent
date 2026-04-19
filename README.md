@@ -4,6 +4,15 @@
 
 오픈소스 모델(Qwen 계열, GLM-5)과 폐쇄형 모델(Claude 4.6)을 모두 지원하며, 자체 LiteLLM Gateway + Langfuse 관측성을 통한 LLM 운영 체계를 포함합니다.
 
+> **📦 minyoung-mah 라이브러리 소비자 (2026-04-19~)**
+> 9차 세션 이후 과제 제출이 완료된 시점에서, 이 프로젝트의 harness 5책임(Safety/Detection/Clarity/Context/Observation)을
+> [`minyoung-mah`](https://github.com/youngs75/minyoung-mah) 라이브러리로 추출했습니다.
+> ax_advanced_coding_ai_agent 는 이제 라이브러리의 세 번째 소비자 (apt-legal-agent, prime-jennie-runtime 에 이어)로 재포지셔닝되며,
+> `Orchestrator`/`ProgressGuard`/`SqliteMemoryStore`/`SubAgentRole`/`ToolAdapter` 등 핵심 추상은 라이브러리 쪽에서 관리합니다.
+> 이 repo 는 coding-domain 특화 부분만 남깁니다 — 6개 role prompt, file/shell tool, LangGraph 최상위 ReAct 루프, CLI, 3-tier memory extractor/middleware.
+>
+> 설치: `pip install -e ../minyoung-mah && pip install -e ".[dev]"` (또는 `make install`).
+
 **실증된 역량** — PMS(Project Management System) 풀스택을 단일 사용자 요청으로 생성:
 - **최종 (9차 E2E, Qwen3 DashScope, 8차 핫픽스 4건 반영)**: **35.0분 · 15/15 task 완주 · 26 SubAgent 호출 · 51 파일.** fixer 1회 11.1s (v8 12 사이클 → 단발 수정), verifier 3회 38.0s (v8 1226s → **97% 감소**), ProgressGuard A-2 hook record 48건 (v8 0 → 완전 정상화), execute 90s timeout 발화 0건. TASK-14 모바일 테스트는 Playwright viewport 에뮬레이션 3 디바이스로 자율 작성. 상세는 [`EVIDENCE.md` §8 9차 E2E](EVIDENCE.md) 참조
 - **직전 (8차 E2E, Sub-B + Phase 3 A/B/C)**: 25개 atomic task SPEC 자율 작성, HITL 6문항, 무한 reject 루프 0. TASK-09 conftest 5함정으로 76분+ 사용자 cancel — 이후 4건 핫픽스를 9차에 반영

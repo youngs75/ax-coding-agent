@@ -1,4 +1,5 @@
-.PHONY: setup install test test-memory test-subagents test-resilience test-performance \
+.PHONY: setup install test test-memory test-roles test-resilience test-performance \
+       test-user-decisions test-ask-adapter \
        lint demo clean up down logs \
        docker-build docker-run docker-up docker-down docker-logs traces trace
 
@@ -22,8 +23,8 @@ test:
 test-memory:
 	python -m pytest tests/test_memory.py -v
 
-test-subagents:
-	python -m pytest tests/test_subagents.py -v
+test-roles:
+	python -m pytest tests/test_user_decisions.py tests/test_ask_adapter.py -v
 
 test-resilience:
 	python -m pytest tests/test_resilience.py -v

@@ -4,28 +4,49 @@
 AX Coding Agent — 3계층 장기 메모리, 동적 SubAgent 수명주기, Agentic Loop 복원력을 갖춘 AI Coding Agent Harness.
 오픈소스 모델(Qwen, GLM)을 활용하며, LiteLLM Gateway + Langfuse 관측성을 통한 LLM 운영 체계를 포함한다.
 
+**포지셔닝** (2026-04-19~): 과제 제출(2026-04-12) 이후 harness 5책임(Safety/Detection/Clarity/Context/Observation)을
+`minyoung-mah` 라이브러리로 추출했고, 이 repo 는 해당 라이브러리의 세 번째 소비자이다. Orchestrator / ProgressGuard /
+SqliteMemoryStore / SubAgentRole / ToolAdapter / ResiliencePolicy 등 공통 추상은 라이브러리가 소유하며, 이 repo 는
+coding-domain 특화 부분만 담당한다:
+  - 6개 SubAgent role prompts (`coding_agent/subagents/roles.py`)
+  - file/shell ToolAdapter 어댑터 (`coding_agent/tools/adapters.py`) + HITL ask adapter (`coding_agent/tools/ask_adapter.py`)
+  - LangGraph 최상위 ReAct 드라이버 (`coding_agent/core/loop.py`)
+  - Rich + prompt-toolkit 대화형 CLI (`coding_agent/cli/`)
+  - 3-tier memory extractor + middleware (`coding_agent/memory/`)
+  - Langfuse span forwarder (`coding_agent/observability/langfuse_observer.py`)
+
 ## 프로젝트 구조
 
 ```
 ax_advanced_coding_ai_agent/
-├── coding_agent/                   # 메인 패키지
-│   ├── core/                       # 에이전트 루프, 상태, 오케스트레이터, 도구 어댑터
-│   ├── memory/                     # 3계층 장기 메모리 (user/project/domain)
-│   ├── subagents/                  # 동적 SubAgent 수명주기 관리
-│   ├── resilience/                 # Agentic Loop 복원력 (watchdog, retry, safe stop)
-│   ├── tools/                      # 도구 시스템 (파일, 셸, SubAgent 위임)
+├── coding_agent/                   # 메인 패키지 (application 레이어)
+│   ├── core/                       # LangGraph 최상위 ReAct 드라이버 + agent state
+│   ├── memory/                     # 3계층 메모리 extractor/middleware
+│   │                               #   (store 는 minyoung_mah.SqliteMemoryStore)
+│   ├── subagents/                  # roles.py (6 SubAgentRole) + orchestrator_factory
+│   │                               #   + user_decisions + classifier
+│   │                               #   (manager/registry/factory 는 minyoung_mah 가 소유)
+│   ├── resilience_compat.py        # Watchdog / SafeStop / tier-fallback ErrorHandler
+│   │                               #   (ProgressGuard 는 minyoung_mah 가 소유)
+│   ├── tools/                      # file/shell StructuredTool + ToolAdapter 래퍼
+│   │                               #   + ask/todo/task 도구
+│   ├── observability/              # Observer 구현 (StructlogObserver + Langfuse span)
 │   ├── cli/                        # 대화형 CLI (Rich + prompt-toolkit)
-│   └── utils/                      # 유틸리티 (Langfuse 트레이스 추출 등)
-├── tests/                          # 유닛 테스트 (235개, 9차 세션 기준)
-├── memory_store/                   # SQLite 메모리 DB (런타임 생성)
+│   └── utils/                      # Langfuse trace 익스포터
+├── tests/                          # 유닛 테스트 (187개, Phase 8 기준)
+├── memory_store/                   # SQLite 메모리 DB (런타임 생성, ax.v2.db)
 ├── docker-compose.yml              # 풀스택 배포 (Agent + LiteLLM + Langfuse)
 ├── Dockerfile                      # 에이전트 Docker 이미지
 ├── litellm_config.yaml             # LiteLLM Proxy 모델 라우팅 설정
 ├── ax-agent.sh                     # 실행 스크립트
-├── pyproject.toml                  # Python 의존성
+├── pyproject.toml                  # Python 의존성 (minyoung-mah editable 포함)
 ├── AGENTS.md                       # 이 파일 — AI와 기여자가 따를 규칙 문서
 └── README.md                       # 프로젝트 소개 및 요구사항 매핑
 ```
+
+라이브러리가 소유하는 부분 (수정은 `../minyoung-mah` 에서): Orchestrator, SubAgentRole protocol,
+ToolAdapter protocol, ProgressGuard, SqliteMemoryStore, TieredModelRouter, HITLChannel,
+StructlogObserver, CompositeObserver, ResiliencePolicy, default_resilience.
 
 규칙이 여러 곳에 흩어져 있어도 기준 문서는 항상 `AGENTS.md`로 통일합니다.
 
@@ -77,8 +98,8 @@ AX_DEBUG=1 ./ax-agent.sh
 ```bash
 make test                # 전체 테스트
 make test-memory         # 메모리 시스템
-make test-subagents      # SubAgent 상태 전이
-make test-resilience     # 복원력 (timeout/retry/safe stop)
+make test-roles          # SubAgentRole + UserDecisionsLog + ask adapter
+make test-resilience     # Watchdog/SafeStop/ErrorHandler (ProgressGuard 는 라이브러리 테스트)
 ```
 
 ### Docker 배포
@@ -115,12 +136,20 @@ make docker-down
 | `project` | 아키텍처/규칙/결정 | SQLite + FTS5 |
 | `domain` | 비즈니스 용어/규칙 | SQLite + FTS5 |
 
-### 2. 동적 SubAgent (`coding_agent/subagents/`)
-상태 머신: CREATED → ASSIGNED → RUNNING → COMPLETED → DESTROYED
-LLM이 역할/도구/모델을 런타임에 결정하여 SubAgent를 동적 생성.
+→ 저장소는 `minyoung_mah.SqliteMemoryStore` 가 소유 (tier/scope 스키마).
+  extractor + middleware + 3-layer semantic 은 이 repo 에 남음.
 
-### 3. Agentic Loop 복원력 (`coding_agent/resilience/`)
-7가지 장애 유형에 대한 감지/재시도/폴백/안전 중단 정책.
+### 2. SubAgent 체계 (`coding_agent/subagents/`)
+`minyoung_mah.Orchestrator` 가 역할 invocation 전체를 담당한다. 이 repo 에는
+역할 정의(6개 `SubAgentRole` 구현, `roles.py`) + Orchestrator 빌더
+(`orchestrator_factory.py`) + 분류기(`classifier.py`) + user decisions 누적기만 남는다.
+기존 CREATED→ASSIGNED→RUNNING→COMPLETED 상태 머신은 라이브러리가 소유
+(`minyoung_mah.RoleStatus`).
+
+### 3. Agentic Loop 복원력
+`minyoung_mah.ProgressGuard` + `default_resilience` 가 핵심 감지/타임아웃 로직 소유.
+ax-specific tier fallback + dangerous-path SafeStop + Watchdog 은 `resilience_compat.py`
+에 남아 최상위 LangGraph `handle_error` 노드가 계속 사용 (plan §결정 2).
 
 ## 4-Tier 모델 체계
 | 티어 | 용도 | 환경변수 |
