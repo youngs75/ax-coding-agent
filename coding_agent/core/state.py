@@ -42,9 +42,21 @@ class AgentState(TypedDict, total=False):
     # ── Pending-todo 종료 방어 ──
     # orchestrator 가 tool_calls=None 으로 종료 시도했는데 ledger 에 pending
     # 항목이 남아있으면 harness 가 nudge 메시지를 주입해 재시도시킨다.
-    # 이 필드는 누적된 nudge 횟수 — OrchestratorLoop._MAX_PENDING_NUDGES 에
-    # 도달하면 재시도를 포기하고 정상 종료 경로로 빠진다.
+    # ``pending_nudges`` 는 "진전 없는 연속 silent-terminate 횟수" — 직전
+    # nudge 시점 대비 unfinished 가 줄어들면 0 으로 리셋된다. qwen3-max 처럼
+    # 매 배치 완료 후 자연어 보고를 반복하는 모델도 진전이 있는 한 계속
+    # 찌를 수 있게 함. _MAX_STUCK_NUDGES 도달 시에만 재시도를 포기한다.
     pending_nudges: int
+    # 직전 nudge 시점의 pending+in_progress 합. progress 판정 baseline.
+    last_nudge_unfinished: int
+
+    # ── 분해 확인 (planner→ledger 등록 후 HITL 게이트) ──
+    # ledger 가 초기 등록을 마친 뒤, coder/verifier/fixer/reviewer 로 위임하기
+    # 전에 사용자에게 granularity 를 확인받아야 한다. False 이면 게이트가
+    # 한 번 차단하고 안내 메시지를 주입한 뒤 True 로 전환 — 프롬프트가
+    # 이어서 ask_user_question 을 호출하도록 유도한다. 모델 순종도에 완전
+    # 의존하지 않는 harness 안전망.
+    decomposition_confirmed: bool
 
     # ── 작업 디렉토리 ──
     working_directory: str  # 현재 작업 디렉토리

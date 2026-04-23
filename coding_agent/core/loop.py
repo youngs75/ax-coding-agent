@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -76,18 +76,136 @@ def _task_id_extractor(tool_name: str, tool_args: dict) -> str | None:
     m = _TASK_ID_PATTERN.search(desc)
     return m.group(0).upper() if m else None
 
-def _should_nudge_pending(
-    counts: dict[str, int],
-    nudges_so_far: int,
-    max_nudges: int,
-) -> bool:
-    """True iff the orchestrator should be nudged instead of terminated.
+# Roles that should be gated by decomposition confirmation. Delegating to
+# these before the user has approved the task breakdown is the anti-pattern
+# v2 E2E (2026-04-22) exposed — planner returned 8 coarse tasks, orchestrator
+# went straight to coder without user review, and coarse tasks led coder to
+# decide completion granularity unilaterally. Ledger/planner/researcher are
+# NOT gated — ledger needs to register, planner may need re-delegation, and
+# researcher/read-only exploration is safe.
+_GATED_ROLES = frozenset({"coder", "verifier", "fixer", "reviewer"})
 
-    Extracted from ``route_after_agent`` so the decision is unit-testable
-    without standing up a real LangGraph. ``counts`` is :meth:`TodoStore.counts`.
+
+def _requires_decomposition_gate(
+    last_message: Any,
+    todo_counts: dict[str, int],
+    confirmed: bool,
+) -> tuple[bool, str | None]:
+    """Decide whether to block before a non-ledger task delegation.
+
+    Returns ``(gate_needed, blocked_tool_call_id)``. The id points at the
+    first offending ``task`` tool_call so the gate node can respond with a
+    ``ToolMessage`` — otherwise LangChain would raise about an orphan call.
+
+    Pure — callers pass in the last AIMessage (or whatever is at the tail
+    of the message list), the current ``TodoStore.counts()`` snapshot, and
+    the ``decomposition_confirmed`` flag.
+    """
+    if confirmed:
+        return (False, None)
+    total = sum(todo_counts.values())
+    if total == 0:
+        return (False, None)
+    tool_calls = getattr(last_message, "tool_calls", None) if last_message is not None else None
+    if not tool_calls:
+        return (False, None)
+    for tc in tool_calls:
+        if tc.get("name") != "task":
+            continue
+        args = tc.get("args") or {}
+        agent_type = (args.get("agent_type") or "").strip().lower()
+        if agent_type in _GATED_ROLES:
+            return (True, tc.get("id"))
+    return (False, None)
+
+
+def _detect_implicit_decomposition_confirm(
+    messages: list,
+    todo_counts: dict[str, int],
+) -> bool:
+    """Infer that the user has already been consulted about this ledger.
+
+    If the ledger has items AND the message history contains at least one
+    completed ``ask_user_question`` interaction, treat the gate as already
+    satisfied. Avoids the noise where an orchestrator that proactively calls
+    ``ask_user_question`` (per SYSTEM_PROMPT "분해 확인" section) then trips
+    the gate on its follow-up ``task(coder)`` call.
+
+    Heuristic, not a proof — an early planner ask about tech stack would
+    also match, even if no decomposition-specific question was asked. The
+    trade-off is deliberate: false positives degrade to pre-gate behavior
+    (the user simply isn't re-consulted), while eliminating the spurious
+    block keeps logs clean for the common well-behaved case.
+    """
+    if sum(todo_counts.values()) == 0:
+        return False
+    for m in messages:
+        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_user_question":
+            return True
+    return False
+
+
+def _build_gate_decomposition_message(
+    counts: dict[str, int],
+    preview: list[str],
+) -> str:
+    """Render the ToolMessage injected when a delegation is gated.
+
+    ``preview`` is a list of "TASK-NN: <content>" lines the caller has already
+    truncated. Kept pure so tests can snapshot layout.
+    """
+    n = counts.get("pending", 0) + counts.get("in_progress", 0) + counts.get("completed", 0)
+    shown = preview[:5]
+    preview_block = "\n".join(f"    - {line}" for line in shown)
+    if n > len(shown):
+        preview_block += f"\n    ... 외 {n - len(shown)}개"
+    return (
+        f"⚠ 분해 확인 필요: ledger 에 {n}개 task 가 등록되어 있는데, 사용자의 "
+        f"granularity 승인 없이 위임하려 했습니다. harness 가 이 위임을 1회 "
+        f"차단합니다.\n\n"
+        f"현재 분해 미리보기:\n{preview_block}\n\n"
+        f"지금 바로 `ask_user_question` 을 호출해서 다음을 묻고, 답변에 따라 "
+        f"재분해(ledger clear + planner 재위임) 또는 그대로 진행(coder 위임)을 "
+        f"결정하세요:\n"
+        f"- 분해된 개수({n}개)가 적절한가?\n"
+        f"- 더 세분화 / 더 통합 / 이대로 진행 중 어느 것을 원하는가?\n\n"
+        f"사용자 답변을 받은 뒤 다시 task 도구로 위임하면 통과됩니다. "
+        f"(게이트는 1회만 차단하지만, 사용자 확인 없이 위임을 재시도하는 것은 "
+        f"금지입니다.)"
+    )
+
+
+def _nudge_decision(
+    counts: dict[str, int],
+    last_unfinished: int | None,
+    stuck_nudges: int,
+    max_stuck: int,
+) -> str:
+    """Decide between nudge / stuck_end / clean_end after a silent-terminate.
+
+    - ``clean_end``   — ledger empty (pending+in_progress == 0). Let the
+      orchestrator finish normally.
+    - ``nudge``       — pending exists AND either (a) no prior nudge or
+      (b) progress since last nudge (unfinished decreased). Reset the
+      stuck counter in the caller.
+    - ``stuck_end``   — pending exists but no progress since last nudge and
+      the stuck counter has reached ``max_stuck``. Gives up re-prompting.
+
+    The "progress-based reset" is what separates this from a pure accumulator:
+    qwen3-max style models silent-terminate after every completed batch, so a
+    cumulative cap (e.g. 3 total) runs out mid-run. Resetting on progress lets
+    the harness keep enforcing the rule as long as the model is actually
+    making forward progress, and only abort when truly stuck.
     """
     unfinished = counts.get("pending", 0) + counts.get("in_progress", 0)
-    return unfinished > 0 and nudges_so_far < max_nudges
+    if unfinished == 0:
+        return "clean_end"
+    progress_made = last_unfinished is None or unfinished < last_unfinished
+    if progress_made:
+        return "nudge"
+    if stuck_nudges >= max_stuck:
+        return "stuck_end"
+    return "nudge"
 
 
 def _build_pending_nudge_message(
@@ -188,6 +306,23 @@ ledger 기록은 ledger 에게 위임하세요.
 - 같은 TASK-NN 을 verifier↔fixer 로 6 회 이상 반복하면 ProgressGuard 가
   강제 종료합니다. verifier 가 보고한 실패(에러 메시지·테스트명·스택)를
   fixer description 에 그대로 복사하세요.
+
+## 분해 확인 (중요 — coder/verifier/fixer/reviewer 위임 전 필수)
+- ledger 가 초기 등록을 마친 직후, **반드시 사용자에게 분해 granularity 를
+  확인받은 뒤** coder/verifier/fixer/reviewer 에게 위임하세요.
+- 방법: `ask_user_question` 도구 (task 위임 없이 orchestrator 가 직접 호출
+  가능) 로 다음을 묻습니다:
+    1. 분해된 task 개수와 첫 3-5개 미리보기 제시
+    2. "더 세분화 / 더 통합 / 이대로 진행" 중 선택 요청
+- 사용자 응답에 따라:
+    - "이대로 진행" → TASK-01 부터 coder/verifier 위임 시작
+    - "더 세분화" / "더 통합" → ledger 에게 "모든 todos 를 clear" 위임 후,
+      planner 에게 사용자 피드백과 목표 개수(예: "20-25개 수준으로 각 API
+      endpoint 를 개별 task 로 분리")를 명시해 재위임
+- harness 안전망: 이 단계를 건너뛰고 coder/verifier/fixer/reviewer 에게
+  바로 위임하면 `task` 도구가 1회 차단되고 같은 안내를 받습니다. 차단
+  직후에도 **반드시 `ask_user_question` 을 먼저 호출하세요** — 차단을
+  단순히 "한 번 통과하면 지나감" 으로 취급하지 마십시오.
 
 ## 종료
 - 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시
@@ -458,25 +593,43 @@ class AgentLoop:
 
             verdict = self._progress_guard.check(iteration)
 
+            result: dict[str, Any] = {}
+
+            # Implicit decomposition confirm — ledger 등록 후 ask_user_question
+            # 이력이 있으면 게이트를 스킵하고 flag 를 미리 전환. 모범생 흐름에서
+            # 불필요한 gate 차단을 제거한다 (v3 E2E 관찰).
+            if not state.get("decomposition_confirmed", False):
+                if _detect_implicit_decomposition_confirm(
+                    messages, self._todo_store.counts()
+                ):
+                    log.info("orchestrator.decomposition_confirmed_implicit")
+                    result["decomposition_confirmed"] = True
+
             if verdict == GuardVerdict.STOP:
-                return {
-                    "exit_reason": "progress_guard_stop",
-                    "stall_count": (state.get("stall_count") or 0) + 1,
-                }
+                result.update(
+                    {
+                        "exit_reason": "progress_guard_stop",
+                        "stall_count": (state.get("stall_count") or 0) + 1,
+                    }
+                )
+                return result
             elif verdict == GuardVerdict.WARN:
                 log.warning("progress_guard.stall_detected", iteration=iteration)
-                return {"stall_count": (state.get("stall_count") or 0) + 1}
+                result["stall_count"] = (state.get("stall_count") or 0) + 1
+                return result
 
-            return {}
+            return result
 
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
-        # Termination-with-pending-todos 재시도 횟수 상한.
-        # 3회까지 허용 — nudge 가 너무 보수적이면 정말 할 일 없는 상황에서도
-        # 세션을 못 끝내고, 너무 관대하면 의미없는 "계속해도 이미 나 자연어로만
-        # 답해" 루프가 남는다. 3 은 "모델이 한 번 실수하고, 한 번 더 실수해도
-        # 결국 따라오는" 여유. 여전히 안 따라오면 정상 종료 경로로 내린다.
-        _MAX_PENDING_NUDGES = 3
+        # Termination-with-pending-todos 재시도 — "진전 없는 연속 silent-
+        # terminate" 횟수 상한. 직전 nudge 대비 unfinished 가 줄어들면 리셋
+        # 되므로, 진전이 있는 한 ledger 가 빌 때까지 계속 찌른다. 3 은 "모델
+        # 이 세 번 연속 찔러도 같은 ledger 상태로 자연어만 뱉는" 정체 신호.
+        # 2026-04-21 v1 E2E (46 tasks) 관찰 — qwen3-max 가 매 배치 후
+        # silent-terminate 하는 패턴이므로 누적 상한(3)은 부족. progress-based
+        # reset 으로 보완.
+        _MAX_STUCK_NUDGES = 3
 
         def handle_error(state: AgentState) -> dict[str, Any]:
             """에러 처리 노드.
@@ -535,32 +688,77 @@ class AgentLoop:
             """Inject a reminder when orchestrator tries to terminate with
             pending todos still on the ledger.
 
-            Qwen3-max observed in v12 E2E: after ledger registers 62 todos,
-            orchestrator emits a natural-language summary with ``tool_calls=None``
-            ("이제 등록된 작업들을 순차적으로 수행하여 시스템을 개발할 수
-            있습니다") despite the system prompt stating pending > 0 cannot
-            terminate. The termination rule is not reliably enforced across
-            models, so the harness backstops it by re-prompting with the
-            first pending task as an explicit directive.
+            Qwen3-max observed in v12/v1 E2E: after each batch of completed
+            tasks, orchestrator emits a natural-language progress report with
+            ``tool_calls=None`` ("다음 작업을 진행할 준비가 되어 있습니다")
+            despite the system prompt stating pending > 0 cannot terminate.
+            Pattern repeats every batch, so a cumulative nudge cap runs out
+            mid-run. This node resets the stuck counter when unfinished
+            decreases versus the last nudge — progress-based, not cumulative.
             """
             items = self._todo_store.list_items()
             counts = self._todo_store.counts()
+            unfinished = counts.get("pending", 0) + counts.get("in_progress", 0)
             first = next(
                 (it for it in items if it.status in ("pending", "in_progress")),
                 None,
             )
-            nudges = (state.get("pending_nudges") or 0) + 1
+            last_unfinished = state.get("last_nudge_unfinished")
+            progress_made = last_unfinished is None or unfinished < last_unfinished
+            new_nudges = 1 if progress_made else (state.get("pending_nudges") or 0) + 1
             reminder = _build_pending_nudge_message(first, counts)
             log.warning(
                 "orchestrator.pending_nudge_injected",
                 pending=counts.get("pending", 0),
                 in_progress=counts.get("in_progress", 0),
                 first_task=(first.id if first else None),
-                nudge_count=nudges,
+                nudge_count=new_nudges,
+                progress_reset=progress_made,
+                last_unfinished=last_unfinished,
+                unfinished=unfinished,
             )
             return {
                 "messages": [HumanMessage(content=reminder)],
-                "pending_nudges": nudges,
+                "pending_nudges": new_nudges,
+                "last_nudge_unfinished": unfinished,
+            }
+
+        def gate_decomposition_node(state: AgentState) -> dict[str, Any]:
+            """Block the first non-ledger delegation after ledger fill.
+
+            Responds with a ``ToolMessage`` so LangChain does not raise on
+            an orphan tool_call, and flips ``decomposition_confirmed`` to
+            True so subsequent delegations pass. The system prompt instructs
+            the orchestrator to call ``ask_user_question`` on receiving this
+            block message — harness enforces the first gate, prompt enforces
+            the follow-through.
+            """
+            counts = self._todo_store.counts()
+            items = self._todo_store.list_items()
+            preview = [f"{it.id}: {it.content[:80]}" for it in items[:5]]
+            messages = state.get("messages", [])
+            last_msg = messages[-1] if messages else None
+            _, blocked_id = _requires_decomposition_gate(
+                last_msg,
+                counts,
+                state.get("decomposition_confirmed", False),
+            )
+            if blocked_id is None:
+                # Safety: route decided to gate but id went missing — just
+                # clear the flag so we don't deadlock.
+                return {"decomposition_confirmed": True}
+            body = _build_gate_decomposition_message(counts, preview)
+            log.warning(
+                "orchestrator.decomposition_gate_blocked",
+                pending=counts.get("pending", 0),
+                in_progress=counts.get("in_progress", 0),
+                completed=counts.get("completed", 0),
+                total=sum(counts.values()),
+                blocked_tool_call_id=blocked_id,
+            )
+            return {
+                "messages": [ToolMessage(content=body, tool_call_id=blocked_id)],
+                "decomposition_confirmed": True,
             }
 
         def safe_stop_node(state: AgentState) -> dict[str, Any]:
@@ -601,18 +799,39 @@ class AgentLoop:
             if messages:
                 last_msg = messages[-1]
                 if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                    # 분해 확인 게이트 — ledger 등록 후 첫 번째 non-ledger
+                    # task 위임을 1회 차단해서 사용자 confirmation 유도.
+                    gate_needed, _blocked_id = _requires_decomposition_gate(
+                        last_msg,
+                        self._todo_store.counts(),
+                        state.get("decomposition_confirmed", False),
+                    )
+                    if gate_needed:
+                        return "gate_decomposition"
                     return "tools"
 
             # 도구 호출 없음 = 응답 완료 — 단, ledger 에 pending 이 남아있으면
-            # 한두 번 nudge 를 주입해서 orchestrator 가 종료 규칙을 지키도록
-            # 강제한다. 모델 순종도 차이로 자연어만 뱉고 끝내는 경로 방어
-            # (v12 E2E 관찰, Qwen3-max).
-            if _should_nudge_pending(
-                self._todo_store.counts(),
+            # nudge 를 주입해서 orchestrator 가 종료 규칙을 지키도록 강제한다.
+            # 진전이 있는 한 계속 찌르고, "진전 없는 연속 실패"가
+            # _MAX_STUCK_NUDGES 에 도달한 경우에만 포기하고 정상 종료 경로로
+            # 빠진다 (v1 E2E 관찰, Qwen3-max).
+            counts = self._todo_store.counts()
+            decision = _nudge_decision(
+                counts,
+                state.get("last_nudge_unfinished"),
                 state.get("pending_nudges") or 0,
-                _MAX_PENDING_NUDGES,
-            ):
+                _MAX_STUCK_NUDGES,
+            )
+            if decision == "nudge":
                 return "nudge_pending_todos"
+            if decision == "stuck_end":
+                log.warning(
+                    "orchestrator.pending_nudge_stuck_abort",
+                    pending=counts.get("pending", 0),
+                    in_progress=counts.get("in_progress", 0),
+                    stuck_nudges=state.get("pending_nudges") or 0,
+                    last_unfinished=state.get("last_nudge_unfinished"),
+                )
 
             return "extract_memory_final"
 
@@ -636,6 +855,7 @@ class AgentLoop:
         builder.add_node("agent", agent_node)
         builder.add_node("tools", tool_node)
         builder.add_node("nudge_pending_todos", nudge_pending_todos_node)
+        builder.add_node("gate_decomposition", gate_decomposition_node)
         builder.add_node("extract_memory_final", extract_memory)
         builder.add_node("check_progress", check_progress)
         builder.add_node("handle_error", handle_error)
@@ -651,6 +871,7 @@ class AgentLoop:
             {
                 "tools": "tools",
                 "nudge_pending_todos": "nudge_pending_todos",
+                "gate_decomposition": "gate_decomposition",
                 "extract_memory_final": "extract_memory_final",
                 "handle_error": "handle_error",
                 "safe_stop": "safe_stop",
@@ -660,6 +881,10 @@ class AgentLoop:
         # Nudge 후 곧바로 agent 재호출 — injected HumanMessage 를 읽고
         # 이번엔 task 도구를 호출하도록 재촉한다.
         builder.add_edge("nudge_pending_todos", "agent")
+
+        # 분해 게이트 후 agent 재호출 — 안내 ToolMessage 를 읽고 이번엔
+        # ask_user_question 을 호출하도록 유도.
+        builder.add_edge("gate_decomposition", "agent")
 
         # 루프 중간에는 메모리 추출 없이 바로 진전 확인
         builder.add_edge("tools", "check_progress")
