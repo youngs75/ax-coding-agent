@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 
 from minyoung_mah import (
-    HITL_INTERRUPT_MARKER,
     ToolResult,
     extract_interrupt_payload,
     make_interrupt_marker,
@@ -37,8 +36,7 @@ class AskUserQuestionAdapter:
     name: str = "ask_user_question"
     description: str = (
         "Pause and ask the user 1–4 multiple-choice questions about essential "
-        f"decisions. 결과가 {HITL_INTERRUPT_MARKER} 를 포함하면 즉시 짧은 요약 "
-        "한 줄로 응답을 마치세요 (상위 레이어가 사용자 답변 후 다시 호출합니다)."
+        "decisions."
     )
     arg_schema: type = AskUserQuestionInput
 

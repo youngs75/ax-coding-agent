@@ -249,7 +249,10 @@ def test_progress_guard_reset_clears_task_history() -> None:
 def test_system_prompt_mentions_sequential_todo_and_auto_marking() -> None:
     assert "등록 순서" in SYSTEM_PROMPT or "순서대로" in SYSTEM_PROMPT
     assert "자동" in SYSTEM_PROMPT
-    assert "ProgressGuard" in SYSTEM_PROMPT
+    # NOTE: harness 임계값(ProgressGuard 6회 한도 등) 어휘는 prompt 에 노출
+    # 하지 않는다. harness 차원에서만 관찰·조절한다는 사용자 철학에 따라,
+    # SYSTEM_PROMPT 에서 "ProgressGuard" 단어가 등장하지 않아야 한다.
+    assert "ProgressGuard" not in SYSTEM_PROMPT
 
 
 # ── A-2 integration: check_progress reverse lookup ──────────

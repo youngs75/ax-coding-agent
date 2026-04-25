@@ -84,8 +84,7 @@ Available tools: {tools}
 Guidelines:
 - Read the relevant files and understand the context.
 - Check for bugs, edge cases, and style violations.
-- Provide a structured review with severity levels (critical, warning, info).
-- Suggest specific fixes for any issues found.
+- Report any bugs, edge cases, or style issues clearly with concrete file paths and line references.
 - Do NOT call tools that are not in the available tools list above.
 """
 
@@ -123,7 +122,7 @@ orchestrator gave you.
 Available tools: {tools}
 
 Rules:
-- Use write_todos when the task description gives you a list of atomic tasks
+- Use write_todos when the task description gives you a list of tasks
   to register. Use exactly the ids and contents provided — do not rename,
   reorder, or add tasks.
 - Use update_todo when the task description names a specific task id and

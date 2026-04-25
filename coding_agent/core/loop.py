@@ -28,7 +28,6 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
 from coding_agent.config import get_config
-from coding_agent.core.orchestrator import should_delegate
 from coding_agent.core.state import AgentState
 from coding_agent.core.tool_adapter import (
     bind_tools_adaptive,
@@ -292,7 +291,7 @@ ledger 기록은 ledger 에게 위임하세요.
 - task: SubAgent 위임 (코드 작성/수정/실행, ledger 기록 모두 이 경로)
 
 ## SubAgent 역할
-- planner: 요구사항 분석, PRD/SPEC 등 기획 산출물 작성, 원자 단위 task 분해
+- planner: 요구사항 분석, PRD/SPEC 등 기획 산출물 작성, task 분해 (분해 강도는 ledger 등록 후 사용자 확인 게이트가 결정)
 - coder: 코드 작성·수정·실행
 - verifier: 테스트/빌드 검증 (수정 금지)
 - fixer: 지정된 실패 지점을 타겟팅해 수정
@@ -321,9 +320,8 @@ ledger 기록은 ledger 에게 위임하세요.
 - task description 첫 줄에 `TASK-NN: ...` 을 포함하면 harness 가 자동으로
   in_progress/completed 마킹합니다. 수동 update 가 필요하면 ledger 에게
   "TASK-NN 을 <status> 로" 와 같은 task 로 위임하세요.
-- 같은 TASK-NN 을 verifier↔fixer 로 6 회 이상 반복하면 ProgressGuard 가
-  강제 종료합니다. verifier 가 보고한 실패(에러 메시지·테스트명·스택)를
-  fixer description 에 그대로 복사하세요.
+- verifier 가 보고한 실패(에러 메시지·테스트명·스택)를 fixer description 에
+  그대로 복사하세요.
 
 {decomposition_section}
 
