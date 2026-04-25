@@ -17,10 +17,23 @@ fi
 WORKSPACE_ABS="$(cd "$WORKSPACE" && pwd)"
 PROJECT_ID="$(printf '%s' "$WORKSPACE_ABS" | md5sum | cut -c1-12)"
 
+# Sufficiency loop env override — 호스트에 명시적으로 셋팅된 변수만
+# 컨테이너로 forward. 미설정이면 컨테이너 내부 default 사용 (sufficiency
+# 는 default ON, MAX_ITER=1).
+EXTRA_ENV=()
+for v in AX_SUFFICIENCY_ENABLED AX_SUFF_MAX_ITER \
+         AX_SUFF_HIGH_TODO AX_SUFF_LOW_TODO \
+         AX_SUFF_HIGH_PRD AX_SUFF_LOW_PRD; do
+  if [ -n "${!v}" ]; then
+    EXTRA_ENV+=(-e "$v=${!v}")
+  fi
+done
+
 docker run -it --rm --network host \
   --name "$CONTAINER_NAME" \
   -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
   -e AX_PROJECT_ID="$PROJECT_ID" \
+  "${EXTRA_ENV[@]}" \
   -v "$WORKSPACE":/workspace \
   -v ax-agent-memory:/app/memory_store \
   ax-coding-agent

@@ -36,6 +36,7 @@ from coding_agent.cli.display import (
     print_iteration_info,
     print_memory_event,
     print_memory_table,
+    print_needs_human_review_footer,
     print_response,
     print_stall_warning,
     print_status,
@@ -45,6 +46,7 @@ from coding_agent.cli.display import (
     print_tool_call,
     print_tool_result,
     print_welcome,
+    render_critic_escalate_panel,
 )
 
 # ── Lazy init ──
@@ -239,6 +241,30 @@ async def _run_agent_streaming(user_input: str) -> None:
     # passes the initial_state; subsequent rounds pass Command(resume=...).
     next_input: Any = initial_state
 
+    # Sufficiency-loop notifications consumer — drains the orchestrator's
+    # ``QueueHITLChannel.notifications`` queue and renders ``critic_escalate``
+    # events as Rich panels live (instead of only at end-of-run). Started
+    # unconditionally because the queue is a no-op when sufficiency is
+    # disabled (channel is created but never receives ``notify`` calls).
+    async def _drain_hitl_notifications() -> None:
+        try:
+            channel = loop._orchestrator.hitl
+            queue = getattr(channel, "notifications", None)
+            if queue is None:
+                return
+            while True:
+                event = await queue.get()
+                kind = getattr(event, "kind", None)
+                data = getattr(event, "data", {}) or {}
+                if kind == "critic_escalate":
+                    render_critic_escalate_panel(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.debug("cli.hitl_notifications.error", error=str(exc))
+
+    notif_task = asyncio.create_task(_drain_hitl_notifications())
+
     while True:
         try:
             async for event in graph.astream_events(
@@ -416,6 +442,26 @@ async def _run_agent_streaming(user_input: str) -> None:
     else:
         status_detail = f"{elapsed:.1f}s · {llm_call_total} llm_calls"
     print_agent_status("completed", status_detail)
+
+    # ── Sufficiency-loop end-of-run footer (if escalated) ──
+    # 라이브 panel 은 이미 _drain_hitl_notifications 가 출력했지만, 51분 같은
+    # 긴 런에서는 한참 위로 스크롤됐을 수 있으므로 한 번 더 강조.
+    try:
+        final_state = await graph.aget_state(config) if hasattr(graph, "aget_state") else None
+        if final_state is not None:
+            sv = final_state.values if hasattr(final_state, "values") else final_state
+            if sv.get("needs_human_review"):
+                last_verdict = sv.get("last_critic_verdict") or {}
+                print_needs_human_review_footer(reason=last_verdict.get("reason"))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("cli.review_footer.error", error=str(exc))
+
+    # ── Notifications consumer cleanup ──
+    notif_task.cancel()
+    try:
+        await notif_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 # ── 폴백: 비스트리밍 실행 ──

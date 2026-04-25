@@ -60,3 +60,15 @@ class AgentState(TypedDict, total=False):
 
     # ── 작업 디렉토리 ──
     working_directory: str  # 현재 작업 디렉토리
+
+    # ── Sufficiency loop (apt-legal 패턴 이식) ──
+    # 모든 task 가 COMPLETED 인 시점에 한 번 더 "사용자 요청 충족도"를
+    # rule_gate + critic LLM 으로 평가. config.sufficiency_enabled=True 일
+    # 때만 그래프가 sufficiency_gate 노드로 진입한다. retry/replan 으로
+    # agent 노드 복귀 시 sufficiency_pending_feedback 이 다음 진입 시점에
+    # HumanMessage 로 변환된다. 모든 필드 reducer 없음 (덮어쓰기).
+    sufficiency_iterations: int  # 누적 outer-loop 반복 횟수
+    last_critic_verdict: dict[str, Any]  # CriticVerdict 직렬화
+    needs_human_review: bool
+    sufficiency_history: list[dict[str, Any]]  # SufficiencyHistoryEntry 직렬화
+    sufficiency_pending_feedback: str  # 다음 agent 진입 시 HumanMessage 로 주입할 텍스트

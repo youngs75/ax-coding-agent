@@ -215,6 +215,71 @@ def print_iteration_info(iteration: int, tier: str, model: str = "") -> None:
     console.print(f"  [dim]iteration {iteration} · {tier}[/dim]")
 
 
+# ── Sufficiency loop — critic_escalate panel ──
+
+def render_critic_escalate_panel(event_data: dict) -> None:
+    """Render an HITL ``critic_escalate`` notification as a red-bordered panel.
+
+    Called from the CLI ``notifications`` consumer task whenever the
+    sufficiency loop pushes a ``critic_escalate`` HITLEvent. Single-line
+    ``[HITL]`` 출력 대신 panel 로 사용자 주의를 끈다.
+
+    Expected ``event_data`` keys: ``reason`` (str), ``iteration`` (int),
+    ``metrics`` (dict), ``answer_preview`` (str). 누락 키는 graceful 처리.
+    """
+    reason = event_data.get("reason") or "(reason 없음)"
+    iteration = event_data.get("iteration", "?")
+    metrics = event_data.get("metrics") or {}
+
+    metric_lines: list[str] = []
+    for k in (
+        "pytest_exit", "lint_errors", "todo_done", "todo_total",
+        "todo_ratio", "prd_coverage",
+    ):
+        if k in metrics:
+            v = metrics[k]
+            if isinstance(v, float):
+                metric_lines.append(f"  [dim]·[/dim] {k}: {v:.2f}")
+            else:
+                metric_lines.append(f"  [dim]·[/dim] {k}: {v}")
+    metrics_block = "\n".join(metric_lines) or "  [dim](신호 없음)[/dim]"
+
+    body = (
+        f"[bold]사유[/bold]\n{reason}\n\n"
+        f"[bold]rule_gate metrics[/bold]\n{metrics_block}\n\n"
+        f"[dim]iteration: {iteration} · 사용자 다시 질의 권장[/dim]"
+    )
+
+    console.print()
+    console.print(
+        Panel(
+            body,
+            title=f"[bold red]{ICON_WARN} 검토 필요 — sufficiency critic_escalate[/bold red]",
+            border_style="red",
+            padding=(1, 2),
+        )
+    )
+    console.print()
+
+
+def print_needs_human_review_footer(reason: str | None = None) -> None:
+    """End-of-run footer when ``state.needs_human_review`` was True.
+
+    The escalate event itself is shown live via :func:`render_critic_escalate_panel`;
+    this footer is a final reminder so the user doesn't miss it after a long run.
+    """
+    txt = "[bold red]⚠ 이 응답은 사용자 검토가 권장됩니다.[/bold red]"
+    if reason:
+        txt += f"\n[dim]{reason}[/dim]"
+    console.print(
+        Panel(
+            txt,
+            border_style="red",
+            padding=(0, 2),
+        )
+    )
+
+
 # ── Todo ledger 표시 ──
 
 _TODO_GLYPHS = {

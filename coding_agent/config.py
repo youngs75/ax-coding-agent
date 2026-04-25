@@ -117,6 +117,30 @@ class Config:
         default_factory=lambda: os.getenv("ORCHESTRATOR_TIER", "reasoning")
     )
 
+    # ── Sufficiency loop (apt-legal 패턴 이식, MAX_ITER=1 보수 default) ──
+    # default ON — 별도 설정 없으면 켜진다. LangGraph 종료 직전에
+    # rule_gate(test/lint/todo/PRD) → MEDIUM 분기에서 LLM critic 호출.
+    # MAX_ITER=1 이라 정상(HIGH) 케이스에서는 critic 호출 자체가 일어나지
+    # 않아 비용 영향이 작다. 명시적 비활성: ``AX_SUFFICIENCY_ENABLED=0``.
+    sufficiency_enabled: bool = field(
+        default_factory=lambda: os.getenv("AX_SUFFICIENCY_ENABLED", "1") == "1"
+    )
+    sufficiency_max_iterations: int = field(
+        default_factory=lambda: int(os.getenv("AX_SUFF_MAX_ITER", "1"))
+    )
+    sufficiency_high_todo: float = field(
+        default_factory=lambda: float(os.getenv("AX_SUFF_HIGH_TODO", "0.9"))
+    )
+    sufficiency_low_todo: float = field(
+        default_factory=lambda: float(os.getenv("AX_SUFF_LOW_TODO", "0.5"))
+    )
+    sufficiency_high_prd: float = field(
+        default_factory=lambda: float(os.getenv("AX_SUFF_HIGH_PRD", "0.85"))
+    )
+    sufficiency_low_prd: float = field(
+        default_factory=lambda: float(os.getenv("AX_SUFF_LOW_PRD", "0.4"))
+    )
+
     # 프로젝트 경로
     project_root: Path = field(default_factory=lambda: _PROJECT_ROOT)
 

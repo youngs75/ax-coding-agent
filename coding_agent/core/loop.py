@@ -47,6 +47,11 @@ from coding_agent.resilience_compat import (
 )
 from coding_agent.subagents.orchestrator_factory import build_orchestrator
 from coding_agent.subagents.user_decisions import UserDecisionsLog
+from coding_agent.sufficiency import critic as _critic_mod
+from coding_agent.sufficiency import loop as _suff_loop
+from coding_agent.sufficiency import rules as _suff_rules
+from coding_agent.sufficiency import signals as _suff_signals
+from coding_agent.sufficiency.schemas import CriticVerdict as _CriticVerdict
 from coding_agent.tools.file_ops import FILE_TOOLS
 from coding_agent.tools.shell import SHELL_TOOLS
 from coding_agent.tools.task_tool import build_task_tool
@@ -123,23 +128,36 @@ def _detect_implicit_decomposition_confirm(
     messages: list,
     todo_counts: dict[str, int],
 ) -> bool:
-    """Infer that the user has already been consulted about this ledger.
+    """Infer that the user has already been consulted *about this ledger*.
 
-    If the ledger has items AND the message history contains at least one
-    completed ``ask_user_question`` interaction, treat the gate as already
-    satisfied. Avoids the noise where an orchestrator that proactively calls
-    ``ask_user_question`` (per SYSTEM_PROMPT "분해 확인" section) then trips
-    the gate on its follow-up ``task(coder)`` call.
+    Only counts ``ask_user_question`` interactions that happened **after**
+    the orchestrator's last ``task("ledger", ...)`` delegation. Pre-ledger
+    asks (e.g. planner's early tech-stack questions) do *not* qualify —
+    those are about scope/framework decisions, not decomposition
+    granularity.
 
-    Heuristic, not a proof — an early planner ask about tech stack would
-    also match, even if no decomposition-specific question was asked. The
-    trade-off is deliberate: false positives degrade to pre-gate behavior
-    (the user simply isn't re-consulted), while eliminating the spurious
-    block keeps logs clean for the common well-behaved case.
+    Avoids the v3 noise where an orchestrator that proactively calls
+    ``ask_user_question`` (per the prompt "분해 확인" section) then trips
+    the gate on its follow-up ``task(coder)`` call, while also avoiding
+    the v8 regression where pre-ledger asks falsely flipped the flag and
+    the user never saw the granularity question.
     """
     if sum(todo_counts.values()) == 0:
         return False
-    for m in messages:
+    last_ledger_idx = -1
+    for i, m in enumerate(messages):
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            if tc.get("name") != "task":
+                continue
+            args = tc.get("args") or {}
+            agent_type = (args.get("agent_type") or "").strip().lower()
+            if agent_type == "ledger":
+                last_ledger_idx = i
+                break
+    if last_ledger_idx < 0:
+        return False
+    for m in messages[last_ledger_idx + 1:]:
         if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_user_question":
             return True
     return False
@@ -307,6 +325,30 @@ ledger 기록은 ledger 에게 위임하세요.
   강제 종료합니다. verifier 가 보고한 실패(에러 메시지·테스트명·스택)를
   fixer description 에 그대로 복사하세요.
 
+{decomposition_section}
+
+## 종료
+- 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시
+  자연어 요약 한 번으로 응답을 마무리하세요. 새 task 위임을 만들면 안
+  됩니다.
+- todo ledger 를 쓰지 않는 짧은 요청의 경우에도, 사용자 요청이 충족되면
+  동일하게 자연어 요약으로 종료합니다.
+
+{user_decisions_block}
+
+{ledger_snapshot}
+
+{memory_context}
+"""
+
+
+# ── 분해 확인 (decomposition gate) — 동적 섹션 빌더 ───────────────────────
+# v7 회귀(2026-04-26): SYSTEM_PROMPT 가 정적이라 ``decomposition_confirmed``
+# 가 True 가 된 후에도 같은 "ledger 직후 ask 호출" 안내가 그대로 보임 →
+# orchestrator(qwen3-max) 가 답을 받고도 같은 질문을 planner 에게 또
+# 위임하는 무한 루프. 동적 섹션으로 confirmed 상태를 명시한다.
+
+_DECOMPOSITION_PENDING_TEXT = """\
 ## 분해 확인 (중요 — coder/verifier/fixer/reviewer 위임 전 필수)
 - ledger 가 초기 등록을 마친 직후, **반드시 사용자에게 분해 granularity 를
   확인받은 뒤** coder/verifier/fixer/reviewer 에게 위임하세요.
@@ -322,19 +364,33 @@ ledger 기록은 ledger 에게 위임하세요.
 - harness 안전망: 이 단계를 건너뛰고 coder/verifier/fixer/reviewer 에게
   바로 위임하면 `task` 도구가 1회 차단되고 같은 안내를 받습니다. 차단
   직후에도 **반드시 `ask_user_question` 을 먼저 호출하세요** — 차단을
-  단순히 "한 번 통과하면 지나감" 으로 취급하지 마십시오.
+  단순히 "한 번 통과하면 지나감" 으로 취급하지 마십시오."""
 
-## 종료
-- 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시
-  자연어 요약 한 번으로 응답을 마무리하세요. 새 task 위임을 만들면 안
-  됩니다.
-- todo ledger 를 쓰지 않는 짧은 요청의 경우에도, 사용자 요청이 충족되면
-  동일하게 자연어 요약으로 종료합니다.
 
-{ledger_snapshot}
+_DECOMPOSITION_CONFIRMED_TEXT = """\
+## 분해 확인 — 완료
+ledger 등록 후 분해 granularity 에 대한 사용자 확인이 끝났습니다.
+**같은 분해 확인 질문을 다시 호출하거나 planner 에게 'ask_user_question'
+관련 task 를 위임하지 마세요** — 사용자가 이미 답했고 그 답은 위 "사용자
+결정 사항" 에 기록돼 있습니다.
 
-{memory_context}
-"""
+다음 단계:
+- 사용자 답변이 "이대로 진행" 류라면 TASK-01 부터 순서대로 coder/verifier
+  위임을 시작하세요.
+- "더 세분화" 또는 "더 통합" 류라면 ledger 에게 "모든 todos 를 clear" 를
+  위임한 뒤 planner 에게 사용자 피드백과 목표 개수를 명시해 재위임하세요."""
+
+
+def _build_decomposition_section(confirmed: bool) -> str:
+    return _DECOMPOSITION_CONFIRMED_TEXT if confirmed else _DECOMPOSITION_PENDING_TEXT
+
+
+def _build_user_decisions_block(decisions_header: str) -> str:
+    """orchestrator SYSTEM_PROMPT 상단용. SubAgent 도 같은 블록을 본다 —
+    한 곳에 모아두면 orchestrator 가 사용자 답변을 인지 못하고 같은 질문을
+    반복하는 회귀 (v7) 가 막힌다. header 가 비어 있으면 빈 줄.
+    """
+    return decisions_header if decisions_header else ""
 
 
 class AgentLoop:
@@ -493,9 +549,17 @@ class AgentLoop:
             # 시스템 프롬프트 구성
             memory_ctx = state.get("memory_context", "")
             ledger_snapshot = _render_ledger_snapshot(self._todo_store)
+            decomposition_section = _build_decomposition_section(
+                state.get("decomposition_confirmed", False)
+            )
+            user_decisions_block = _build_user_decisions_block(
+                self._user_decisions.header()
+            )
             sys_prompt = SYSTEM_PROMPT.format(
                 memory_context=memory_ctx,
                 ledger_snapshot=ledger_snapshot,
+                decomposition_section=decomposition_section,
+                user_decisions_block=user_decisions_block,
             )
 
             # 프롬프트 기반 도구 호출 모드면 도구 스키마를 시스템 프롬프트에 추가
@@ -761,6 +825,187 @@ class AgentLoop:
                 "decomposition_confirmed": True,
             }
 
+        # ── Sufficiency loop nodes ──
+        # apt-legal 패턴 이식. ``Config.sufficiency_enabled=True`` 일 때만
+        # ``route_after_agent`` 가 ``sufficiency_gate`` 로 분기한다. 비활성
+        # 모드에서는 노드는 등록만 되고 도달하지 않는다.
+
+        def sufficiency_gate_node(state: AgentState) -> dict[str, Any]:
+            """Run the deterministic rule_gate.
+
+            HIGH 면 종료, LOW 면 휴리스틱 verdict 를 미리 채워
+            ``sufficiency_apply_node`` 에 넘김, MEDIUM 이면 critic 호출로
+            라우팅된다 (라우팅 함수가 결정).
+            """
+            cfg = get_config()
+            signals = _suff_signals.collect_signals(dict(state), self._todo_store)
+            gate = _suff_rules.evaluate(
+                signals,
+                high_todo=cfg.sufficiency_high_todo,
+                low_todo=cfg.sufficiency_low_todo,
+                high_prd=cfg.sufficiency_high_prd,
+                low_prd=cfg.sufficiency_low_prd,
+            )
+            log.info(
+                "sufficiency.gate",
+                level=gate.level,
+                triggered=gate.triggered_signals,
+                metrics=gate.metrics,
+            )
+            updates: dict[str, Any] = {
+                "last_critic_verdict": {
+                    "_gate_level": gate.level,
+                    "_gate_metrics": gate.metrics,
+                    "_gate_reason": gate.reason,
+                    "_gate_triggered": list(gate.triggered_signals),
+                },
+            }
+            if gate.level == "LOW":
+                # LOW 분기는 critic 비용 없이 휴리스틱 verdict 로 직행
+                verdict = _suff_rules.heuristic_verdict_for_low(gate)
+                updates["last_critic_verdict"] = {
+                    **updates["last_critic_verdict"],
+                    **_suff_loop.serialize_verdict(verdict),
+                }
+            return updates
+
+        async def critic_node(state: AgentState) -> dict[str, Any]:
+            """Invoke the LLM critic for MEDIUM band gates."""
+            stash = state.get("last_critic_verdict") or {}
+            metrics = stash.get("_gate_metrics") or {}
+            iteration = (state.get("sufficiency_iterations") or 0) + 1
+
+            # 사용자 원 요청은 첫 HumanMessage 에서 추출
+            user_request = ""
+            for m in state.get("messages", []) or []:
+                if isinstance(m, HumanMessage):
+                    content = m.content if isinstance(m.content, str) else ""
+                    if content:
+                        user_request = content
+                        break
+
+            verdict = await _critic_mod.invoke_critic(
+                self._orchestrator,
+                user_request=user_request,
+                metrics=metrics,
+                iteration=iteration,
+            )
+            log.info(
+                "sufficiency.critic.done",
+                verdict=verdict.verdict,
+                target_role=verdict.target_role,
+                iteration=iteration,
+            )
+            return {
+                "last_critic_verdict": {
+                    **stash,
+                    **_suff_loop.serialize_verdict(verdict),
+                },
+            }
+
+        async def sufficiency_apply_node(state: AgentState) -> dict[str, Any]:
+            """Apply the verdict — emit observer event, push history,
+            either inject feedback HumanMessage (retry/replan) or notify HITL
+            and mark ``needs_human_review`` (escalate). pass falls through to
+            ``extract_memory_final`` via the router.
+            """
+            cfg = get_config()
+            stash = dict(state.get("last_critic_verdict") or {})
+            gate_level = stash.pop("_gate_level", "MEDIUM")
+            gate_metrics = stash.pop("_gate_metrics", {}) or {}
+            stash.pop("_gate_reason", None)
+            stash.pop("_gate_triggered", None)
+
+            iteration = (state.get("sufficiency_iterations") or 0) + 1
+
+            # Reconstruct the CriticVerdict from the serialized payload
+            verdict = _CriticVerdict(
+                verdict=stash.get("verdict", "escalate_hitl"),
+                target_role=stash.get("target_role"),
+                reason=stash.get("reason", "(reason 누락)"),
+                feedback_for_retry=stash.get("feedback_for_retry"),
+            )
+
+            # Cycle detection — promotes retry/replan to escalate when blocked
+            history_raw: list[dict[str, Any]] = list(
+                state.get("sufficiency_history") or []
+            )
+            new_hash = _suff_loop.compute_cycle_hash(
+                gate_level, verdict.verdict, verdict.target_role
+            )
+            is_cycle = _suff_loop.detect_cycle(history_raw, new_hash)
+            verdict = _suff_loop.force_escalate_if_blocked(
+                verdict,
+                iteration=iteration,
+                max_iterations=cfg.sufficiency_max_iterations,
+                is_cycle=is_cycle,
+            )
+
+            # Append history entry (post-promotion so the recorded verdict
+            # matches the actual decision applied)
+            new_entry = _suff_loop.SufficiencyHistoryEntry(
+                iteration=iteration,
+                rule_level=gate_level,
+                verdict=verdict.verdict,
+                target_role=verdict.target_role,
+                cycle_hash=new_hash,
+            )
+            history_raw.append(_suff_loop.serialize_history_entry(new_entry))
+
+            # Standard observability events
+            await _suff_loop.emit_critic_verdict_event(
+                self._orchestrator.observer,
+                verdict=verdict,
+                iteration=iteration,
+                rule_level=gate_level,
+                metrics=gate_metrics,
+            )
+
+            updates: dict[str, Any] = {
+                "sufficiency_iterations": iteration,
+                "sufficiency_history": history_raw,
+                "last_critic_verdict": _suff_loop.serialize_verdict(verdict),
+            }
+
+            if verdict.verdict == "escalate_hitl":
+                await _suff_loop.notify_hitl_escalation(
+                    self._orchestrator.hitl,
+                    verdict=verdict,
+                    iteration=iteration,
+                    metrics=gate_metrics,
+                )
+                updates["needs_human_review"] = True
+                updates["exit_reason"] = "sufficiency_escalated"
+                log.warning(
+                    "sufficiency.escalated",
+                    iteration=iteration,
+                    rule_level=gate_level,
+                    reason=verdict.reason[:200],
+                )
+                return updates
+
+            if verdict.verdict in ("retry_lookup", "replan"):
+                feedback_text = _suff_loop.build_feedback_human_message(
+                    verdict
+                ).replace("{iter}", str(iteration))
+                updates["messages"] = [HumanMessage(content=feedback_text)]
+                # Reset pending_nudges so the next agent turn isn't immediately
+                # killed by the stuck counter — feedback is itself the
+                # progress signal.
+                updates["pending_nudges"] = 0
+                updates["last_nudge_unfinished"] = None
+                log.info(
+                    "sufficiency.retry",
+                    iteration=iteration,
+                    target_role=verdict.target_role,
+                )
+                return updates
+
+            # pass — clear pending feedback and let the router send us to
+            # extract_memory_final.
+            log.info("sufficiency.pass", iteration=iteration, rule_level=gate_level)
+            return updates
+
         def safe_stop_node(state: AgentState) -> dict[str, Any]:
             """안전 중단 노드. 진행 상태를 파일로 저장하여 이어서 작업 가능."""
             exit_reason = state.get("exit_reason", "safe_stop")
@@ -825,6 +1070,12 @@ class AgentLoop:
             if decision == "nudge":
                 return "nudge_pending_todos"
             if decision == "stuck_end":
+                # stuck 은 nudge 시스템이 이미 "agent 가 진전 없이 종료를
+                # 반복" 으로 판정한 상태. sufficiency 가 끼면 LOW band 로
+                # 분류돼 의미 없는 retry/escalate 가 추가될 뿐이다 (v6 회귀:
+                # ledger 등록 직후 4 회 silent_terminate → stuck_end →
+                # sufficiency LOW + MAX_ITER=1 → 즉시 escalate). stuck 은
+                # 다른 안전망의 영역이므로 sufficiency 우회.
                 log.warning(
                     "orchestrator.pending_nudge_stuck_abort",
                     pending=counts.get("pending", 0),
@@ -832,7 +1083,44 @@ class AgentLoop:
                     stuck_nudges=state.get("pending_nudges") or 0,
                     last_unfinished=state.get("last_nudge_unfinished"),
                 )
+                return "extract_memory_final"
 
+            # Sufficiency loop — clean_end 시점에 한 번 더 충족도 평가.
+            # 비활성 시 직전 동작 그대로 extract_memory_final 직행.
+            if get_config().sufficiency_enabled:
+                # 사이클 방지: 이미 escalate 결정된 상태면 더 평가하지 않고 종료
+                last_verdict = state.get("last_critic_verdict") or {}
+                if last_verdict.get("verdict") == "escalate_hitl":
+                    return "extract_memory_final"
+                return "sufficiency_gate"
+
+            return "extract_memory_final"
+
+        def route_after_sufficiency_gate(state: AgentState) -> str:
+            """Pick the post-rule-gate destination.
+
+            HIGH → 종료, MEDIUM → critic, LOW → apply (휴리스틱 verdict 가
+            이미 ``last_critic_verdict`` 에 저장돼 있음).
+            """
+            stash = state.get("last_critic_verdict") or {}
+            level = stash.get("_gate_level", "MEDIUM")
+            if level == "HIGH":
+                return "extract_memory_final"
+            if level == "LOW":
+                return "sufficiency_apply"
+            return "critic"
+
+        def route_after_sufficiency_apply(state: AgentState) -> str:
+            """Pick the post-apply destination.
+
+            verdict==pass / escalated → 종료. retry/replan → 다시 agent 노드
+            로 돌아 다음 iteration 진입 (feedback HumanMessage 가 messages
+            에 이미 추가됐다).
+            """
+            verdict_payload = state.get("last_critic_verdict") or {}
+            verdict = verdict_payload.get("verdict", "escalate_hitl")
+            if verdict in ("retry_lookup", "replan"):
+                return "agent"
             return "extract_memory_final"
 
         def route_after_check(state: AgentState) -> str:
@@ -856,6 +1144,9 @@ class AgentLoop:
         builder.add_node("tools", tool_node)
         builder.add_node("nudge_pending_todos", nudge_pending_todos_node)
         builder.add_node("gate_decomposition", gate_decomposition_node)
+        builder.add_node("sufficiency_gate", sufficiency_gate_node)
+        builder.add_node("critic", critic_node)
+        builder.add_node("sufficiency_apply", sufficiency_apply_node)
         builder.add_node("extract_memory_final", extract_memory)
         builder.add_node("check_progress", check_progress)
         builder.add_node("handle_error", handle_error)
@@ -872,9 +1163,32 @@ class AgentLoop:
                 "tools": "tools",
                 "nudge_pending_todos": "nudge_pending_todos",
                 "gate_decomposition": "gate_decomposition",
+                "sufficiency_gate": "sufficiency_gate",
                 "extract_memory_final": "extract_memory_final",
                 "handle_error": "handle_error",
                 "safe_stop": "safe_stop",
+            },
+        )
+
+        builder.add_conditional_edges(
+            "sufficiency_gate",
+            route_after_sufficiency_gate,
+            {
+                "critic": "critic",
+                "sufficiency_apply": "sufficiency_apply",
+                "extract_memory_final": "extract_memory_final",
+            },
+        )
+
+        # critic 은 결정만 만들고 곧장 apply 로
+        builder.add_edge("critic", "sufficiency_apply")
+
+        builder.add_conditional_edges(
+            "sufficiency_apply",
+            route_after_sufficiency_apply,
+            {
+                "agent": "agent",
+                "extract_memory_final": "extract_memory_final",
             },
         )
 

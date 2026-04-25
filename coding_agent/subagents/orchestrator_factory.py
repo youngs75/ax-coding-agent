@@ -13,14 +13,15 @@ from typing import TYPE_CHECKING
 
 from minyoung_mah import (
     MemoryStore,
-    NullHITLChannel,
     Orchestrator,
     RoleRegistry,
     TieredModelRouter,
     ToolRegistry,
     default_resilience,
 )
+from minyoung_mah.hitl.channels import QueueHITLChannel
 
+from coding_agent.config import get_config
 from coding_agent.observability import build_default_observer
 
 from coding_agent.models import get_model
@@ -33,6 +34,10 @@ from coding_agent.subagents.roles import (
     reviewer_role,
     verifier_role,
 )
+
+# critic_role 은 ``coding_agent.subagents.roles`` 의 ``CodingAgentRole`` 등을
+# 재사용하므로 module-level import 시 ``coding_agent.subagents.__init__``
+# 패키지 로드와 순환 충돌. ``build_orchestrator`` 안에서 lazy import 한다.
 from coding_agent.tools.adapters import (
     FILE_ADAPTERS,
     SHELL_ADAPTERS,
@@ -95,6 +100,13 @@ def build_orchestrator(
     role_registry.register(verifier_role(user_decisions=user_decisions))
     if todo_store is not None:
         role_registry.register(ledger_role(user_decisions=user_decisions))
+    # critic role — sufficiency loop 가 켜진 경우에만 등록. 끄면 invoke_role
+    # 호출이 일어나지 않으므로 이 등록을 가드해 토큰 비용·로그 노이즈를
+    # 줄인다. apt-legal 패턴.
+    cfg = get_config()
+    if cfg.sufficiency_enabled:
+        from coding_agent.sufficiency.critic_role import critic_role
+        role_registry.register(critic_role(user_decisions=user_decisions))
 
     # ── Model router: one shared model per tier ──
     # Building the ChatOpenAI instances here keeps the Orchestrator wiring
@@ -124,12 +136,20 @@ def build_orchestrator(
     }
     resilience = default_resilience(role_timeouts=timeouts)
 
+    # ── HITL ──
+    # ax 의 ``ask_user_question`` 경로는 LangGraph interrupt 를 통해 처리
+    # 되므로 여기 HITL 채널은 ``ask`` 가 아닌 ``notify`` 만 쓴다.
+    # QueueHITLChannel 의 ``notifications`` 큐로 sufficiency critic_escalate
+    # 이벤트를 흘려보내고, CLI 가 polling 해서 Rich panel 로 표시한다.
+    # plan §결정 3 — interrupt 경로는 그대로 LangGraph 가 담당.
+    hitl_channel = QueueHITLChannel()
+
     return Orchestrator(
         role_registry=role_registry,
         tool_registry=tool_registry,
         model_router=model_router,
         memory=memory_store,
-        hitl=NullHITLChannel(),  # plan §결정 3 — interrupt path stays on LangGraph
+        hitl=hitl_channel,
         observer=build_default_observer(),
         resilience=resilience,
     )
