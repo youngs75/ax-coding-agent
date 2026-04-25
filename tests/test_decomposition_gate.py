@@ -331,8 +331,16 @@ def test_system_prompt_no_decomposition_placeholder():
 
 
 def test_system_prompt_format_succeeds_with_current_args():
-    # agent_node calls SYSTEM_PROMPT.format(memory_context=..., ledger_snapshot=...)
-    # — verify those are still the only required placeholders.
-    rendered = SYSTEM_PROMPT.format(memory_context="m", ledger_snapshot="l")
+    # agent_node calls SYSTEM_PROMPT.format(memory_context, ledger_snapshot,
+    # user_decisions_block) — verify those are still the only required
+    # placeholders. ``{decomposition_section}`` was removed when the gate
+    # moved to harness-driven interrupt; ``{user_decisions_block}`` stays
+    # so orchestrator can see prior user answers.
+    rendered = SYSTEM_PROMPT.format(
+        memory_context="m",
+        ledger_snapshot="l",
+        user_decisions_block="u",
+    )
     assert "m" in rendered
     assert "l" in rendered
+    assert "u" in rendered

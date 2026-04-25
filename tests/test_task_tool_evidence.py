@@ -313,6 +313,8 @@ def test_system_prompt_no_longer_demands_manual_evidence_copy():
     # point of this refactor — if it sneaks back in, the harness's auto-
     # prepend becomes redundant noise.
     assert "fixer description 에 그대로 복사" not in SYSTEM_PROMPT
-    # The 6-회 ProgressGuard reference must still be there (handled by
-    # bundle A; we just want to confirm we didn't accidentally delete it).
-    assert "6 회 이상" in SYSTEM_PROMPT or "ProgressGuard" in SYSTEM_PROMPT
+    # Bundle A also removed the explicit ProgressGuard 6회 한도 line
+    # (harness 임계값을 모델에 노출하지 않는다는 사용자 철학). Confirm
+    # the line is gone — both must be absent.
+    assert "6 회 이상" not in SYSTEM_PROMPT
+    assert "ProgressGuard" not in SYSTEM_PROMPT
