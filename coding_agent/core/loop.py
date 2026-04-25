@@ -25,7 +25,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 from coding_agent.config import get_config
 from coding_agent.core.state import AgentState
@@ -123,73 +123,95 @@ def _requires_decomposition_gate(
     return (False, None)
 
 
-def _detect_implicit_decomposition_confirm(
-    messages: list,
-    todo_counts: dict[str, int],
-) -> bool:
-    """Infer that the user has already been consulted *about this ledger*.
-
-    Only counts ``ask_user_question`` interactions that happened **after**
-    the orchestrator's last ``task("ledger", ...)`` delegation. Pre-ledger
-    asks (e.g. planner's early tech-stack questions) do *not* qualify —
-    those are about scope/framework decisions, not decomposition
-    granularity.
-
-    Avoids the v3 noise where an orchestrator that proactively calls
-    ``ask_user_question`` (per the prompt "분해 확인" section) then trips
-    the gate on its follow-up ``task(coder)`` call, while also avoiding
-    the v8 regression where pre-ledger asks falsely flipped the flag and
-    the user never saw the granularity question.
-    """
-    if sum(todo_counts.values()) == 0:
-        return False
-    last_ledger_idx = -1
-    for i, m in enumerate(messages):
-        tool_calls = getattr(m, "tool_calls", None) or []
-        for tc in tool_calls:
-            if tc.get("name") != "task":
-                continue
-            args = tc.get("args") or {}
-            agent_type = (args.get("agent_type") or "").strip().lower()
-            if agent_type == "ledger":
-                last_ledger_idx = i
-                break
-    if last_ledger_idx < 0:
-        return False
-    for m in messages[last_ledger_idx + 1:]:
-        if isinstance(m, ToolMessage) and getattr(m, "name", "") == "ask_user_question":
-            return True
-    return False
-
-
-def _build_gate_decomposition_message(
+def _build_decomposition_interrupt_payload(
     counts: dict[str, int],
     preview: list[str],
-) -> str:
-    """Render the ToolMessage injected when a delegation is gated.
+) -> dict[str, Any]:
+    """Build the ``ask_user_question`` payload the harness raises via ``interrupt()``.
 
-    ``preview`` is a list of "TASK-NN: <content>" lines the caller has already
-    truncated. Kept pure so tests can snapshot layout.
+    Mirrors the format produced by the ``ask_user_question`` tool so the
+    CLI's ``question_renderer`` handles both code paths uniformly. Threshold
+    advisory: total > 15 → suggest consolidating, total < 4 → suggest finer
+    split, otherwise neutral. Text goes directly to the user (not the model).
     """
-    n = counts.get("pending", 0) + counts.get("in_progress", 0) + counts.get("completed", 0)
+    total = sum(counts.values())
     shown = preview[:5]
-    preview_block = "\n".join(f"    - {line}" for line in shown)
-    if n > len(shown):
-        preview_block += f"\n    ... 외 {n - len(shown)}개"
-    return (
-        f"⚠ 분해 확인 필요: ledger 에 {n}개 task 가 등록되어 있는데, 사용자의 "
-        f"granularity 승인 없이 위임하려 했습니다. harness 가 이 위임을 1회 "
-        f"차단합니다.\n\n"
-        f"현재 분해 미리보기:\n{preview_block}\n\n"
-        f"지금 바로 `ask_user_question` 을 호출해서 다음을 묻고, 답변에 따라 "
-        f"재분해(ledger clear + planner 재위임) 또는 그대로 진행(coder 위임)을 "
-        f"결정하세요:\n"
-        f"- 분해된 개수({n}개)가 적절한가?\n"
-        f"- 더 세분화 / 더 통합 / 이대로 진행 중 어느 것을 원하는가?\n\n"
-        f"사용자 답변을 받은 뒤 다시 task 도구로 위임하면 통과됩니다. "
-        f"(게이트는 1회만 차단하지만, 사용자 확인 없이 위임을 재시도하는 것은 "
-        f"금지입니다.)"
+    preview_block = "\n".join(f"  - {line}" for line in shown)
+    if total > len(shown):
+        preview_block += f"\n  ... 외 {total - len(shown)}개"
+
+    if total > 15:
+        advisory = f" (총 {total}개 — 일반 권고: 5~15개. 세분화가 과한 것 같습니다.)"
+    elif total < 4:
+        advisory = f" (총 {total}개 — 일반 권고: 5~15개. 통합이 과한 것 같습니다.)"
+    else:
+        advisory = f" (총 {total}개)"
+
+    question_text = (
+        f"task 분해 결과 미리보기{advisory}\n\n"
+        f"{preview_block}\n\n"
+        f"어떻게 진행할까요?"
     )
+
+    return {
+        "kind": "ask_user_question",
+        "questions": [
+            {
+                "header": "분해 확인",
+                "question": question_text,
+                "multi_select": False,
+                "allow_other": False,
+                "options": [
+                    {"label": "이대로 진행", "description": "현재 분해 그대로 위임 시작"},
+                    {"label": "더 세분화", "description": "ledger 비우고 planner 에게 더 작은 단위로 재분해 요청"},
+                    {"label": "더 통합", "description": "ledger 비우고 planner 에게 더 큰 단위로 재분해 요청"},
+                ],
+            }
+        ],
+    }
+
+
+def _extract_decomposition_answer(answer: Any) -> str:
+    """Pull the user's selection out of the resume payload.
+
+    CLI returns dict keyed by question header (``{"분해 확인": "이대로 진행"}``).
+    Optional fallbacks accept list-of-dict and bare strings for tests / programmatic
+    resume.
+    """
+    if isinstance(answer, dict):
+        if "분해 확인" in answer:
+            v = answer["분해 확인"]
+        elif answer:
+            v = next(iter(answer.values()))
+        else:
+            v = ""
+        if isinstance(v, list):
+            v = v[0] if v else ""
+        return str(v or "").strip()
+    if isinstance(answer, list) and answer:
+        first = answer[0]
+        if isinstance(first, dict):
+            return str(first.get("value") or first.get("answer") or "").strip()
+        if isinstance(first, str):
+            return first.strip()
+    if isinstance(answer, str):
+        return answer.strip()
+    return ""
+
+
+def _classify_decomposition_answer(value: str) -> str:
+    """Map a free-form answer string to one of: ``proceed``, ``finer``,
+    ``coarser``, ``unknown``. Pure helper for snapshot tests.
+    """
+    if not value:
+        return "unknown"
+    if "세분화" in value:
+        return "finer"
+    if "통합" in value:
+        return "coarser"
+    if "이대로" in value or "그대로" in value or value.startswith("진행"):
+        return "proceed"
+    return "unknown"
 
 
 def _nudge_decision(
@@ -321,8 +343,6 @@ ledger 기록은 ledger 에게 위임하세요.
   in_progress/completed 마킹합니다. 수동 update 가 필요하면 ledger 에게
   "TASK-NN 을 <status> 로" 와 같은 task 로 위임하세요.
 
-{decomposition_section}
-
 ## 종료
 - 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시
   자연어 요약 한 번으로 응답을 마무리하세요. 새 task 위임을 만들면 안
@@ -338,47 +358,10 @@ ledger 기록은 ledger 에게 위임하세요.
 """
 
 
-# ── 분해 확인 (decomposition gate) — 동적 섹션 빌더 ───────────────────────
-# v7 회귀(2026-04-26): SYSTEM_PROMPT 가 정적이라 ``decomposition_confirmed``
-# 가 True 가 된 후에도 같은 "ledger 직후 ask 호출" 안내가 그대로 보임 →
-# orchestrator(qwen3-max) 가 답을 받고도 같은 질문을 planner 에게 또
-# 위임하는 무한 루프. 동적 섹션으로 confirmed 상태를 명시한다.
-
-_DECOMPOSITION_PENDING_TEXT = """\
-## 분해 확인 (중요 — coder/verifier/fixer/reviewer 위임 전 필수)
-- ledger 가 초기 등록을 마친 직후, **반드시 사용자에게 분해 granularity 를
-  확인받은 뒤** coder/verifier/fixer/reviewer 에게 위임하세요.
-- 방법: `ask_user_question` 도구 (task 위임 없이 orchestrator 가 직접 호출
-  가능) 로 다음을 묻습니다:
-    1. 분해된 task 개수와 첫 3-5개 미리보기 제시
-    2. "더 세분화 / 더 통합 / 이대로 진행" 중 선택 요청
-- 사용자 응답에 따라:
-    - "이대로 진행" → TASK-01 부터 coder/verifier 위임 시작
-    - "더 세분화" / "더 통합" → ledger 에게 "모든 todos 를 clear" 위임 후,
-      planner 에게 사용자 피드백과 목표 개수(예: "20-25개 수준으로 각 API
-      endpoint 를 개별 task 로 분리")를 명시해 재위임
-- harness 안전망: 이 단계를 건너뛰고 coder/verifier/fixer/reviewer 에게
-  바로 위임하면 `task` 도구가 1회 차단되고 같은 안내를 받습니다. 차단
-  직후에도 **반드시 `ask_user_question` 을 먼저 호출하세요** — 차단을
-  단순히 "한 번 통과하면 지나감" 으로 취급하지 마십시오."""
-
-
-_DECOMPOSITION_CONFIRMED_TEXT = """\
-## 분해 확인 — 완료
-ledger 등록 후 분해 granularity 에 대한 사용자 확인이 끝났습니다.
-**같은 분해 확인 질문을 다시 호출하거나 planner 에게 'ask_user_question'
-관련 task 를 위임하지 마세요** — 사용자가 이미 답했고 그 답은 위 "사용자
-결정 사항" 에 기록돼 있습니다.
-
-다음 단계:
-- 사용자 답변이 "이대로 진행" 류라면 TASK-01 부터 순서대로 coder/verifier
-  위임을 시작하세요.
-- "더 세분화" 또는 "더 통합" 류라면 ledger 에게 "모든 todos 를 clear" 를
-  위임한 뒤 planner 에게 사용자 피드백과 목표 개수를 명시해 재위임하세요."""
-
-
-def _build_decomposition_section(confirmed: bool) -> str:
-    return _DECOMPOSITION_CONFIRMED_TEXT if confirmed else _DECOMPOSITION_PENDING_TEXT
+# 분해 확인은 harness 가 직접 처리한다. SYSTEM_PROMPT 에서 "ledger 직후
+# ask_user_question 호출" 같은 행동 지시는 *전부 삭제됨* — gate_decomposition_node
+# 가 LangGraph interrupt() 로 사용자에게 직접 묻고 답을 분기 처리.
+# v6/v7/v8/v9 누적 회귀 (prompt fidelity 의존) 의 근본 원인 제거.
 
 
 def _build_user_decisions_block(decisions_header: str) -> str:
@@ -545,16 +528,12 @@ class AgentLoop:
             # 시스템 프롬프트 구성
             memory_ctx = state.get("memory_context", "")
             ledger_snapshot = _render_ledger_snapshot(self._todo_store)
-            decomposition_section = _build_decomposition_section(
-                state.get("decomposition_confirmed", False)
-            )
             user_decisions_block = _build_user_decisions_block(
                 self._user_decisions.header()
             )
             sys_prompt = SYSTEM_PROMPT.format(
                 memory_context=memory_ctx,
                 ledger_snapshot=ledger_snapshot,
-                decomposition_section=decomposition_section,
                 user_decisions_block=user_decisions_block,
             )
 
@@ -655,15 +634,10 @@ class AgentLoop:
 
             result: dict[str, Any] = {}
 
-            # Implicit decomposition confirm — ledger 등록 후 ask_user_question
-            # 이력이 있으면 게이트를 스킵하고 flag 를 미리 전환. 모범생 흐름에서
-            # 불필요한 gate 차단을 제거한다 (v3 E2E 관찰).
-            if not state.get("decomposition_confirmed", False):
-                if _detect_implicit_decomposition_confirm(
-                    messages, self._todo_store.counts()
-                ):
-                    log.info("orchestrator.decomposition_confirmed_implicit")
-                    result["decomposition_confirmed"] = True
+            # 분해 확인 implicit detection 은 더 이상 사용하지 않는다 —
+            # gate_decomposition_node 가 LangGraph interrupt() 로 사용자에게
+            # 직접 묻고 답을 분기 처리한다. confirmed 플래그는 그 분기에서만
+            # set 된다.
 
             if verdict == GuardVerdict.STOP:
                 result.update(
@@ -784,42 +758,145 @@ class AgentLoop:
             }
 
         def gate_decomposition_node(state: AgentState) -> dict[str, Any]:
-            """Block the first non-ledger delegation after ledger fill.
+            """Harness-driven decomposition confirmation gate.
 
-            Responds with a ``ToolMessage`` so LangChain does not raise on
-            an orphan tool_call, and flips ``decomposition_confirmed`` to
-            True so subsequent delegations pass. The system prompt instructs
-            the orchestrator to call ``ask_user_question`` on receiving this
-            block message — harness enforces the first gate, prompt enforces
-            the follow-through.
+            Pauses the graph with LangGraph ``interrupt()`` and surfaces an
+            ``ask_user_question``-shaped payload to the CLI. When the user
+            answers, LangGraph re-runs this node from the top with the
+            answer available to ``interrupt()``'s call site — we then
+            translate the answer into state updates (set
+            ``decomposition_confirmed``, optionally ``reset()`` the ledger
+            and inject a HumanMessage that redirects the orchestrator to
+            re-delegate to planner).
+
+            Replaces the prompt-fidelity-dependent flow where the
+            orchestrator was nudged to call ``ask_user_question`` itself.
+            The harness now owns both the question and the branching logic,
+            so the gate is enforced regardless of how well the model
+            follows instructions (v6/v7/v8/v9 회귀 근본 원인 제거).
             """
             counts = self._todo_store.counts()
             items = self._todo_store.list_items()
             preview = [f"{it.id}: {it.content[:80]}" for it in items[:5]]
+
+            # Identify the blocked tool_call to satisfy LangChain's
+            # "every tool_call must have a corresponding ToolMessage" rule.
             messages = state.get("messages", [])
             last_msg = messages[-1] if messages else None
-            _, blocked_id = _requires_decomposition_gate(
-                last_msg,
-                counts,
-                state.get("decomposition_confirmed", False),
-            )
-            if blocked_id is None:
-                # Safety: route decided to gate but id went missing — just
-                # clear the flag so we don't deadlock.
-                return {"decomposition_confirmed": True}
-            body = _build_gate_decomposition_message(counts, preview)
-            log.warning(
-                "orchestrator.decomposition_gate_blocked",
+            blocked_id: str | None = None
+            for tc in (getattr(last_msg, "tool_calls", None) or []):
+                if tc.get("name") == "task":
+                    args = tc.get("args") or {}
+                    role = (args.get("agent_type") or "").strip().lower()
+                    if role in _GATED_ROLES:
+                        blocked_id = tc.get("id")
+                        break
+
+            payload = _build_decomposition_interrupt_payload(counts, preview)
+            log.info(
+                "orchestrator.decomposition_gate_interrupt",
                 pending=counts.get("pending", 0),
                 in_progress=counts.get("in_progress", 0),
                 completed=counts.get("completed", 0),
                 total=sum(counts.values()),
                 blocked_tool_call_id=blocked_id,
             )
-            return {
-                "messages": [ToolMessage(content=body, tool_call_id=blocked_id)],
-                "decomposition_confirmed": True,
-            }
+
+            # ``interrupt()`` raises ``GraphInterrupt`` on first entry; on
+            # resume via ``Command(resume=...)`` it returns the supplied
+            # value here. LangGraph re-executes the node from the top on
+            # resume, so the lines above run twice — by design.
+            answer = interrupt(payload)
+            value = _extract_decomposition_answer(answer)
+            decision = _classify_decomposition_answer(value)
+
+            updates: dict[str, Any] = {"decomposition_confirmed": True}
+            inject_messages: list[Any] = []
+
+            if decision == "finer":
+                # Clear ledger and steer planner to a finer breakdown.
+                self._todo_store.reset()
+                if self._todo_change_callback:
+                    try:
+                        self._todo_change_callback(self._todo_store.list_items())
+                    except Exception:  # noqa: BLE001
+                        pass
+                if blocked_id is not None:
+                    inject_messages.append(
+                        ToolMessage(
+                            content=(
+                                "사용자 답변: '더 세분화'. 차단된 위임은 취소되었고 "
+                                "ledger 가 비워졌습니다. planner 에게 더 작은 단위 "
+                                "(예: 기존의 1.5~2배 task 수) 로 재분해를 요청하세요."
+                            ),
+                            tool_call_id=blocked_id,
+                        )
+                    )
+                inject_messages.append(
+                    HumanMessage(
+                        content=(
+                            f"사용자가 task 분해를 더 세분화해달라고 요청했습니다 "
+                            f"(이전 분해: {sum(counts.values())}개). ledger 는 이미 "
+                            f"비워졌습니다. planner 에게 더 작은 단위로 재분해 (예: "
+                            f"기존의 1.5~2배 task 수) 를 요청하고, 결과를 ledger 에 "
+                            f"다시 등록하세요."
+                        )
+                    )
+                )
+            elif decision == "coarser":
+                self._todo_store.reset()
+                if self._todo_change_callback:
+                    try:
+                        self._todo_change_callback(self._todo_store.list_items())
+                    except Exception:  # noqa: BLE001
+                        pass
+                if blocked_id is not None:
+                    inject_messages.append(
+                        ToolMessage(
+                            content=(
+                                "사용자 답변: '더 통합'. 차단된 위임은 취소되었고 "
+                                "ledger 가 비워졌습니다. planner 에게 더 큰 단위로 "
+                                "재분해를 요청하세요."
+                            ),
+                            tool_call_id=blocked_id,
+                        )
+                    )
+                inject_messages.append(
+                    HumanMessage(
+                        content=(
+                            f"사용자가 task 분해를 더 통합해달라고 요청했습니다 "
+                            f"(이전 분해: {sum(counts.values())}개). ledger 는 이미 "
+                            f"비워졌습니다. planner 에게 더 큰 단위 (예: 기존의 절반 "
+                            f"task 수) 로 재분해를 요청하고, 결과를 ledger 에 다시 "
+                            f"등록하세요."
+                        )
+                    )
+                )
+            else:
+                # ``proceed`` or ``unknown`` — pass the original delegation
+                # through. We still need to satisfy the blocked tool_call.
+                if blocked_id is not None:
+                    note = (
+                        "사용자 답변: '이대로 진행'. 차단된 위임을 그대로 재시도하세요."
+                        if decision == "proceed"
+                        else (
+                            f"사용자 답변 ({value!r}) 을 명확히 분류하지 못했습니다. "
+                            f"보수적으로 차단된 위임을 그대로 재시도합니다."
+                        )
+                    )
+                    inject_messages.append(
+                        ToolMessage(content=note, tool_call_id=blocked_id)
+                    )
+
+            if inject_messages:
+                updates["messages"] = inject_messages
+
+            log.info(
+                "orchestrator.decomposition_gate_resolved",
+                decision=decision,
+                raw_answer=value[:120],
+            )
+            return updates
 
         # ── Sufficiency loop nodes ──
         # apt-legal 패턴 이식. ``Config.sufficiency_enabled=True`` 일 때만
