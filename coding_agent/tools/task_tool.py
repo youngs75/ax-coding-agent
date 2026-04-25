@@ -19,6 +19,14 @@ This module retains the ax-specific concerns the library stays out of:
   markdown sections.
 - **Written-files footer** — cumulative list of ``write_file`` / ``edit_file``
   targets appended to successful terminal output.
+- **Verifier→fixer evidence auto-prepend** — closure cache stores the most
+  recent verifier ``_format_verifier_output`` text and a wrapper around the
+  library tool prepends it to every fixer description. Replaces the prior
+  prompt obligation ("verifier 가 보고한 실패를 fixer description 에 그대로
+  복사하세요") so the orchestrator LLM no longer has to remember the copy
+  step (v8 RBAC cycle regression — the LLM forgot under load and fixer
+  re-tried the same broken patch). Harness-level observation, not prompt
+  control.
 
 These are plugged into the library via hooks (``resolve_role``,
 ``format_result``, ``on_tool_call_start``, ``on_tool_call_end``,
@@ -247,6 +255,33 @@ def _verifier_signals_success(result: "RoleInvocationResult") -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Length cap for the auto-prepended verifier evidence. Prevents a giant
+# stack trace + log dump from drowning the fixer's actual task description.
+# Empirically 8000 chars is enough for 5-10 pytest failures with full
+# tracebacks; if a verifier emits more we truncate with a marker so the
+# fixer at least knows there was overflow.
+_VERIFIER_EVIDENCE_PREPEND_CAP = 8000
+
+
+def _prepend_verifier_evidence(description: str, evidence: str) -> str:
+    """Glue the last verifier's evidence onto a fixer description.
+
+    Format intentionally matches what the orchestrator used to paste manually
+    so existing fixer prompts/templates that key off "## 직전 verifier 결과"
+    style headers still resonate. The "harness 자동 첨부" marker tells the
+    fixer (and any debugger reading transcripts) this came from the wrapper,
+    not the orchestrator LLM.
+    """
+    if len(evidence) > _VERIFIER_EVIDENCE_PREPEND_CAP:
+        evidence = evidence[:_VERIFIER_EVIDENCE_PREPEND_CAP] + "\n... (truncated)"
+    return (
+        "## 직전 verifier 결과 (harness 자동 첨부)\n"
+        f"{evidence}\n\n"
+        "----\n\n"
+        f"{description}"
+    )
+
+
 def build_task_tool(
     orchestrator: "Orchestrator",
     user_decisions: "UserDecisionsLog",
@@ -269,7 +304,18 @@ def build_task_tool(
 
     Fixer is NOT auto-advanced — fix success/failure is judged by the next
     verifier round, so the orchestrator LLM keeps the call.
+
+    On top of the library tool we add a thin StructuredTool wrapper that
+    auto-prepends the most recent verifier's evidence to any fixer
+    delegation. The library tool itself stays unchanged; the wrapper shares
+    the same args_schema and forwards to the inner ``func`` so LangGraph's
+    ``InjectedToolCallId`` plumbing keeps working.
     """
+
+    # Closure cache for the most-recent verifier evidence text. Mutable
+    # container (dict) so the inner ``_on_end`` closure can rebind without
+    # ``nonlocal``. ``_run_wrapped`` reads it on every fixer delegation.
+    _last_verifier_evidence: dict[str, str] = {"text": ""}
 
     def _on_start(role_name: str, description: str) -> None:
         task_id = _extract_task_id(description)
@@ -284,6 +330,17 @@ def build_task_tool(
         result: "RoleInvocationResult",
         status_tag: str,
     ) -> None:
+        # Cache verifier evidence regardless of COMPLETED/INCOMPLETE — fixer
+        # is most useful exactly when verifier surfaced something. We only
+        # skip on hard FAILED/ABORTED where ``_format_verifier_output`` may
+        # not have meaningful execute pairs to extract.
+        if role_name == "verifier" and status_tag in ("COMPLETED", "INCOMPLETE"):
+            try:
+                _last_verifier_evidence["text"] = _format_verifier_output(result)
+            except Exception:
+                log.exception("task_tool.verifier_evidence_cache_failed")
+                _last_verifier_evidence["text"] = ""
+
         if status_tag != "COMPLETED":
             return
         task_id = _extract_task_id(description)
@@ -315,7 +372,7 @@ def build_task_tool(
         parts.append(f"[Duration: {elapsed_s:.1f}s]")
         return "\n".join(parts)
 
-    return build_subagent_task_tool(
+    inner_tool = build_subagent_task_tool(
         orchestrator,
         resolve_role=resolve_role_name,
         format_result=_format_result,
@@ -329,6 +386,50 @@ def build_task_tool(
             "Use this when a task is complex enough to benefit from a dedicated "
             "agent with its own tool access and reasoning loop."
         ),
+    )
+
+    inner_func = inner_tool.func
+    if inner_func is None:  # pragma: no cover — minyoung_mah always sets func
+        return inner_tool
+
+    def _run_wrapped(
+        description: str,
+        agent_type: str = "auto",
+        tool_call_id: str = "",
+    ) -> str:
+        # Resolve the role *before* invoking the inner tool so we know whether
+        # to prepend evidence. ``resolve_role_name`` is the same function the
+        # inner tool uses internally — running it twice is cheap (keyword
+        # fast-path or a single fast-LLM classify call) and keeps the
+        # prepend decision local to this wrapper.
+        try:
+            resolved = resolve_role_name(agent_type, description)
+        except Exception:
+            log.exception("task_tool.resolve_role_failed_in_wrapper")
+            resolved = agent_type
+
+        if resolved == "fixer" and _last_verifier_evidence["text"]:
+            description = _prepend_verifier_evidence(
+                description, _last_verifier_evidence["text"]
+            )
+            log.info(
+                "task_tool.verifier_evidence_prepended",
+                evidence_chars=len(_last_verifier_evidence["text"]),
+            )
+
+        return inner_func(
+            description=description,
+            agent_type=agent_type,
+            tool_call_id=tool_call_id,
+        )
+
+    # Re-wrap with the same args_schema so InjectedToolCallId, name, and
+    # description all match what callers expect.
+    return StructuredTool.from_function(
+        func=_run_wrapped,
+        name=inner_tool.name,
+        description=inner_tool.description,
+        args_schema=inner_tool.args_schema,
     )
 
 

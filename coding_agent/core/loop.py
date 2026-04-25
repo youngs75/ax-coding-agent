@@ -320,8 +320,6 @@ ledger 기록은 ledger 에게 위임하세요.
 - task description 첫 줄에 `TASK-NN: ...` 을 포함하면 harness 가 자동으로
   in_progress/completed 마킹합니다. 수동 update 가 필요하면 ledger 에게
   "TASK-NN 을 <status> 로" 와 같은 task 로 위임하세요.
-- verifier 가 보고한 실패(에러 메시지·테스트명·스택)를 fixer description 에
-  그대로 복사하세요.
 
 {decomposition_section}
 
