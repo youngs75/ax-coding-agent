@@ -18,6 +18,12 @@ import structlog
 import litellm
 from langchain_openai import ChatOpenAI
 
+# LLM provider compat shims — deepseek thinking-mode 의 reasoning_content 가
+# multi-turn tool-calling 시나리오에서 보존되도록 langchain-openai 를
+# 모듈 로드 시 한 번 patch. import 순서 보존을 위해 ChatOpenAI import 직후.
+from coding_agent.llm_compat import apply_compat_patches as _apply_llm_compat
+_apply_llm_compat()
+
 from coding_agent.config import get_config
 
 log = structlog.get_logger(__name__)
