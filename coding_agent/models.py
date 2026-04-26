@@ -178,6 +178,7 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
 
     # 직접 프로바이더 모드 (기본)
     model_name = _strip_provider_prefix(raw_model_name)
+    extra_kwargs: dict[str, Any] = {}
 
     if cfg.provider == "dashscope":
         os.environ.setdefault("DASHSCOPE_API_KEY", cfg.dashscope_api_key)
@@ -187,6 +188,13 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         os.environ.setdefault("DEEPSEEK_API_KEY", cfg.deepseek_api_key)
         api_key = cfg.deepseek_api_key
         base_url = cfg.deepseek_base_url
+        # deepseek-v4 thinking-mode 의 reasoning_content 가 langchain-openai
+        # 1.2.x 의 ``_convert_chunk_to_generation_chunk`` 에서 *완전 무시* 됨
+        # → streaming 경로로 가면 AIMessage.additional_kwargs 에 보존 못 함
+        # → 다음 turn 에서 deepseek 가 400. 비-streaming 경로 (_create_chat_result,
+        # 우리 llm_compat patch 적용) 로 강제.
+        # ``disable_streaming=True`` 는 langchain-core 의 표준 옵션.
+        extra_kwargs["disable_streaming"] = True
     else:
         os.environ.setdefault("OPENROUTER_API_KEY", cfg.openrouter_api_key)
         api_key = cfg.openrouter_api_key
@@ -207,6 +215,7 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         temperature=temperature,
         timeout=cfg.llm_timeout,
         max_tokens=max_tokens,
+        **extra_kwargs,
     )
     _model_instance_cache[cache_key] = instance
     return instance

@@ -90,6 +90,7 @@ def apply_compat_patches() -> None:
         # ``model_extra`` 가 누락되는 경로 대비).
         result = _orig_create_chat_result(self, response, generation_info)
         choices = getattr(response, "choices", None) or []
+        rc_count = 0
         for i, choice in enumerate(choices):
             raw_msg = getattr(choice, "message", None)
             rc = _extract_reasoning(raw_msg)
@@ -98,6 +99,12 @@ def apply_compat_patches() -> None:
                 msg = getattr(gen, "message", None)
                 if msg is not None and hasattr(msg, "additional_kwargs"):
                     msg.additional_kwargs.setdefault("reasoning_content", rc)
+                    rc_count += 1
+        log.debug(
+            "llm_compat.create_chat_result_patched",
+            choices=len(choices),
+            reasoning_content_preserved=rc_count,
+        )
         return result
 
     _base._convert_dict_to_message = _patched_from_dict
