@@ -60,6 +60,15 @@ _ANTHROPIC_MODELS = ModelTier(
     fast="claude-haiku-4-5",             # memory extractor / classifier
 )
 
+# z.ai GLM — 직접 호출 (OpenAI 호환). reasoning_content 반환하는 thinking 모델.
+# coding 엔드포인트는 별도 base_url. 5.1-coding 은 무거우니 strong 만 사용.
+_ZAI_MODELS = ModelTier(
+    reasoning="glm-5.1",                 # planner / critic — 일반 5.1 (코딩보다 빠름)
+    strong="glm-5.1",                    # coder / fixer — 일반 5.1
+    default="glm-4.6",                   # reviewer — 안정·빠름
+    fast="glm-4.5-air",                  # memory extractor — 경량
+)
+
 # 추가 프로바이더 프리셋 (GLM, Nemotron 등 — .env에서 모델명 오버라이드로 사용)
 # 예: STRONG_MODEL=openrouter/z-ai/glm-5.1
 #     DEFAULT_MODEL=openrouter/nvidia/nemotron-3-super-120b-a12b
@@ -101,6 +110,18 @@ class Config:
     # Anthropic (Claude) — 표준 메시지 contract. langchain-anthropic 사용.
     anthropic_api_key: str = field(
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "")
+    )
+
+    # z.ai (GLM 공식 API) — 직접 호출 (OpenAI 호환).
+    # standard endpoint: https://api.z.ai/api/paas/v4
+    # coding endpoint:   https://api.z.ai/api/coding/paas/v4 (glm-*-coding 전용)
+    zai_api_key: str = field(
+        default_factory=lambda: os.getenv("ZAI_API_KEY", "")
+    )
+    zai_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "ZAI_BASE_URL", "https://api.z.ai/api/paas/v4"
+        )
     )
 
     # LiteLLM Proxy (Docker 하니스 모드)
@@ -195,6 +216,8 @@ class Config:
             base = _DEEPSEEK_MODELS
         elif self.provider == "anthropic":
             base = _ANTHROPIC_MODELS
+        elif self.provider == "zai":
+            base = _ZAI_MODELS
         else:
             base = _OPENROUTER_MODELS
         return ModelTier(
@@ -215,6 +238,8 @@ class Config:
             return self.deepseek_api_key
         if self.provider == "anthropic":
             return self.anthropic_api_key
+        if self.provider == "zai":
+            return self.zai_api_key
         return self.openrouter_api_key
 
 
