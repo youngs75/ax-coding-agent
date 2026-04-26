@@ -200,7 +200,39 @@ def sanitize_messages_for_llm(messages: list[Any]) -> list[Any]:
     if removed_count:
         log.info("tool_call_utils.sanitized_orphans", removed=removed_count)
 
-    return cleaned
+    # Anthropic strict ordering: tool_use AIMessage 직후 *immediately*
+    # ToolMessage 가 와야 함. 다른 메시지(SystemMessage / HumanMessage /
+    # 또 다른 tool_call AIMessage 등) 가 끼면 400 거부 (v15 회귀).
+    # 직후 ToolMessage 가 없는 AIMessage 의 tool_calls 는 텍스트로 강등.
+    final: list[Any] = []
+    i = 0
+    while i < len(cleaned):
+        msg = cleaned[i]
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            expected_ids = {tc_id(tc) for tc in msg.tool_calls if tc_id(tc)}
+            # 다음 메시지(들) 이 ToolMessage 이고 모든 expected_ids 가 채워지는지
+            seen_ids: set[str] = set()
+            j = i + 1
+            while j < len(cleaned) and isinstance(cleaned[j], ToolMessage):
+                tcid = getattr(cleaned[j], "tool_call_id", None)
+                if tcid:
+                    seen_ids.add(tcid)
+                j += 1
+            if seen_ids >= expected_ids:
+                final.append(msg)
+            else:
+                # 짝 부족 — tool_calls 강등 (anthropic 거부 방지)
+                final.append(AIMessage(content=msg.content or "[도구 호출 짝 부족 — 강등됨]"))
+                log.info(
+                    "tool_call_utils.tool_use_pair_demoted",
+                    expected=len(expected_ids),
+                    seen=len(seen_ids),
+                )
+        else:
+            final.append(msg)
+        i += 1
+
+    return final
 
 
 # ═══════════════════════════════════════════════════════════════

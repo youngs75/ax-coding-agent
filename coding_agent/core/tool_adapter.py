@@ -242,6 +242,24 @@ def invoke_with_tool_fallback(
                 model=model_name,
                 error=str(e)[:200],
             )
+            # ChatAnthropic 등 비-OpenAI 모델은 ChatOpenAI 기반 fallback 이
+            # 의미 없음 (api_key 미설정으로 즉시 실패). 같은 model 인스턴스
+            # 로 *bind_tools 없이* 재시도해 prompt-based 경로를 *모델별로
+            # 자연스럽게* 풀어준다. langchain-anthropic 은 native tool calling
+            # 안정적이라 이 경로에 도달하는 일이 거의 없다.
+            from langchain_anthropic import ChatAnthropic
+            if isinstance(model, ChatAnthropic):
+                # bind_tools 없는 raw anthropic 인스턴스 재구성 후 재시도.
+                # ax 가 모델 생성을 cache 하므로 model 인스턴스 자체를 재사용.
+                raw_model = ChatAnthropic(
+                    model=model.model,
+                    api_key=model.anthropic_api_key,
+                    timeout=model.default_request_timeout,
+                    max_tokens=model.max_tokens or 4096,
+                )
+                response = raw_model.invoke(messages)
+                return convert_text_response_to_tool_calls(response)
+
             # 프롬프트 기반 재시도: 시스템 프롬프트에 도구 스키마 추가 필요
             # → 이미 agent_node에서 tool_prompt_block이 추가됨
             from langchain_core.messages import SystemMessage

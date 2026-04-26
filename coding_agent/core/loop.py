@@ -484,7 +484,11 @@ class AgentLoop:
             return updates
 
         # ── Fix 1: Orchestrator message window ────────────────
-        _ORCH_MAX_MESSAGES = 60  # keep system + last N messages
+        # Anthropic 은 ``tool_use`` 다음 *immediately* ``tool_result`` 를
+        # 요구. trim 윈도우가 그 짝을 자르면 400 거부 (v15 회귀). 60 → 200
+        # 으로 늘려 대형 SubAgent 위임의 paired tool 호출도 윈도우 안에
+        # 머물게 한다. OpenAI 는 tolerant 라 영향 없음.
+        _ORCH_MAX_MESSAGES = 200  # keep system + last N messages
 
         def _trim_orchestrator_messages(messages: list) -> list:
             """Trim orchestrator message history.
