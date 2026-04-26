@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -262,6 +263,11 @@ def _verifier_signals_success(result: "RoleInvocationResult") -> bool:
 # fixer at least knows there was overflow.
 _VERIFIER_EVIDENCE_PREPEND_CAP = 8000
 
+# Fixer 재시도 경고 임계값 — 같은 TASK-NN 의 fixer 호출 횟수가 이 값에
+# 도달하면 strong warning 로그 발화. ProgressGuard 의 secondary repeat
+# 한도 (6) 절반 수준. 환경변수 ``AX_FIXER_RETRY_WARN`` 으로 override.
+_FIXER_RETRY_WARN_THRESHOLD = int(os.getenv("AX_FIXER_RETRY_WARN", "3"))
+
 
 def _prepend_verifier_evidence(description: str, evidence: str) -> str:
     """Glue the last verifier's evidence onto a fixer description.
@@ -317,12 +323,40 @@ def build_task_tool(
     # ``nonlocal``. ``_run_wrapped`` reads it on every fixer delegation.
     _last_verifier_evidence: dict[str, str] = {"text": ""}
 
+    # Fixer retry counter per TASK-NN. ProgressGuard aborts at 6 same-key
+    # repeats; we want the user to be *aware* well before the hard abort,
+    # so when the same task hits ``_FIXER_RETRY_WARN_THRESHOLD`` (default 3)
+    # consecutive fixer delegations the wrapper logs a high-visibility
+    # warning and (later) can trigger an HITL panel. v8 RBAC verifier↔fixer
+    # cycle 회귀 — 사용자가 6회 도달 후 abort 까지 기다리지 않고 *3 회 시점에
+    # 인지할 기회*.
+    _fixer_attempts: dict[str, int] = {}
+
     def _on_start(role_name: str, description: str) -> None:
         task_id = _extract_task_id(description)
         if task_id:
             _auto_advance_todo(
                 todo_store, task_id, "in_progress", todo_change_callback
             )
+        # Fixer 재시도 가드 — coder/verifier 같은 다른 role 호출이 끼어도
+        # 같은 task_id 의 fixer 누적 카운트가 임계값에 도달하는 시점을
+        # 검출. 카운트는 fixer 위임 시에만 증가, 다른 role 위임은 누적
+        # 무시.
+        if role_name == "fixer" and task_id:
+            count = _fixer_attempts.get(task_id, 0) + 1
+            _fixer_attempts[task_id] = count
+            if count >= _FIXER_RETRY_WARN_THRESHOLD:
+                log.warning(
+                    "task_tool.fixer_retry_warn",
+                    task_id=task_id,
+                    attempts=count,
+                    threshold=_FIXER_RETRY_WARN_THRESHOLD,
+                    progress_guard_abort_at=6,
+                    hint=(
+                        "같은 task 를 fixer 가 반복 시도 중. 환경/요구사항이 "
+                        "잘못 잡혔을 가능성 — 사용자 직접 검토 권장."
+                    ),
+                )
 
     def _on_end(
         role_name: str,
@@ -346,12 +380,22 @@ def build_task_tool(
         task_id = _extract_task_id(description)
         if not task_id:
             return
-        if role_name == "coder" or (
-            role_name == "verifier" and _verifier_signals_success(result)
-        ):
-            _auto_advance_todo(
-                todo_store, task_id, "completed", todo_change_callback
-            )
+        # v10 회귀: 기존 로직은 ``coder`` / ``verifier(success)`` 만 마킹.
+        # planner/fixer/researcher/reviewer 가 처리한 task 도 ledger 가
+        # ``in_progress`` 그대로 남아 graph 흐름이 깨졌다 (TASK-02 가
+        # planner 에게 위임돼서 PRD 작업했는데도 ◐ 영원). harness 가
+        # 모든 SubAgent role 의 COMPLETED 를 동일하게 다룬다.
+        # verifier 만 ``execute`` 실패 마커가 있으면 마킹 보류 (테스트가
+        # 실제 통과한 경우만 ``completed`` 로 옮기는 안전망 — 기존 동작).
+        if role_name == "verifier":
+            if not _verifier_signals_success(result):
+                return
+        # ledger / critic 은 task description 에 ``TASK-NN:`` 를 포함하지
+        # 않아 ``_extract_task_id`` 가 None 을 돌려준다 → 위에서 이미 return.
+        # 따라서 별도 가드 불필요.
+        _auto_advance_todo(
+            todo_store, task_id, "completed", todo_change_callback
+        )
 
     def _format_result(
         *,

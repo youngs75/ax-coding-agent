@@ -148,3 +148,34 @@ def test_metrics_preserved_in_result():
 ])
 def test_gate_level_label(level, label):
     assert gate_level_to_label(level) == label
+
+
+# ── B-2: verifier 미호출 검출 (sufficiency 가 *낮은 신뢰* 로 처리하는지) ──
+# sufficiency rule_gate 는 ``pytest_exit=None`` 을 "신호 없음" 으로 다뤄
+# HIGH 분기를 *막지는* 않지만, 사용자 요청이 코드 작성 + 테스트인데
+# verifier 가 한 번도 호출되지 않으면 (즉 pytest_exit 가 None 인데 todo
+# 가 모두 completed 라고 마킹된 상태) sufficiency 가 *충분히 검증된 것이
+# 아니다* 라는 증거를 critic 에게 넘겨야 한다.
+
+
+def test_high_when_pytest_signal_missing_is_intentional():
+    """pytest_exit=None + lint=None 은 *신호 없음* (verifier/reviewer 미호출).
+    이게 HIGH 로 직행하면 critic 도 안 도는데, 그건 코드 도메인의 정상
+    flow 라 의도된 동작. todo_ratio + prd_coverage 가 신뢰 신호."""
+    g = evaluate(
+        _signals(pytest_exit=None, lint_errors=None),
+        **_DEFAULTS,
+    )
+    assert g.level == "HIGH"
+    assert g.metrics["pytest_exit"] is None  # raw 신호 보존 — critic 이 알 수 있음
+
+
+def test_medium_when_prd_coverage_borderline_with_no_pytest():
+    """반대 케이스: pytest 신호 부재 + prd_coverage 보더라인 → MEDIUM 으로
+    critic 호출. critic 이 raw metrics 로 verifier 누락을 인지 가능."""
+    g = evaluate(
+        _signals(pytest_exit=None, lint_errors=None, prd_coverage=0.7),
+        **_DEFAULTS,
+    )
+    assert g.level == "MEDIUM"
+    assert g.metrics["pytest_exit"] is None  # critic 에 그대로 전달됨
