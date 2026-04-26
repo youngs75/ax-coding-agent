@@ -17,13 +17,23 @@ fi
 WORKSPACE_ABS="$(cd "$WORKSPACE" && pwd)"
 PROJECT_ID="$(printf '%s' "$WORKSPACE_ABS" | md5sum | cut -c1-12)"
 
-# Sufficiency loop env override — 호스트에 명시적으로 셋팅된 변수만
-# 컨테이너로 forward. 미설정이면 컨테이너 내부 default 사용 (sufficiency
-# 는 default ON, MAX_ITER=1).
+# Sufficiency loop / fixer guard / LLM provider env override — 호스트에
+# 명시적으로 셋팅된 변수만 컨테이너로 forward. 미설정이면 컨테이너 내부
+# default 사용. LLM provider 전환 (예: LLM_PROVIDER=deepseek + DEEPSEEK_API_KEY)
+# 도 호스트에서 export 하면 자동 적용.
 EXTRA_ENV=()
 for v in AX_SUFFICIENCY_ENABLED AX_SUFF_MAX_ITER \
          AX_SUFF_HIGH_TODO AX_SUFF_LOW_TODO \
-         AX_SUFF_HIGH_PRD AX_SUFF_LOW_PRD; do
+         AX_SUFF_HIGH_PRD AX_SUFF_LOW_PRD \
+         AX_FIXER_RETRY_WARN \
+         LLM_PROVIDER \
+         DEEPSEEK_API_KEY DEEPSEEK_BASE_URL \
+         DASHSCOPE_API_KEY DASHSCOPE_BASE_URL \
+         OPENROUTER_API_KEY \
+         LITELLM_PROXY_URL LITELLM_MASTER_KEY \
+         REASONING_MODEL STRONG_MODEL DEFAULT_MODEL FAST_MODEL \
+         ORCHESTRATOR_TIER \
+         LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY; do
   if [ -n "${!v}" ]; then
     EXTRA_ENV+=(-e "$v=${!v}")
   fi

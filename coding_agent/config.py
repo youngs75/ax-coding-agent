@@ -41,6 +41,15 @@ _OPENROUTER_MODELS = ModelTier(
     fast="openrouter/qwen/qwen3.5-flash-02-23",
 )
 
+# Deepseek V4 시리즈 — 두 모델만 (pro/flash). pro 가 깊은 추론·복잡 코드,
+# flash 가 빠른 분석·메모리 추출. tier 별 매핑은 ax 4-tier 의도에 맞춤.
+_DEEPSEEK_MODELS = ModelTier(
+    reasoning="deepseek-v4-pro",   # planner / critic — 깊이 우선
+    strong="deepseek-v4-pro",      # coder / fixer — tool calling + 복잡 코드 생성
+    default="deepseek-v4-flash",   # reviewer / researcher — 빠른 분석
+    fast="deepseek-v4-flash",      # memory extractor / classifier
+)
+
 # 추가 프로바이더 프리셋 (GLM, Nemotron 등 — .env에서 모델명 오버라이드로 사용)
 # 예: STRONG_MODEL=openrouter/z-ai/glm-5.1
 #     DEFAULT_MODEL=openrouter/nvidia/nemotron-3-super-120b-a12b
@@ -67,6 +76,16 @@ class Config:
     )
     openrouter_api_key: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_API_KEY", "")
+    )
+
+    # Deepseek (V4 라인업) 직접 호출 — OpenAI 호환 API
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")
+    )
+    deepseek_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
+        )
     )
 
     # LiteLLM Proxy (Docker 하니스 모드)
@@ -155,9 +174,12 @@ class Config:
                 default=os.getenv("DEFAULT_MODEL", "default"),
                 fast=os.getenv("FAST_MODEL", "fast"),
             )
-        base = (
-            _DASHSCOPE_MODELS if self.provider == "dashscope" else _OPENROUTER_MODELS
-        )
+        if self.provider == "dashscope":
+            base = _DASHSCOPE_MODELS
+        elif self.provider == "deepseek":
+            base = _DEEPSEEK_MODELS
+        else:
+            base = _OPENROUTER_MODELS
         return ModelTier(
             reasoning=os.getenv("REASONING_MODEL", base.reasoning),
             strong=os.getenv("STRONG_MODEL", base.strong),
@@ -172,6 +194,8 @@ class Config:
             return self.litellm_master_key
         if self.provider == "dashscope":
             return self.dashscope_api_key
+        if self.provider == "deepseek":
+            return self.deepseek_api_key
         return self.openrouter_api_key
 
 

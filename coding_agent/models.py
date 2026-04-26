@@ -177,6 +177,10 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         os.environ.setdefault("DASHSCOPE_API_KEY", cfg.dashscope_api_key)
         api_key = cfg.dashscope_api_key
         base_url = cfg.dashscope_base_url
+    elif cfg.provider == "deepseek":
+        os.environ.setdefault("DEEPSEEK_API_KEY", cfg.deepseek_api_key)
+        api_key = cfg.deepseek_api_key
+        base_url = cfg.deepseek_base_url
     else:
         os.environ.setdefault("OPENROUTER_API_KEY", cfg.openrouter_api_key)
         api_key = cfg.openrouter_api_key
