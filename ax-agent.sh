@@ -39,6 +39,15 @@ for v in AX_SUFFICIENCY_ENABLED AX_SUFF_MAX_ITER \
   fi
 done
 
+# 호스트 .env 를 컨테이너에 mount — 빌드 없이 .env 변경이 즉시 반영됨.
+# (Dockerfile 의 /app/.env 도 빌드 시점 호스트 값으로 박혀 있지만, ro mount
+# 가 그것을 덮어쓰므로 사용자 .env 가 우선.)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_MOUNT=()
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  ENV_MOUNT+=(-v "$SCRIPT_DIR/.env:/app/.env:ro")
+fi
+
 docker run -it --rm --network host \
   --name "$CONTAINER_NAME" \
   -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) \
@@ -46,4 +55,5 @@ docker run -it --rm --network host \
   "${EXTRA_ENV[@]}" \
   -v "$WORKSPACE":/workspace \
   -v ax-agent-memory:/app/memory_store \
+  "${ENV_MOUNT[@]}" \
   ax-coding-agent
