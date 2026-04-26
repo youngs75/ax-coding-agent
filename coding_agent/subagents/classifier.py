@@ -39,11 +39,14 @@ _ROLE_KEYWORDS: dict[str, list[str]] = {
         "테스트", "검증", "확인", "빌드", "실행",
         "test", "verify", "check", "build", "run test", "validate",
     ],
-    "ledger": [
-        "ledger", "todo", "write_todos", "update_todo",
-        "todo 등록", "todo 업데이트", "진행 마킹",
-    ],
+    # v22.2 — ledger SubAgent 폐기. todo 등록 키워드는 planner 로 라우팅
+    # (planner 가 write_todos 직접 호출).
 }
+
+# todo/ledger 관련 키워드를 planner 로 추가 (위 dict 정의 후 합성).
+_ROLE_KEYWORDS["planner"].extend([
+    "todo", "write_todos", "todo 등록", "todo 업데이트", "진행 마킹",
+])
 
 _KNOWN_ROLES = set(_ROLE_KEYWORDS.keys())
 
@@ -51,13 +54,12 @@ _CLASSIFY_PROMPT = """\
 You are a task classifier. Given a task description, determine the single best
 agent role from the following list:
 
-- planner: for tasks that require architecture planning, design decisions, or creating step-by-step plans
+- planner: for tasks that require architecture planning, design decisions, creating step-by-step plans, OR registering a decomposed task list into the todo ledger (planner owns write_todos as of v22.2)
 - coder: for tasks that require writing, generating, or implementing code
 - reviewer: for tasks that require reviewing, auditing, or critiquing existing code
 - fixer: for tasks that require debugging, fixing bugs, or resolving errors
 - researcher: for tasks that require searching, reading, or gathering information
 - verifier: for tasks that require running tests, checking builds, or verifying implementations
-- ledger: for tasks that only register a given task list in the todo ledger or flip a status — no content decisions
 
 Respond with ONLY the role name (one word, lowercase). No explanation.
 

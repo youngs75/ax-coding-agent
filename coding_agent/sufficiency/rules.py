@@ -54,9 +54,31 @@ def evaluate(
     todo_ratio = float(signals.get("todo_ratio", 1.0))
     prd_coverage = float(signals.get("prd_coverage", 1.0))
     artifacts_missing = list(signals.get("artifacts_missing") or [])
+    done_condition_violations = list(signals.get("done_condition_violations") or [])
 
     triggered: list[str] = []
     reasons: list[str] = []
+
+    # ── LOW: DONE_CONDITION.md 위반 (v22 #3) ──
+    # planner 가 작성한 DONE_CONDITION.md 의 forbidden patterns 가 워크스페이스
+    # 에 등장 = stack misalignment 등 *기획 위반*. v21 의 React 선택→Vue 작성
+    # 회귀 직접 차단. 다른 LOW 신호보다 *최우선* — 잘못된 방향으로 더 진행하지
+    # 않게 즉시 fixer 또는 planner 위임.
+    if done_condition_violations:
+        triggered.append(
+            f"done_condition_violations={done_condition_violations[:3]}"
+            + ("..." if len(done_condition_violations) > 3 else "")
+        )
+        reasons.append(
+            f"DONE_CONDITION 위반 ({len(done_condition_violations)}건): "
+            f"{', '.join(done_condition_violations[:3])}"
+        )
+        return CodeQualityGateResult(
+            level="LOW",
+            triggered_signals=triggered,
+            metrics=dict(signals),
+            reason="; ".join(reasons),
+        )
 
     # ── LOW: 사용자 요청 산출물 누락 (옵션 C) ──
     # SubAgent 가 COMPLETED 라고 주장해도 사용자가 명시한 산출물 (PRD/SPEC/
@@ -157,6 +179,31 @@ def heuristic_verdict_for_low(
     todo_ratio = float(metrics.get("todo_ratio", 1.0))
     prd_coverage = float(metrics.get("prd_coverage", 1.0))
     artifacts_missing = list(metrics.get("artifacts_missing") or [])
+    done_condition_violations = list(metrics.get("done_condition_violations") or [])
+
+    # v22 #3 — DONE_CONDITION 위반은 다른 신호보다 *최우선*. 잘못된 방향으로
+    # 더 진행하지 못하게 즉시 fixer 위임 (필요 시 planner replan 도 가능하나
+    # 우선 fixer 가 구체적 위반 파일 제거/교체로 시도).
+    if done_condition_violations:
+        violations_label = "; ".join(done_condition_violations[:5])
+        if len(done_condition_violations) > 5:
+            violations_label += f"; ... (외 {len(done_condition_violations) - 5}건)"
+        return CriticVerdict(
+            verdict="retry_lookup",
+            target_role="fixer",
+            reason=(
+                f"DONE_CONDITION 위반 — planner 가 합의한 forbidden patterns 가 "
+                f"워크스페이스에 등장 ({len(done_condition_violations)}건). "
+                f"기획 위반은 더 진행하기 전에 제거 필요."
+            ),
+            feedback_for_retry=(
+                f"DONE_CONDITION.md 의 forbidden patterns 가 다음 파일에서 "
+                f"발견됨: {violations_label}. fixer 에게 위 파일들을 *삭제* 하고 "
+                f"DONE_CONDITION 의 framework 선택과 일치하는 형태로 *재작성* "
+                f"하도록 위임하라. 예: Vue 컴포넌트가 발견됐고 React 가 선택됐으면, "
+                f"동일 기능의 React 컴포넌트로 교체."
+            ),
+        )
 
     # 산출물 누락이 가장 강한 신호 — 다른 신호보다 우선 처리.
     if artifacts_missing:

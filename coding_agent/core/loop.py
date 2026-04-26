@@ -86,8 +86,9 @@ def _task_id_extractor(tool_name: str, tool_args: dict) -> str | None:
 # v2 E2E (2026-04-22) exposed — planner returned 8 coarse tasks, orchestrator
 # went straight to coder without user review, and coarse tasks led coder to
 # decide completion granularity unilaterally. Ledger/planner/researcher are
-# NOT gated — ledger needs to register, planner may need re-delegation, and
-# researcher/read-only exploration is safe.
+# NOT gated — planner may need re-delegation, and researcher/read-only
+# exploration is safe. (v22.2: ledger SubAgent 폐기 — planner 가 write_todos
+# 직접 호출하므로 ledger gating 항목 자체가 사라짐.)
 _GATED_ROLES = frozenset({"coder", "verifier", "fixer", "reviewer"})
 
 
@@ -96,7 +97,7 @@ def _requires_decomposition_gate(
     todo_counts: dict[str, int],
     confirmed: bool,
 ) -> tuple[bool, str | None]:
-    """Decide whether to block before a non-ledger task delegation.
+    """Decide whether to block before a gated task delegation.
 
     Returns ``(gate_needed, blocked_tool_call_id)``. The id points at the
     first offending ``task`` tool_call so the gate node can respond with a
@@ -164,8 +165,8 @@ def _build_decomposition_interrupt_payload(
                 "allow_other": False,
                 "options": [
                     {"label": "이대로 진행", "description": "현재 분해 그대로 위임 시작"},
-                    {"label": "더 세분화", "description": "ledger 비우고 planner 에게 더 작은 단위로 재분해 요청"},
-                    {"label": "더 통합", "description": "ledger 비우고 planner 에게 더 큰 단위로 재분해 요청"},
+                    {"label": "더 세분화", "description": "todo 비우고 planner 에게 더 작은 단위로 재분해 요청"},
+                    {"label": "더 통합", "description": "todo 비우고 planner 에게 더 큰 단위로 재분해 요청"},
                 ],
             }
         ],
@@ -306,22 +307,20 @@ def _render_ledger_snapshot(todo_store: "TodoStore") -> str:
 SYSTEM_PROMPT = """당신은 Orchestrator AI Coding Agent입니다.
 직접 코드를 작성하거나 작업을 분해·설계하지 않고, task 도구로 전문
 SubAgent에게 위임합니다. orchestrator 의 책임은 SubAgent 간 조율과
-진행 관리입니다 — 요구사항 분석·task 분해·산출물 설계는 planner 에게,
-ledger 기록은 ledger 에게 위임하세요.
+진행 관리입니다 — 요구사항 분석·task 분해·todo 등록·산출물 설계는
+모두 planner 에게 위임하세요.
 
 ## 사용 가능한 도구
 - read_file / glob_files / grep: 결과물 확인용
-- task: SubAgent 위임 (코드 작성/수정/실행, ledger 기록 모두 이 경로)
+- task: SubAgent 위임 (코드 작성/수정/실행 모두 이 경로)
 
 ## SubAgent 역할
-- planner: 요구사항 분석, PRD/SPEC 등 기획 산출물 작성, task 분해 (분해 강도는 ledger 등록 후 사용자 확인 게이트가 결정)
+- planner: 요구사항 분석, PRD/SPEC 등 기획 산출물 작성, task 분해, **todo 초기 등록 (write_todos 직접 호출)**
 - coder: 코드 작성·수정·실행
 - verifier: 테스트/빌드 검증 (수정 금지)
 - fixer: 지정된 실패 지점을 타겟팅해 수정
 - reviewer: 코드 품질 검토
 - researcher: 코드/문서 탐색
-- ledger: planner 가 돌려준 분해 결과를 todo ledger 에 등록하거나, 특정
-  task 의 상태를 수동으로 업데이트. 내용을 생성하지 않는 registrar.
 
 ## 원칙
 - 사용자가 요청하지 않은 기능·산출물·도구를 임의로 추가하지 마세요.
@@ -335,14 +334,18 @@ ledger 기록은 ledger 에게 위임하세요.
   어떤 산출물을 먼저 만들지는 모두 orchestrator인 당신이 판단합니다.
   harness 는 특정 워크플로·산출물 형식·섹션 구조를 강제하지 않습니다.
 
-## Todo ledger 운용
-- ledger 기록은 orchestrator 가 직접 하지 않고 ledger SubAgent 에게 위임
-  합니다. 초기 등록은 planner 가 돌려준 분해 결과를 ledger 에게 넘겨
-  write_todos 로 등록하도록 하세요.
-- 등록 순서 = 작업 순서. pending 첫 항목부터 진행하세요.
+## Todo 운용 (v22.2 변경)
+- todo 초기 등록은 **planner 가 직접** write_todos 로 합니다. orchestrator 는
+  planner 위임 시 "task 분해 후 write_todos 로 등록까지" 명시하세요.
+- 등록 순서 = 작업 순서. pending 첫 항목부터 coder 에게 위임하세요.
 - task description 첫 줄에 `TASK-NN: ...` 을 포함하면 harness 가 자동으로
-  in_progress/completed 마킹합니다. 수동 update 가 필요하면 ledger 에게
-  "TASK-NN 을 <status> 로" 와 같은 task 로 위임하세요.
+  in_progress/completed 마킹합니다 (auto-advance). 별도 ledger 호출 불필요.
+- v22.1 부터 coder COMPLETED 후 자동으로 verifier 가 호출되며, 실패 시
+  fixer 사이클 (최대 3회) 이 task_tool 안에서 atomic 으로 진행됩니다.
+  결과 본문에 `[AUTO_VERIFY_PASSED]` 또는 `[AUTO_VERIFY_FAILED]` 마커가
+  붙습니다. FAILED 면 그 task 만 사용자 검토 영역으로 두고 다음 pending
+  task 로 진행하세요 — fixer 를 *추가로* 호출하면 hard-cap 에 걸려 차단
+  됩니다.
 
 ## 종료
 - 아래 ledger snapshot 의 pending 과 in_progress 가 모두 0 이면, 즉시

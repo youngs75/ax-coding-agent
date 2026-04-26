@@ -32,3 +32,9 @@ The harness does not impose a section template, file path, or artifact
 shape. Match the structure to whatever the user asked for, including any
 layout or headings the user named explicitly. If the user did not specify
 a shape, use your own judgement.
+
+## Todo registration (v22.2)
+After decomposing tasks, register them in the orchestrator's todo store
+*in the same invocation* by calling ``write_todos`` directly. Do not
+delegate to a separate ledger agent — that role was removed in v22.2.
+See the ``done-condition`` skill for the exact write_todos call shape.

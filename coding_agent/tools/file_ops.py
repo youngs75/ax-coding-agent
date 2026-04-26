@@ -127,9 +127,123 @@ _PLATFORM_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# v22 #4 — TDD pre-hook: 코드 파일 작성 전 대응 테스트 파일 존재 확인.
+# 환경변수 ``AX_DISABLE_TDD_HOOK=1`` 로 비활성화 (TDD 가 부적합한 프로젝트
+# — 예: PoC, prototyping). Default = 활성.
+_TDD_HOOK_ENABLED = os.getenv("AX_DISABLE_TDD_HOOK", "").strip() not in ("1", "true", "yes")
 
-def _check_write_policy(path_str: str) -> str | None:
-    """Return an error message if *path_str* violates write policy, else None."""
+# TDD 적용 대상 코드 확장자. md/json/yaml/css/html/sql 등 *비실행* 파일은 예외.
+_TDD_CHECKED_EXTENSIONS: set[str] = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".vue", ".svelte",
+    ".go", ".rs", ".java", ".kt", ".rb", ".php", ".cs", ".swift",
+}
+
+# 워크스페이스 루트 마커 — write 대상 파일에서 위로 올라가며 검색.
+_WORKSPACE_ROOT_MARKERS: tuple[str, ...] = (
+    ".ax-agent",
+    ".git",
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "DONE_CONDITION.md",
+)
+
+# 검색에서 항상 제외할 디렉토리 (vendor, build artifacts, harness 내부)
+_TDD_SKIP_DIRS: set[str] = {
+    ".git", ".ax-agent", "node_modules", "__pycache__", ".venv",
+    "venv", "dist", "build", ".pytest_cache", "memory_store",
+    ".pnpm-store", ".turbo", ".next", "target", "vendor",
+}
+
+# 파일이 *테스트 파일* 인지 식별 — 경로 어디든 이 마커가 있으면 test 로 분류.
+_TEST_PATH_MARKERS: tuple[str, ...] = (
+    "/tests/", "/test/", "/__tests__/", "/spec/", "/specs/",
+    ".test.", ".spec.", "_test.", "_spec.",
+)
+
+
+def _is_test_file_path(p: Path) -> bool:
+    """경로가 test/spec 파일이면 True."""
+    s = str(p).replace("\\", "/").lower()
+    if any(marker in s for marker in _TEST_PATH_MARKERS):
+        return True
+    name = p.name.lower()
+    if name.startswith("test_") or name.startswith("spec_"):
+        return True
+    return False
+
+
+def _find_workspace_root(target: Path) -> Path:
+    """target 파일 위로 5단계까지 올라가며 워크스페이스 루트 탐색."""
+    cur = target.parent
+    for _ in range(6):
+        for marker in _WORKSPACE_ROOT_MARKERS:
+            if (cur / marker).exists():
+                return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    # 못 찾으면 target.parent 를 root 로 간주 (보수)
+    return target.parent
+
+
+def _workspace_has_any_tests(root: Path) -> bool:
+    """워크스페이스에 테스트 파일이 *하나라도* 존재하면 True.
+
+    아무 테스트도 없으면 boot phase 로 보고 TDD hook 을 발동하지 않는다
+    (첫 파일은 어떻게든 만들어야 하므로 닭-달걀 회피).
+    """
+    if not root.exists():
+        return False
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(p in _TDD_SKIP_DIRS for p in path.parts):
+                continue
+            if _is_test_file_path(path):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_corresponding_test(target: Path, root: Path) -> bool:
+    """target 의 *동일 모듈* 테스트 파일이 워크스페이스에 존재하는지.
+
+    매칭 기준:
+    - target 의 stem (확장자 제거한 basename) 이 어떤 test 파일 경로/이름에
+      포함되어 있으면 매치.
+    - 예: ``src/auth/jwt.service.ts`` → ``tests/auth/jwt.service.test.ts`` 매치.
+    """
+    stem = target.stem  # 'jwt.service' from 'jwt.service.ts'
+    if not stem or len(stem) < 2:
+        return True  # 짧은 stem 은 false-positive 위험 — 통과
+    stem_lower = stem.lower()
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(p in _TDD_SKIP_DIRS for p in path.parts):
+                continue
+            if not _is_test_file_path(path):
+                continue
+            if stem_lower in str(path).lower():
+                return True
+    except Exception:
+        # 파일시스템 오류 시 통과 (보수적)
+        return True
+    return False
+
+
+def _check_write_policy(path_str: str, content: str = "") -> str | None:
+    """Return an error message if *path_str* violates write policy, else None.
+
+    ``content`` 는 v22 #4 의 향후 확장용 (e.g., test 파일이면 assert 가
+    있는지 검사). 현재는 사용 안 함.
+    """
     name = Path(path_str).name
     if _PLATFORM_SUFFIX_RE.search(name):
         return (
@@ -138,13 +252,35 @@ def _check_write_policy(path_str: str) -> str | None:
             "예: `LoginPage.tsx` 하나 + `@media (max-width: 768px)`. "
             "별도 -mobile/-desktop/-tablet 파일을 만들지 마세요."
         )
-    return None
+
+    # v22 #4 — TDD pre-hook
+    if not _TDD_HOOK_ENABLED:
+        return None
+    target = Path(path_str)
+    if target.suffix.lower() not in _TDD_CHECKED_EXTENSIONS:
+        return None  # 비-코드 파일 (md/json/yaml/css/sql 등) 통과
+    if _is_test_file_path(target):
+        return None  # 테스트 파일 자체 통과
+    root = _find_workspace_root(target)
+    if not _workspace_has_any_tests(root):
+        return None  # boot phase — 첫 파일은 통과
+    if _has_corresponding_test(target, root):
+        return None  # 대응 테스트 존재 → OK
+    return (
+        f"REJECTED: TDD 위반 — 코드 파일 작성 전에 테스트 파일이 필요합니다 "
+        f"({target.name}). 동일 모듈의 테스트 파일 ({target.stem}.test.* / "
+        f"{target.stem}.spec.* / test_{target.stem}.* 등) 이 워크스페이스에 "
+        f"존재하지 않습니다. 먼저 테스트 파일을 작성한 뒤 (Red 단계), 그 "
+        f"테스트를 통과시키는 코드를 작성하세요 (Green 단계). "
+        f"TDD 가 부적합한 작업이면 환경변수 AX_DISABLE_TDD_HOOK=1 로 "
+        f"비활성화 가능."
+    )
 
 
 @tool("write_file", args_schema=WriteFileInput)
 def write_file(path: str, content: str) -> str:
     """새 파일을 생성하거나 기존 파일을 덮어쓴다."""
-    policy_error = _check_write_policy(path)
+    policy_error = _check_write_policy(path, content)
     if policy_error is not None:
         return policy_error
 

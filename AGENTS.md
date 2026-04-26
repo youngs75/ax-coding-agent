@@ -151,6 +151,20 @@ make docker-down
 ax-specific tier fallback + dangerous-path SafeStop + Watchdog 은 `resilience_compat.py`
 에 남아 최상위 LangGraph `handle_error` 노드가 계속 사용 (plan §결정 2).
 
+### 4. Artifact Verification (v22 부터, 6번째 책임)
+v21 회귀 — coder 가 파일 0개 작성하고 `update_todo(completed)` 호출, reviewer/verifier
+0회 호출, 20/20 "완료" vs 실제 8개 파일 — 후 도입. 자세한 자료:
+`.ai/research/harness-insights-2026-04-26.md`.
+
+- **Auto-verifier chain** (`tools/task_tool.py` `_auto_verify_chain`) — coder COMPLETED 직후
+  *자동* verifier+fixer 사이클 (최대 3회). orchestrator LLM 의 호출 결정 의존 폐기.
+- **DONE_CONDITION.md** (`skills/planner/done-condition.md` + `sufficiency/signals.py`) —
+  planner 가 framework choice + forbidden patterns + required tests 를 mechanically-checkable
+  파일로 명문화. sufficiency.gate 가 워크스페이스와 *기계적*으로 대조해 stack misalignment
+  즉시 LOW band.
+- **TDD pre-hook** (`tools/file_ops.py` `_check_write_policy`) — 코드 파일 작성 전
+  대응 테스트 파일 존재 확인. 환경변수 `AX_DISABLE_TDD_HOOK=1` 로 비활성화 가능.
+
 ## 4-Tier 모델 체계
 | 티어 | 용도 | 환경변수 |
 |------|------|----------|

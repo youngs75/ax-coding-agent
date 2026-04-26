@@ -125,6 +125,20 @@ _VERIFIER_FORBIDDEN_HEADINGS = (
     "## Recommendations",
 )
 
+# v22 #2 — auto-verify cycle bounds (Decision D: Soft 3 → Hard escalate)
+# coder COMPLETED 이후 verifier 를 *자동* 1회 실행. verifier 가 실패 마커를
+# 보고하면 fixer 를 호출하고 verifier 를 재실행. 최대 _AUTO_VERIFY_MAX_ATTEMPTS
+# 회 verifier 시도 (= 첫 1회 + 재시도 2회). 모두 실패 시 결과 본문에
+# AUTO_VERIFY_FAILED 마커를 붙여 orchestrator/critic 에 escalate 신호.
+#
+# v21 회귀의 직접 처방 — orchestrator LLM 이 reviewer/verifier 호출을 잊는
+# 문제 (28 SubAgent 호출 중 verifier 0회) 를 *결정론적으로* 차단한다.
+# Anthropic 의 "GANs for prose" 진단 + Osmani 의 generator/evaluator 분리
+# 권고 + Codex 팀의 "invariants mechanical" 패턴의 합성.
+_AUTO_VERIFY_MAX_ATTEMPTS = int(os.getenv("AX_AUTO_VERIFY_ATTEMPTS", "3"))
+_AUTO_VERIFY_FAILED_MARKER = "[AUTO_VERIFY_FAILED]"
+_AUTO_VERIFY_PASSED_MARKER = "[AUTO_VERIFY_PASSED]"
+
 
 def _sanitize_verifier_text(text: str) -> str:
     """Drop instruction-style markdown sections that would steer the top-level
@@ -267,6 +281,187 @@ _VERIFIER_EVIDENCE_PREPEND_CAP = 8000
 # 도달하면 strong warning 로그 발화. ProgressGuard 의 secondary repeat
 # 한도 (6) 절반 수준. 환경변수 ``AX_FIXER_RETRY_WARN`` 으로 override.
 _FIXER_RETRY_WARN_THRESHOLD = int(os.getenv("AX_FIXER_RETRY_WARN", "3"))
+
+# v22.1 — outer loop bound. 같은 TASK-NN 의 fixer 호출이 hard cap 에 도달하면
+# task_tool 자체가 inner_func 호출 *전* 에 short-circuit 으로 INCOMPLETE 반환.
+# 이게 없으면 ProgressGuard 의 session-level safe_stop 까지 가서 *전체* 세션이
+# 종료됨 (v22 회귀, 2026-04-26 — TASK-1.1 fixer 4회 후 stall_stop, TASK-1.2~13
+# 도 같이 죽음). hard cap 은 task-level 격리 — 한 task 만 손해, 나머지 진행.
+# Default 4 = WARN 임계값(3) 다음 1회 + ProgressGuard frequency=3 도달 전.
+_FIXER_HARD_CAP = int(os.getenv("AX_FIXER_HARD_CAP", "4"))
+
+
+def _build_auto_verifier_description(
+    coder_description: str,
+    coder_result: str,
+) -> str:
+    """v22 #2: orchestrator 가 보내준 coder description 을 verifier task 로 변환.
+
+    verifier 가 실제 산출물을 *기계적*으로 확인하도록 명확한 지시:
+    - read_file/glob_files 로 파일이 실제 작성됐는지 점검
+    - 테스트 명령(pytest/npm test/jest 등)이 있으면 execute 로 실행
+    - exit code 와 함께 결과 보고
+
+    coder 결과 본문은 *말미 1500자만* 잘라 첨부 — 너무 길면 verifier 가
+    원본 task 가 아닌 *coder 자가 보고* 만 보고 자가검증으로 빠진다
+    ("GANs for prose" 회피).
+    """
+    coder_tail = coder_result[-1500:] if len(coder_result) > 1500 else coder_result
+    return (
+        "## verify TASK 산출물 (harness auto-invoke, v22 #2)\n\n"
+        "### 원 task description (coder 가 받은 것)\n"
+        f"{coder_description[:800]}\n\n"
+        "### coder 보고 결과 (자가 보고 — 그대로 믿지 말 것)\n"
+        f"{coder_tail}\n\n"
+        "### 검증 지시 (반드시 결정론적 증거로 답할 것)\n"
+        "1. coder 가 *실제로* 작성/수정했다고 주장하는 파일을 read_file 또는 "
+        "glob_files 로 읽어 존재 + 내용 확인.\n"
+        "2. 작성된 파일이 task 의 spec 을 만족하는지 점검.\n"
+        "3. 테스트가 있으면 execute 로 실행 (pytest / npm test / jest / "
+        "vitest / cargo test / go test 등 — 프로젝트 종류에 맞게).\n"
+        "4. lint/build 명령이 있으면 함께 실행.\n"
+        "5. 모든 execute 결과를 그대로 보고. exit code 0 = 통과, "
+        "그 외 = 실패.\n\n"
+        "검증 결과를 자연어로 *해석*하지 말 것 — 기계가 읽을 수 있게 "
+        "execute 출력 그대로."
+    )
+
+
+def _build_auto_fixer_description(
+    coder_description: str,
+    verifier_result: str,
+) -> str:
+    """v22 #2: verifier 실패 후 fixer task description.
+
+    `_prepend_verifier_evidence` 가 별도 wrapper 에서 verifier 결과를 prepend
+    하지만, auto-chain 에서는 inner_func 직접 호출이라 wrapper 를 거치지
+    않는다 → 여기서 직접 verifier 결과를 본문에 박아둔다.
+    """
+    verifier_tail = (
+        verifier_result[-2500:] if len(verifier_result) > 2500 else verifier_result
+    )
+    return (
+        "## fix TASK (harness auto-invoke, v22 #2)\n\n"
+        "### 원 task description (coder 가 받았던 것)\n"
+        f"{coder_description[:800]}\n\n"
+        "### 직전 verifier 실패 증거\n"
+        f"{verifier_tail}\n\n"
+        "### fix 지시\n"
+        "verifier 가 보고한 실패의 *근본 원인*을 고친다. workaround 금지. "
+        "edit_file/write_file 로 코드 수정만 수행 — 테스트 실행은 다음 "
+        "verifier 사이클이 담당."
+    )
+
+
+def _auto_verify_chain(
+    *,
+    inner_func: Any,
+    coder_description: str,
+    coder_result: str,
+    base_tool_call_id: str,
+) -> str:
+    """v22 #2 — coder COMPLETED 직후 verifier+fixer 사이클 자동 실행.
+
+    Decision D (Soft 3 → Hard escalate):
+      - verifier 1차 → PASS 면 종료
+      - FAIL 이면 fixer 호출 → verifier 2차 → PASS 면 종료
+      - 또 FAIL 이면 fixer 2차 → verifier 3차
+      - 3차도 FAIL 이면 ``[AUTO_VERIFY_FAILED]`` 마커 부착 후 반환
+
+    inner_func 의 ``tool_call_id`` 는 stable 하게 유도 (LangGraph replay
+    cache 가 같은 값으로 hit 하도록). orchestrator LLM 은 이 모든 사이클을
+    *하나의* task() 호출 결과로 인식.
+    """
+    cycles_log: list[str] = []
+    verifier_desc = _build_auto_verifier_description(coder_description, coder_result)
+    last_verifier_text = ""
+
+    for attempt in range(_AUTO_VERIFY_MAX_ATTEMPTS):
+        verifier_id = f"{base_tool_call_id}-auto-verify-{attempt}"
+        log.info(
+            "task_tool.auto_verify.start",
+            attempt=attempt + 1,
+            max_attempts=_AUTO_VERIFY_MAX_ATTEMPTS,
+        )
+        try:
+            verifier_text = inner_func(
+                description=verifier_desc,
+                agent_type="verifier",
+                tool_call_id=verifier_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("task_tool.auto_verify.invoke_failed", attempt=attempt + 1)
+            cycles_log.append(
+                f"### auto-verify attempt {attempt + 1} → INVOCATION ERROR\n{exc}"
+            )
+            break
+
+        last_verifier_text = verifier_text
+        cycles_log.append(
+            f"### auto-verify attempt {attempt + 1}\n{verifier_text}"
+        )
+
+        # PASS 판정: verifier 가 COMPLETED + execute 실패 마커 없음.
+        # _verifier_signals_success 은 RoleInvocationResult 객체를 받지만
+        # 여기선 이미 _format_result 가 통과한 *문자열* 만 가짐 →
+        # 동일한 마커 ([exit code:, [TIMEOUT], REJECTED:, Error:) 를
+        # 본문에서 검사한다. (signals.py 의 _extract_pytest_exit 가 같은
+        # 로직을 사용 — 일관성 유지.)
+        if "[Task COMPLETED" not in verifier_text:
+            # verifier 자체가 INCOMPLETE/FAILED — 다음 사이클 진행
+            pass
+        elif not any(
+            marker in verifier_text for marker in _EXECUTE_FAILURE_MARKERS
+        ):
+            log.info(
+                "task_tool.auto_verify.passed",
+                attempt=attempt + 1,
+            )
+            return (
+                f"{coder_result}\n\n"
+                f"## ↳ harness auto-verifier {_AUTO_VERIFY_PASSED_MARKER} "
+                f"(v22 #2, attempt {attempt + 1}/{_AUTO_VERIFY_MAX_ATTEMPTS})\n"
+                f"{verifier_text}"
+            )
+
+        # 마지막 사이클이면 fixer 호출 안 함
+        if attempt >= _AUTO_VERIFY_MAX_ATTEMPTS - 1:
+            break
+
+        # fixer 호출
+        fixer_desc = _build_auto_fixer_description(coder_description, verifier_text)
+        fixer_id = f"{base_tool_call_id}-auto-fix-{attempt}"
+        try:
+            fixer_text = inner_func(
+                description=fixer_desc,
+                agent_type="fixer",
+                tool_call_id=fixer_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("task_tool.auto_verify.fixer_failed", attempt=attempt + 1)
+            cycles_log.append(
+                f"### auto-fix attempt {attempt + 1} → INVOCATION ERROR\n{exc}"
+            )
+            break
+
+        cycles_log.append(f"### auto-fix attempt {attempt + 1}\n{fixer_text}")
+
+        # 다음 verifier task description 에 직전 fixer 결과 첨부 (재검증 컨텍스트)
+        verifier_desc = _build_auto_verifier_description(
+            coder_description, f"{coder_result}\n\n## fixer 변경\n{fixer_text}"
+        )
+
+    # 모든 사이클 소진
+    log.warning(
+        "task_tool.auto_verify.exhausted",
+        attempts=_AUTO_VERIFY_MAX_ATTEMPTS,
+    )
+    return (
+        f"{coder_result}\n\n"
+        f"## ↳ harness auto-verifier {_AUTO_VERIFY_FAILED_MARKER} "
+        f"(v22 #2, {_AUTO_VERIFY_MAX_ATTEMPTS}회 시도 후 실패 — critic 검토 권장)\n"
+        + "\n\n".join(cycles_log)
+    )
 
 
 def _prepend_verifier_evidence(description: str, evidence: str) -> str:
@@ -452,6 +647,31 @@ def build_task_tool(
             log.exception("task_tool.resolve_role_failed_in_wrapper")
             resolved = agent_type
 
+        # v22.1 — outer loop bound. orchestrator 가 같은 TASK-NN 에 fixer 를
+        # 무한 재호출하는 패턴 (v22 회귀) 차단. inner_func 호출 *전* 에
+        # 짧은 INCOMPLETE 결과 반환 → orchestrator 가 다음 task 로 진행하도록.
+        # 단, _on_start 의 _fixer_attempts 카운터는 inner_func 호출 시점에
+        # 증가 → 여기선 *현재* 카운터를 보고 *다음 호출이 hard cap 도달 여부*
+        # 판단. 즉 이미 cap 도달 = 직전 호출이 cap-1 회 = 이번이 cap+1 회.
+        if resolved == "fixer":
+            task_id_for_cap = _extract_task_id(description)
+            if task_id_for_cap and _fixer_attempts.get(task_id_for_cap, 0) >= _FIXER_HARD_CAP:
+                log.warning(
+                    "task_tool.fixer_hard_cap_reached",
+                    task_id=task_id_for_cap,
+                    attempts=_fixer_attempts[task_id_for_cap],
+                    cap=_FIXER_HARD_CAP,
+                )
+                return (
+                    f"[Task INCOMPLETE — fixer]\n"
+                    f"⚠ fixer for {task_id_for_cap} hard-capped after "
+                    f"{_fixer_attempts[task_id_for_cap]} attempts (cap={_FIXER_HARD_CAP}).\n"
+                    f"이 task 는 사용자 검토가 필요합니다 (자동 수정 한계 도달).\n"
+                    f"**다음 pending task 로 진행하세요. 이 task 에 대해 fixer 를 "
+                    f"다시 호출하지 마세요** — 같은 무한 루프 발생.\n"
+                    f"[Duration: 0.0s]"
+                )
+
         if resolved == "fixer" and _last_verifier_evidence["text"]:
             description = _prepend_verifier_evidence(
                 description, _last_verifier_evidence["text"]
@@ -461,11 +681,24 @@ def build_task_tool(
                 evidence_chars=len(_last_verifier_evidence["text"]),
             )
 
-        return inner_func(
+        result_text = inner_func(
             description=description,
             agent_type=agent_type,
             tool_call_id=tool_call_id,
         )
+
+        # v22 #2 — auto-chain verifier+fixer after coder COMPLETED.
+        # orchestrator LLM 이 verifier 호출을 잊는 v21 회귀를 차단한다.
+        # 자세한 동기는 _AUTO_VERIFY_* 상수 위 주석 참조.
+        if resolved == "coder" and "[Task COMPLETED" in result_text:
+            result_text = _auto_verify_chain(
+                inner_func=inner_func,
+                coder_description=description,
+                coder_result=result_text,
+                base_tool_call_id=tool_call_id,
+            )
+
+        return result_text
 
     # Re-wrap with the same args_schema so InjectedToolCallId, name, and
     # description all match what callers expect.

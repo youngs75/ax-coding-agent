@@ -256,6 +256,19 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         os.environ.setdefault("DASHSCOPE_API_KEY", cfg.dashscope_api_key)
         api_key = cfg.dashscope_api_key
         base_url = cfg.dashscope_base_url
+        # qwen3.5-* / qwen3.6-* 는 dual-mode — default 가 thinking on. fast/default
+        # tier 는 즉답성·비용 모두 thinking off 이 유리. probe (2026-04-26)에서
+        # "hi" 한 마디에 qwen3.5-flash 가 539 reasoning_tokens 소모 확인.
+        # reasoning/strong tier 는 thinking 유지 (planner/coder 추론 가치).
+        #
+        # Qwen 의 enable_thinking 은 비표준 OpenAI 파라미터 → openai SDK 의
+        # ``extra_body`` channel 로 전달. langchain ``model_kwargs`` 는 1.2.x
+        # 에서 비표준 키를 reject 하여 ledger/verifier(fast) 가 3ms 만에
+        # FAILED 회귀 (v19 관찰, 2026-04-26).
+        if tier in ("fast", "default") and any(
+            p in model_name.lower() for p in ("qwen3.5", "qwen3.6")
+        ):
+            extra_kwargs["extra_body"] = {"enable_thinking": False}
     elif cfg.provider == "deepseek":
         os.environ.setdefault("DEEPSEEK_API_KEY", cfg.deepseek_api_key)
         api_key = cfg.deepseek_api_key

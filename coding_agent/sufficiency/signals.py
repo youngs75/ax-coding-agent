@@ -267,6 +267,25 @@ _ARTIFACT_FILES: dict[str, tuple[str, ...]] = {
     # ledger 는 파일이 아니라 todo_store 의 상태로 확인 — 별도 처리.
 }
 
+# v22 #3 — DONE_CONDITION.md 후보 경로. planner 가 작성하면 sufficiency 가
+# 워크스페이스 산출물과 *기계적*으로 대조한다.
+_DONE_CONDITION_CANDIDATES: tuple[str, ...] = (
+    "DONE_CONDITION.md",
+    "done_condition.md",
+    "docs/DONE_CONDITION.md",
+    "docs/done_condition.md",
+)
+
+# DONE_CONDITION.md 포맷 — 헤더 다음 bullet 패턴으로 forbidden glob 들을
+# 추출. 자유 형식 markdown 안에서 ``## Forbidden Patterns`` 섹션을 찾고
+# 그 아래 ``- *.ext`` / ``- pattern`` 으로 시작하는 줄을 모은다.
+_FORBIDDEN_HEADER_RE = re.compile(
+    r"^##\s+Forbidden\s+Patterns\b", re.IGNORECASE | re.MULTILINE
+)
+# 다음 ## 헤더 또는 EOF 까지를 섹션 끝으로 본다.
+_NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
+_BULLET_PATTERN_RE = re.compile(r"^\s*[-*]\s+([^\s(]+)", re.MULTILINE)
+
 
 def _user_request_text(messages: list) -> str:
     """첫 HumanMessage 의 content. 사용자 의도 추출용 단일 진입점."""
@@ -323,6 +342,78 @@ def _check_artifacts_present(
     return present
 
 
+def _read_done_condition(working_directory: str | None) -> str | None:
+    """v22 #3 — DONE_CONDITION.md 본문 반환 (없으면 None)."""
+    if not working_directory:
+        return None
+    base = Path(working_directory)
+    if not base.exists():
+        return None
+    for candidate in _DONE_CONDITION_CANDIDATES:
+        path = base / candidate
+        if path.is_file():
+            try:
+                return path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+    return None
+
+
+def _extract_forbidden_patterns(done_condition_text: str) -> list[str]:
+    """``## Forbidden Patterns`` 섹션에서 bullet 패턴 추출.
+
+    예:
+    ```
+    ## Forbidden Patterns
+    - *.vue (React was chosen)
+    - *.svelte
+    ```
+    → ``["*.vue", "*.svelte"]``
+    """
+    m = _FORBIDDEN_HEADER_RE.search(done_condition_text)
+    if not m:
+        return []
+    section_start = m.end()
+    next_h = _NEXT_H2_RE.search(done_condition_text, section_start)
+    section_end = next_h.start() if next_h else len(done_condition_text)
+    section = done_condition_text[section_start:section_end]
+    return [b.group(1).strip() for b in _BULLET_PATTERN_RE.finditer(section)]
+
+
+def _detect_forbidden_violations(
+    working_directory: str | None,
+    forbidden_patterns: list[str],
+) -> list[str]:
+    """DONE_CONDITION 의 forbidden glob 패턴이 워크스페이스에 매치되면
+    *위반* 으로 표시. 매치된 파일 경로를 ``"pattern → path"`` 형식으로 반환.
+
+    skip_dirs: node_modules / .git / dist / build 등 vendor / artifact 경로는
+    제외 (사용자 코드만 대상).
+    """
+    if not working_directory or not forbidden_patterns:
+        return []
+    base = Path(working_directory)
+    if not base.exists():
+        return []
+    skip_dirs = {
+        ".git", ".ax-agent", "node_modules", "__pycache__", ".venv",
+        "venv", "dist", "build", ".pytest_cache", "memory_store",
+        ".pnpm-store", ".turbo", ".next",
+    }
+    violations: list[str] = []
+    for pattern in forbidden_patterns:
+        for path in base.rglob(pattern):
+            if any(p in skip_dirs for p in path.parts):
+                continue
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(base))
+            violations.append(f"{pattern} → {rel}")
+            if len(violations) >= 20:  # 폭주 방지
+                return violations
+    return violations
+
+
 def collect_signals(
     state: dict[str, Any],
     todo_store: "TodoStore | None",
@@ -360,6 +451,19 @@ def collect_signals(
     )
     artifacts_missing = sorted(artifact_intent - artifacts_present)
 
+    # v22 #3 — DONE_CONDITION.md 기반 결정론 게이트.
+    # planner 가 작성한 DONE_CONDITION.md 의 forbidden patterns 가 실제
+    # 워크스페이스에 등장하면 stack misalignment 등 *기획 위반* 으로 LOW
+    # 분류. v21 의 React 선택 → Vue 컴포넌트 작성 회귀 직접 차단.
+    done_condition_text = _read_done_condition(working_directory)
+    if done_condition_text:
+        forbidden_patterns = _extract_forbidden_patterns(done_condition_text)
+        done_condition_violations = _detect_forbidden_violations(
+            working_directory, forbidden_patterns
+        )
+    else:
+        done_condition_violations = []
+
     return {
         "artifact_intent": sorted(artifact_intent),
         "artifacts_missing": artifacts_missing,
@@ -369,6 +473,7 @@ def collect_signals(
         "todo_total": todo_total,
         "todo_ratio": todo_ratio,
         "prd_coverage": _compute_prd_coverage(working_directory),
+        "done_condition_violations": done_condition_violations,
     }
 
 

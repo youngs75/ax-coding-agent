@@ -10,9 +10,15 @@
 
 FROM python:3.12-slim
 
-# 시스템 의존성 + gosu (사용자 전환용)
+# 시스템 의존성 + gosu (사용자 전환용) + Node.js LTS + pnpm
+# Node.js 는 NodeSource LTS — Debian apt 의 nodejs 가 너무 오래되어 (16~18) 최신
+# create-react-app / Next.js 등이 깨짐. v20 회귀에서 Node.js 미설치로 coder 가
+# create-react-app 실패 → fixer 도 sudo 없어 설치 불가 (2026-04-26).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ripgrep tree gosu \
+    git curl ripgrep tree gosu ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

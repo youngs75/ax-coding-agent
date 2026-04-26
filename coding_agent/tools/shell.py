@@ -223,6 +223,29 @@ _WATCH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "this command watches files forever. Use the one-shot form "
         "('tsc' without --watch) or skip it.",
     ),
+    # v22.2 — direct node server invocation (server.js / app.js / main.js / index.js).
+    # 'npm run dev' 패턴이 잡히지만 coder 가 우회해서 'node server.js' 직접
+    # 호출하면 통과 → infinite hang (v24 회귀, 2026-04-26).
+    (
+        re.compile(
+            r"(?:^|[\s;&|])(?:node(?:js)?|deno\s+run|bun\s+run)\s+(?:\S+/)?"
+            r"(?:server|app|main|index|start|bootstrap)\.(?:js|mjs|cjs|ts|tsx)\b",
+            re.IGNORECASE,
+        ),
+        "direct node/deno/bun 서버 스크립트 호출은 daemon 으로 영원히 실행됩니다. "
+        "테스트로 검증하려면 jest/vitest 의 supertest 패턴을 사용하세요. "
+        "수동 smoke test 가 필요하면 build 산출물을 별도 컨테이너에서 실행하세요.",
+    ),
+    # v22.2 — trailing '&' (shell backgrounding). subprocess 가 backgrounded
+    # process 를 reap 하지 못해 execute 가 block. 또한 background process 는
+    # execute return 후 곧 SIGHUP 으로 죽거나 좀비로 남음.
+    (
+        re.compile(r"&\s*$"),
+        "trailing '&' (백그라운드 실행) 은 execute 도구로는 의미 없습니다 — "
+        "subprocess 가 reap 안 되거나 return 후 죽습니다. 진짜로 daemon 이 "
+        "필요하면 docker-compose 또는 build 산출물을 별도 컨테이너에서 "
+        "실행하세요. 단순 검증이면 supertest 류 in-process 테스트로 대체.",
+    ),
 )
 
 

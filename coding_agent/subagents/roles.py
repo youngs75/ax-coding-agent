@@ -113,26 +113,6 @@ Guidelines:
 - Do NOT call tools that are not in the available tools list above.
 """
 
-_LEDGER_PROMPT = """\
-You are a todo ledger agent. Your only job is to register tasks in the
-orchestrator's ledger or update their status. You do not analyze requirements,
-decompose tasks, or decide content — you operate exactly on what the
-orchestrator gave you.
-
-Available tools: {tools}
-
-Rules:
-- Use write_todos when the task description gives you a list of tasks
-  to register. Use exactly the ids and contents provided — do not rename,
-  reorder, or add tasks.
-- Use update_todo when the task description names a specific task id and
-  target status.
-- If the description is ambiguous (no task list and no clear update target),
-  return INCOMPLETE and ask the orchestrator to clarify.
-- Do NOT invent new tasks, rewrite content, or call planner-style reasoning.
-- Do NOT call tools that are not in the available tools list above.
-"""
-
 _VERIFIER_PROMPT = """\
 You are a verification agent. Your job is to run whatever checks the task
 asks for and report what happened. You do not modify code.
@@ -216,12 +196,16 @@ def planner_role(
     tools: list[str] | None = None,
     user_decisions: "UserDecisionsLog | None" = None,
 ) -> CodingAgentRole:
+    # write_todos 포함 — v22.2 부터 ledger SubAgent 폐기 (planner ↔ ledger
+    # ping-pong 회귀, 2026-04-26). planner 가 task 분해 직후 write_todos 로
+    # 직접 등록. 한 단계 핸드오프 사라짐 + LLM 자유 의지에 안 맡김.
     tool_allowlist = tools or [
         "read_file",
         "write_file",
         "glob_files",
         "grep",
         "ask_user_question",
+        "write_todos",
     ]
     return CodingAgentRole(
         name="planner",
@@ -322,20 +306,6 @@ def verifier_role(
     )
 
 
-def ledger_role(
-    tools: list[str] | None = None,
-    user_decisions: "UserDecisionsLog | None" = None,
-) -> CodingAgentRole:
-    tool_allowlist = tools or ["write_todos", "update_todo"]
-    return CodingAgentRole(
-        name="ledger",
-        system_prompt=_compose(_LEDGER_PROMPT, tool_allowlist),
-        tool_allowlist=tool_allowlist,
-        model_tier="fast",
-        _user_decisions=user_decisions,
-    )
-
-
 ROLE_FACTORIES = {
     "planner": planner_role,
     "coder": coder_role,
@@ -343,7 +313,6 @@ ROLE_FACTORIES = {
     "fixer": fixer_role,
     "researcher": researcher_role,
     "verifier": verifier_role,
-    "ledger": ledger_role,
 }
 
 
@@ -352,7 +321,6 @@ __all__ = [
     "ROLE_FACTORIES",
     "coder_role",
     "fixer_role",
-    "ledger_role",
     "planner_role",
     "researcher_role",
     "reviewer_role",

@@ -28,7 +28,6 @@ from coding_agent.models import get_model
 from coding_agent.subagents.roles import (
     coder_role,
     fixer_role,
-    ledger_role,
     planner_role,
     researcher_role,
     reviewer_role,
@@ -98,8 +97,9 @@ def build_orchestrator(
     role_registry.register(fixer_role(user_decisions=user_decisions))
     role_registry.register(researcher_role(user_decisions=user_decisions))
     role_registry.register(verifier_role(user_decisions=user_decisions))
-    if todo_store is not None:
-        role_registry.register(ledger_role(user_decisions=user_decisions))
+    # v22.2 — ledger SubAgent 폐기. write_todos 는 planner 가 직접 호출.
+    # update_todo 는 task_tool 의 _on_end auto-advance + (필요 시) orchestrator
+    # top-level 도구로 처리.
     # critic role — sufficiency loop 가 켜진 경우에만 등록. 끄면 invoke_role
     # 호출이 일어나지 않으므로 이 등록을 가드해 토큰 비용·로그 노이즈를
     # 줄인다. apt-legal 패턴.
@@ -132,7 +132,6 @@ def build_orchestrator(
         "fixer": 90.0,
         "researcher": 120.0,
         "verifier": 90.0,
-        "ledger": 30.0,
     }
     resilience = default_resilience(role_timeouts=timeouts)
 
