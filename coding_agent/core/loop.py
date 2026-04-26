@@ -38,6 +38,7 @@ from coding_agent.core.tool_adapter import (
 from coding_agent.core.tool_call_utils import prepare_messages_for_llm
 from coding_agent.memory import MemoryExtractor, MemoryMiddleware, MemoryStore
 from coding_agent.models import get_model, get_fallback_model, get_model_name, TierName
+from minyoung_mah.context import ContextManager, default_policy
 from minyoung_mah.resilience.progress_guard import GuardVerdict, ProgressGuard
 from coding_agent.resilience_compat import (
     ErrorHandler,
@@ -400,6 +401,16 @@ class AgentLoop:
             ),
         )
 
+        # Context compaction — token-aware threshold + LLM summarize.
+        # 옛 _trim_orchestrator_messages (단순 message-count 슬라이스) 의 정보
+        # 손실 + Anthropic strict pair 위반 결함 해소. claude-code 의
+        # autoCompact 패턴을 minyoung_mah.context 로 승격.
+        self._context_manager = ContextManager(
+            policy=default_policy(),
+            compact_model=get_model("fast"),
+            observer=self._orchestrator.observer,
+        )
+
         # 복원력 시스템
         self._watchdog = Watchdog(timeout_sec=cfg.llm_timeout)
         self._progress_guard = ProgressGuard(
@@ -483,35 +494,7 @@ class AgentLoop:
             log.debug("timing.inject_memory", elapsed_s=round(time.monotonic() - t0, 3))
             return updates
 
-        # ── Fix 1: Orchestrator message window ────────────────
-        # Anthropic 은 ``tool_use`` 다음 *immediately* ``tool_result`` 를
-        # 요구. trim 윈도우가 그 짝을 자르면 400 거부 (v15 회귀). 60 → 200
-        # 으로 늘려 대형 SubAgent 위임의 paired tool 호출도 윈도우 안에
-        # 머물게 한다. OpenAI 는 tolerant 라 영향 없음.
-        _ORCH_MAX_MESSAGES = 200  # keep system + last N messages
-
-        def _trim_orchestrator_messages(messages: list) -> list:
-            """Trim orchestrator message history.
-
-            Preserves:
-              [0] SystemMessage (system prompt)
-              [1] HumanMessage  (user request — MUST NOT be trimmed)
-              [-N:] Most recent messages
-            """
-            if len(messages) <= _ORCH_MAX_MESSAGES + 2:
-                return messages
-            from langchain_core.messages import SystemMessage as _Sys
-            # Keep system prompt + user's original request
-            head = messages[:2]
-            recent = messages[-_ORCH_MAX_MESSAGES:]
-            log.info(
-                "orchestrator.message_window.trimmed",
-                before=len(messages),
-                after=len(head) + len(recent),
-            )
-            return head + recent
-
-        def agent_node(state: AgentState) -> dict[str, Any]:
+        async def agent_node(state: AgentState) -> dict[str, Any]:
             """LLM 호출 노드.
 
             오픈소스 모델 호환성:
@@ -519,15 +502,25 @@ class AgentLoop:
             2. 미지원 (GLM, MiniMax 등) → 프롬프트에 도구 스키마 주입,
                텍스트 응답에서 tool_call JSON 블록 파싱
             3. 메시지 전처리: 고아 tool_call 정리, DashScope 직렬화 보장
-            4. Fix 1: 메시지 윈도우 적용 (토큰 증가 방지)
+            4. Context compaction: minyoung_mah.context.ContextManager 가
+               token-aware threshold 도달 시 LLM summarize 로 대체. 단순
+               message-count 슬라이스 (옛 _trim_orchestrator_messages) 의
+               정보 손실 + Anthropic strict pair 위반 결함 해소.
             """
             t0 = time.monotonic()
             tier = state.get("current_tier") or get_config().orchestrator_tier
             iteration = (state.get("iteration") or 0) + 1
             model, use_prompt_tools = get_bound_model(tier)
 
-            # Fix 1: Trim messages before LLM call
-            messages = _trim_orchestrator_messages(list(state.get("messages", [])))
+            messages = list(state.get("messages", []))
+            # Token-aware context compaction. 임계값 미달이면 원본 그대로
+            # 반환 (compacted=False). 도달하면 별도 LLM 으로 summarize +
+            # boundary marker + summary message 로 교체. 정보 보존.
+            if self._context_manager is not None:
+                compact_result = await self._context_manager.compact_if_needed(
+                    messages, model
+                )
+                messages = compact_result.messages
 
             # 시스템 프롬프트 구성
             memory_ctx = state.get("memory_context", "")
