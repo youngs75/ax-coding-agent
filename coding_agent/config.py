@@ -50,6 +50,16 @@ _DEEPSEEK_MODELS = ModelTier(
     fast="deepseek-v4-flash",      # memory extractor / classifier
 )
 
+# Anthropic Claude — Opus 4.7 (reasoning), Sonnet 4.6 (strong/default),
+# Haiku 4.5 (fast). 표준 OpenAI 호환성 우수 (deepseek 의 reasoning_content
+# 같은 비대칭 contract 없음 — streaming 그대로 사용 가능).
+_ANTHROPIC_MODELS = ModelTier(
+    reasoning="claude-opus-4-7",         # planner / critic — 가장 깊은 추론
+    strong="claude-sonnet-4-6",          # coder / fixer — tool calling + 코드 생성
+    default="claude-sonnet-4-6",         # reviewer / researcher
+    fast="claude-haiku-4-5",             # memory extractor / classifier
+)
+
 # 추가 프로바이더 프리셋 (GLM, Nemotron 등 — .env에서 모델명 오버라이드로 사용)
 # 예: STRONG_MODEL=openrouter/z-ai/glm-5.1
 #     DEFAULT_MODEL=openrouter/nvidia/nemotron-3-super-120b-a12b
@@ -86,6 +96,11 @@ class Config:
         default_factory=lambda: os.getenv(
             "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
         )
+    )
+
+    # Anthropic (Claude) — 표준 메시지 contract. langchain-anthropic 사용.
+    anthropic_api_key: str = field(
+        default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "")
     )
 
     # LiteLLM Proxy (Docker 하니스 모드)
@@ -178,6 +193,8 @@ class Config:
             base = _DASHSCOPE_MODELS
         elif self.provider == "deepseek":
             base = _DEEPSEEK_MODELS
+        elif self.provider == "anthropic":
+            base = _ANTHROPIC_MODELS
         else:
             base = _OPENROUTER_MODELS
         return ModelTier(
@@ -196,6 +213,8 @@ class Config:
             return self.dashscope_api_key
         if self.provider == "deepseek":
             return self.deepseek_api_key
+        if self.provider == "anthropic":
+            return self.anthropic_api_key
         return self.openrouter_api_key
 
 

@@ -180,6 +180,33 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
     model_name = _strip_provider_prefix(raw_model_name)
     extra_kwargs: dict[str, Any] = {}
 
+    # Anthropic 은 별도 langchain-anthropic 패키지 사용 — OpenAI 호환 API 가
+    # 아닌 자체 chat 프로토콜이라 ChatAnthropic 직접 인스턴스화. 표준 메시지
+    # 형식 + native streaming 지원 → disable_streaming 불필요.
+    if cfg.provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        os.environ.setdefault("ANTHROPIC_API_KEY", cfg.anthropic_api_key)
+        log.debug(
+            "models.get_model.anthropic",
+            tier=tier,
+            model=model_name,
+            max_tokens=max_tokens,
+        )
+        # claude-opus-4-7 등 reasoning 모델군은 temperature 를 deprecated
+        # ('temperature is deprecated for this model'). 모델명에 'opus' 가
+        # 들어간 경우 (또는 향후 reasoning 시리즈) temperature 인자 생략.
+        anthropic_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "api_key": cfg.anthropic_api_key,
+            "timeout": cfg.llm_timeout,
+            "max_tokens": max_tokens or 4096,
+        }
+        if "opus" not in model_name.lower():
+            anthropic_kwargs["temperature"] = temperature
+        instance = ChatAnthropic(**anthropic_kwargs)
+        _model_instance_cache[cache_key] = instance
+        return instance
+
     if cfg.provider == "dashscope":
         os.environ.setdefault("DASHSCOPE_API_KEY", cfg.dashscope_api_key)
         api_key = cfg.dashscope_api_key
