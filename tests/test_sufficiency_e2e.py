@@ -136,6 +136,65 @@ def test_collect_signals_no_verifier_message(tmp_path):
     assert s["todo_ratio"] == 1.0  # ledger 미사용 → 1.0
 
 
+def test_collect_signals_detects_artifact_intent_v12_pattern(tmp_path):
+    """v12 회귀: 사용자가 PRD 작성 + 분해를 명시적 요청했는데 SubAgent 가
+    ask 만 하고 종료. 산출물 검증으로 LOW 자동 분류 → planner replan 트리거."""
+    user_request = (
+        "PMS 시스템을 만들어줘. PRD 파일을 만들고 작업을 원자 단위로 "
+        "분해할 것. Spec Driven Development 기반."
+    )
+    state = {
+        "messages": [HumanMessage(content=user_request)],
+        "working_directory": str(tmp_path),  # 비어 있는 워크스페이스
+    }
+    todo = _FakeTodoStore({})  # ledger 도 비어있음
+    sigs = collect_signals(state, todo)
+
+    # 사용자가 명시한 모든 산출물이 누락된 상태
+    assert "prd" in sigs["artifact_intent"]
+    assert "spec" in sigs["artifact_intent"]
+    assert "ledger" in sigs["artifact_intent"]
+    assert "prd" in sigs["artifacts_missing"]
+    assert "spec" in sigs["artifacts_missing"]
+    assert "ledger" in sigs["artifacts_missing"]
+
+
+def test_collect_signals_artifact_present_when_file_exists(tmp_path):
+    """PRD.md 가 워크스페이스에 있으면 prd 가 missing 에서 제외됨."""
+    (tmp_path / "PRD.md").write_text("# PRD\n", encoding="utf-8")
+    state = {
+        "messages": [HumanMessage(content="PRD 작성하고 spec 도 만들어")],
+        "working_directory": str(tmp_path),
+    }
+    sigs = collect_signals(state, _FakeTodoStore({}))
+    assert "prd" not in sigs["artifacts_missing"]
+    assert "spec" in sigs["artifacts_missing"]
+
+
+def test_collect_signals_ledger_present_when_todos_registered(tmp_path):
+    """ledger 가 채워졌으면 (사용자가 분해 요청 + ledger 등록 완료) ledger
+    artifact 가 present 로 처리."""
+    state = {
+        "messages": [HumanMessage(content="원자 단위로 분해해서 ledger 등록")],
+        "working_directory": str(tmp_path),
+    }
+    todo = _FakeTodoStore({"pending": 5})  # ledger 비어있지 않음
+    sigs = collect_signals(state, todo)
+    assert "ledger" in sigs["artifact_intent"]
+    assert "ledger" not in sigs["artifacts_missing"]
+
+
+def test_collect_signals_no_artifact_intent_when_simple_request(tmp_path):
+    """짧은 코드 수정 요청은 산출물 의도 없음 → false positive 방지."""
+    state = {
+        "messages": [HumanMessage(content="hello world 출력하는 함수 작성")],
+        "working_directory": str(tmp_path),
+    }
+    sigs = collect_signals(state, _FakeTodoStore({}))
+    assert sigs["artifact_intent"] == []
+    assert sigs["artifacts_missing"] == []
+
+
 def test_collect_signals_prd_keyword_match(tmp_path):
     """PRD 안의 키워드가 워크스페이스 텍스트에 등장하면 coverage > 0."""
     (tmp_path / "PRD.md").write_text(

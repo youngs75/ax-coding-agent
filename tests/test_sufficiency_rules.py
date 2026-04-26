@@ -26,6 +26,8 @@ def _signals(**overrides):
         "todo_total": 10,
         "todo_ratio": 0.9,
         "prd_coverage": 0.9,
+        "artifact_intent": [],
+        "artifacts_missing": [],
     }
     base.update(overrides)
     return base
@@ -179,3 +181,46 @@ def test_medium_when_prd_coverage_borderline_with_no_pytest():
     )
     assert g.level == "MEDIUM"
     assert g.metrics["pytest_exit"] is None  # critic 에 그대로 전달됨
+
+
+# ── 옵션 C: 산출물 누락 검증 (v12 회귀 fix) ──
+
+
+def test_low_when_artifacts_missing_overrides_other_signals():
+    """artifacts_missing 이 비어있지 않으면 다른 신호와 무관하게 LOW.
+    SubAgent 가 COMPLETED 라고 주장해도 사용자 산출물 검증 실패면 차단."""
+    g = evaluate(
+        _signals(
+            artifacts_missing=["prd", "spec"],
+            pytest_exit=0, lint_errors=0,
+            todo_ratio=1.0, prd_coverage=1.0,  # 다른 신호는 모두 양호
+        ),
+        **_DEFAULTS,
+    )
+    assert g.level == "LOW"
+    assert any("artifacts_missing" in t for t in g.triggered_signals)
+    assert "산출물 누락" in g.reason
+
+
+def test_high_when_no_artifact_intent_at_all():
+    """artifact_intent 가 비어 있으면 (사용자가 산출물 요청 안 함) 영향
+    없음. 이전 동작 보존."""
+    g = evaluate(
+        _signals(artifacts_missing=[], artifact_intent=[]),
+        **_DEFAULTS,
+    )
+    assert g.level == "HIGH"
+
+
+def test_heuristic_artifacts_missing_routes_to_planner_replan():
+    """LOW 휴리스틱: artifacts_missing 우선 → planner replan."""
+    g = evaluate(
+        _signals(artifacts_missing=["prd", "ledger"]),
+        **_DEFAULTS,
+    )
+    v = heuristic_verdict_for_low(g)
+    assert v.verdict == "replan"
+    assert v.target_role == "planner"
+    assert "PRD.md" in v.feedback_for_retry  # PRD 파일 명시
+    assert "ledger" in v.feedback_for_retry  # ledger 안내
+    assert "ask_user_question 답변만으론" in v.feedback_for_retry  # 핵심 안내

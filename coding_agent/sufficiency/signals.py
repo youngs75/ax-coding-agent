@@ -242,6 +242,87 @@ def _compute_prd_coverage(working_directory: str | None) -> float:
     return hits / len(keywords)
 
 
+_ARTIFACT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # (artifact_id, search keywords) — 사용자 요청 텍스트에서 키워드 매칭 시
+    # 그 산출물이 *기대됨* 으로 표시. 워크스페이스에서 실제 파일/디렉토리
+    # 존재를 별도 확인.
+    ("prd", ("prd", "product requirements", "요구사항 문서", "요구사항 정의")),
+    ("spec", ("spec", "specification", "명세서", "spec driven", "spec-driven", "sdd")),
+    ("ledger", ("분해", "원자 단위", "atomic", "task 분해", "task breakdown", "task list", "작업 목록", "작업 분해", "wbs")),
+)
+
+_ARTIFACT_FILES: dict[str, tuple[str, ...]] = {
+    "prd": (
+        "PRD.md", "prd.md", "PRD.txt", "prd.txt",
+        "docs/PRD.md", "docs/prd.md",
+        "PMS_PRD.md", "pms_prd.md",
+        "requirements.md", "Requirements.md",
+    ),
+    "spec": (
+        "SPEC.md", "spec.md", "Specification.md", "specification.md",
+        "docs/SPEC.md", "docs/spec.md", "docs/specification.md",
+        "PMS_SPEC.md", "pms_spec.md",
+        "design.md", "Design.md",
+    ),
+    # ledger 는 파일이 아니라 todo_store 의 상태로 확인 — 별도 처리.
+}
+
+
+def _user_request_text(messages: list) -> str:
+    """첫 HumanMessage 의 content. 사용자 의도 추출용 단일 진입점."""
+    from langchain_core.messages import HumanMessage as _HM
+    for m in messages:
+        if isinstance(m, _HM):
+            content = m.content if isinstance(m.content, str) else ""
+            return content
+    return ""
+
+
+def _detect_artifact_intent(user_request: str) -> set[str]:
+    """사용자 요청에서 *기대되는 산출물* 식별자 집합."""
+    if not user_request:
+        return set()
+    text = user_request.lower()
+    intent: set[str] = set()
+    for artifact_id, keywords in _ARTIFACT_KEYWORDS:
+        for kw in keywords:
+            if kw.lower() in text:
+                intent.add(artifact_id)
+                break
+    return intent
+
+
+def _check_artifacts_present(
+    working_directory: str | None,
+    intent: set[str],
+    todo_total: int,
+) -> set[str]:
+    """``intent`` 중 *실제로 워크스페이스에 존재* 가 확인된 항목.
+
+    파일 기반 산출물(prd/spec)은 ``_ARTIFACT_FILES`` 의 후보 경로 중 하나
+    라도 존재하면 충족. ``ledger`` 는 todo_total > 0 이면 충족.
+    """
+    present: set[str] = set()
+    if "ledger" in intent and todo_total > 0:
+        present.add("ledger")
+
+    if not working_directory:
+        return present
+    base = Path(working_directory)
+    if not base.exists():
+        return present
+
+    for artifact_id in intent:
+        if artifact_id == "ledger":
+            continue
+        candidates = _ARTIFACT_FILES.get(artifact_id, ())
+        for cand in candidates:
+            if (base / cand).is_file():
+                present.add(artifact_id)
+                break
+    return present
+
+
 def collect_signals(
     state: dict[str, Any],
     todo_store: "TodoStore | None",
@@ -267,7 +348,21 @@ def collect_signals(
     todo_total = sum(int(v) for v in counts.values())
     todo_ratio = (todo_done / todo_total) if todo_total > 0 else 1.0
 
+    # ── 산출물 의도 vs 실제 (옵션 C 의 핵심) ──
+    # 사용자가 "PRD 작성", "분해", "SPEC" 같은 산출물을 요청했는데 SubAgent
+    # 가 ask 만 하고 종료 (deepseek 패턴) 한 케이스를 *결과 검증* 으로 잡음.
+    # SubAgent 가 COMPLETED 라고 주장해도 산출물이 없으면 sufficiency 가
+    # LOW band 로 분류해 planner replan 자동 트리거.
+    user_request = _user_request_text(messages)
+    artifact_intent = _detect_artifact_intent(user_request)
+    artifacts_present = _check_artifacts_present(
+        working_directory, artifact_intent, todo_total
+    )
+    artifacts_missing = sorted(artifact_intent - artifacts_present)
+
     return {
+        "artifact_intent": sorted(artifact_intent),
+        "artifacts_missing": artifacts_missing,
         "pytest_exit": _extract_pytest_exit(messages),
         "lint_errors": _extract_lint_errors(messages),
         "todo_done": todo_done,

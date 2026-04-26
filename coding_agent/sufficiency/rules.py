@@ -22,6 +22,17 @@ from coding_agent.sufficiency.schemas import (
 )
 
 
+_ARTIFACT_FILE_HINTS: dict[str, str] = {
+    "prd": "PRD.md",
+    "spec": "SPEC.md",
+    "ledger": "todo ledger 등록 (planner 결과를 ledger SubAgent 에게 위임)",
+}
+
+
+def _artifact_to_file_hint(artifact_id: str) -> str:
+    return _ARTIFACT_FILE_HINTS.get(artifact_id, artifact_id)
+
+
 def evaluate(
     signals: dict[str, Any],
     *,
@@ -42,9 +53,26 @@ def evaluate(
     lint_errors = signals.get("lint_errors")
     todo_ratio = float(signals.get("todo_ratio", 1.0))
     prd_coverage = float(signals.get("prd_coverage", 1.0))
+    artifacts_missing = list(signals.get("artifacts_missing") or [])
 
     triggered: list[str] = []
     reasons: list[str] = []
+
+    # ── LOW: 사용자 요청 산출물 누락 (옵션 C) ──
+    # SubAgent 가 COMPLETED 라고 주장해도 사용자가 명시한 산출물 (PRD/SPEC/
+    # ledger) 이 워크스페이스에 없으면 *기획·분해 단계 미완료* 로 분류.
+    # deepseek 처럼 ask 만 하고 종료하는 패턴 (v12 회귀) 의 직접 검출.
+    if artifacts_missing:
+        triggered.append(f"artifacts_missing={artifacts_missing}")
+        reasons.append(
+            f"사용자 요청 산출물 누락: {', '.join(artifacts_missing)}"
+        )
+        return CodeQualityGateResult(
+            level="LOW",
+            triggered_signals=triggered,
+            metrics=dict(signals),
+            reason="; ".join(reasons),
+        )
 
     # ── LOW ──
     if pytest_exit is not None and pytest_exit != 0:
@@ -128,6 +156,30 @@ def heuristic_verdict_for_low(
     pytest_exit = metrics.get("pytest_exit")
     todo_ratio = float(metrics.get("todo_ratio", 1.0))
     prd_coverage = float(metrics.get("prd_coverage", 1.0))
+    artifacts_missing = list(metrics.get("artifacts_missing") or [])
+
+    # 산출물 누락이 가장 강한 신호 — 다른 신호보다 우선 처리.
+    if artifacts_missing:
+        missing_label = ", ".join(artifacts_missing)
+        # ledger 만 빠진 경우는 *분해 단계 누락* — planner 위임으로 ledger
+        # 채우기. PRD/SPEC 가 빠진 경우도 동일 (planner 책임).
+        return CriticVerdict(
+            verdict="replan",
+            target_role="planner",
+            reason=(
+                f"사용자 요청 산출물 누락 ({missing_label}). SubAgent 가 "
+                f"COMPLETED 라고 주장했지만 워크스페이스에서 검증 실패 — "
+                f"기획/분해 단계가 완료되지 않음."
+            ),
+            feedback_for_retry=(
+                f"사용자 원 요청에 명시된 산출물({missing_label}) 이 워크스페이스에 "
+                f"없습니다. planner 에게 다음을 *반드시 파일로 작성*해 위임하세요: "
+                f"{', '.join(_artifact_to_file_hint(a) for a in artifacts_missing)}. "
+                f"ask_user_question 답변만으론 task 가 끝나지 않으며, 필수 산출물을 "
+                f"실제 파일 (write_file 도구로) 만들고, 분해 결과는 ledger 에게 "
+                f"위임해 등록까지 완료해야 합니다."
+            ),
+        )
 
     if pytest_exit is not None and pytest_exit != 0:
         return CriticVerdict(
