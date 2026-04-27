@@ -25,7 +25,9 @@ dependencies = [
     "structlog>=24.0",
     "rich>=13.0",
     "prompt-toolkit>=3.0",
-    "langfuse>=2.0",
+    "langfuse>=2.0,<3",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 # minyoung-mah is not on PyPI yet — install editable from a sibling
@@ -35,6 +37,7 @@ dependencies = [
 
 [project.scripts]
 ax-agent = "coding_agent.cli.app:main"
+ax-server = "coding_agent.web.app:run"
 
 [dependency-groups]
 dev = [
