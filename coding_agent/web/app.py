@@ -32,6 +32,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .agent_card import _resolve_version, build_agent_card
+from .artifacts import (
+    _BUNDLE_NAME,
+    serve_workspace_file,
+    stream_workspace_bundle,
+)
 from .sse_emitter import stream_agent_events
 
 log = structlog.get_logger()
@@ -289,6 +294,39 @@ async def tasks_stream(request: Request) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------------------------------------------------------------------------
+# A2A — HITL response
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Workspace 산출물 다운로드 — apt-web 의 /coding/a2a/artifacts/{path} relay 대상
+# ---------------------------------------------------------------------------
+
+
+@app.get("/artifacts/__bundle.zip")
+async def artifacts_bundle() -> StreamingResponse:
+    """Workspace 전체를 zip 으로 streaming 다운로드.
+
+    제외 패턴 (node_modules / .git / .venv / dist / __pycache__ / .env 등) 은
+    :mod:`coding_agent.web.artifacts` 참조. apt-web 의 ``/coding/a2a/artifacts/__bundle.zip``
+    proxy 가 이 endpoint 를 그대로 relay.
+    """
+    return await stream_workspace_bundle()
+
+
+@app.get("/artifacts/{path:path}")
+async def artifacts_file(path: str):
+    """Workspace 내 단일 파일 다운로드 + path traversal 방어.
+
+    ``path == "__bundle.zip"`` 인 경우 (apt-web 의 catch-all proxy 가 그
+    경로로 forward 시) 전체 zip 응답. 그 외에는 단일 파일.
+    """
+    if path == _BUNDLE_NAME:
+        return await stream_workspace_bundle()
+    return await serve_workspace_file(path)
 
 
 # ---------------------------------------------------------------------------
