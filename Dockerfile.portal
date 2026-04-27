@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════
+# AX Coding Agent — 포털 배포용 daemon 이미지
+#
+# 기존 Dockerfile (CLI 대화형) 과 별도. 사내 포털(AWS EKS) 에서
+# FastAPI daemon 모드로 띄우기 위한 이미지이다. minyoung-mah 는
+# PyPI(>=0.1.9) 에서 pip 설치 — BuildKit named context 불필요.
+#
+# Build:
+#   docker build -f Dockerfile.portal -t ax-coding-agent:portal .
+# Run:
+#   docker run --rm -p 8080:8080 ax-coding-agent:portal
+# ═══════════════════════════════════════════════════════════════
+
+FROM python:3.12-slim
+
+# 시스템 의존성: git/curl/ripgrep/gcc + Node.js LTS + pnpm.
+# coder/fixer 가 자식 프로세스로 npm/pytest 등을 실행하므로 모두 필요.
+# Node.js LTS 는 NodeSource — Debian apt 의 nodejs 가 너무 오래되어
+# create-react-app/Next.js 등이 깨지는 회귀를 방지.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ripgrep gcc ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 소스 복사 — pyproject + 패키지만. .env 는 포털 ENV 로 주입.
+# Source: pyproject + package only. .env is injected via portal ENV.
+COPY pyproject.toml ./
+COPY coding_agent/ ./coding_agent/
+
+# 의존성 설치 — minyoung-mah 는 PyPI(>=0.1.9) 에서 pip install.
+# Install deps — minyoung-mah comes from PyPI (>=0.1.9), no local context.
+RUN pip install --no-cache-dir -e .
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8080 \
+    LANG=C.UTF-8
+
+EXPOSE 8080
+
+# K8s liveness 가 /healthz 를 따로 찌르지만 docker run 단독 검증용으로도 두기.
+# K8s probes /healthz separately; this also helps standalone docker validation.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f "http://localhost:${PORT}/healthz" || exit 1
+
+CMD ["python", "-m", "uvicorn", "coding_agent.web.app:app", "--host", "0.0.0.0", "--port", "8080"]
