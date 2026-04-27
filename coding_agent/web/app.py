@@ -1,23 +1,18 @@
 """FastAPI daemon entry for ax-coding-agent.
 
-Bootstrap stub: every endpoint contract from the apt-legal-agent A2A
-pattern is registered, but the bodies are dummies. Real LangGraph wiring,
-SSE event streaming, and HITL response handling land in a follow-up
-commit. The goal here is "process is up, healthz/agent_card respond,
-portal probes don't 404".
+A2A endpoint 8 종을 등록하고, AgentLoop 오케스트레이터를 실제로 호출한다.
+tasks/send 는 동기 JSON 응답, stream 은 SSE, respond 는 HITL interrupt 재개.
 
-부트스트랩 단계 — apt-legal-agent A2A 패턴의 endpoint 8 종을 모두 등록하되
-본체는 dummy 응답이다. 실제 LangGraph 통합·SSE·HITL 은 다음 commit. 지금
-목표는 "프로세스가 떠 있고 healthz/agent_card 가 응답하며 포털 probe 가
-404 를 받지 않는 것".
+A2A 엔드포인트에서 AgentLoop.run() 을 직접 호출하여 LangGraph 기반
+멀티 에이전트 오케스트레이터가 코드 작성·검증을 수행한다.
 
 Routes:
 
 - ``GET  /healthz``                  — liveness probe.
 - ``GET  /.well-known/agent.json``   — A2A agent card (dynamic host).
-- ``POST /a2a/tasks/send``           — sync JSON-RPC task (dummy).
-- ``POST /a2a/stream``               — SSE streaming task (dummy single event).
-- ``POST /a2a/respond``              — HITL response submission (dummy).
+- ``POST /a2a/tasks/send``           — sync JSON-RPC task.
+- ``POST /a2a/stream``               — SSE streaming task.
+- ``POST /a2a/respond``              — HITL response submission.
 - ``POST /a2a``                      — portal probe fallback → tasks/send.
 - ``POST /a2a/jsonrpc``              — portal probe fallback → tasks/send.
 - ``POST /a2a/rest``                 — portal probe fallback → tasks/send.
@@ -25,71 +20,173 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .agent_card import _resolve_version, build_agent_card
 
+log = structlog.get_logger()
+
 __version__ = _resolve_version()
 
-app = FastAPI(title="ax-coding-agent", version=__version__)
+# ---------------------------------------------------------------------------
+# AgentLoop singleton — created once at startup, shared across requests.
+# AgentLoop 싱글톤 — startup 시 한 번 생성, 요청 간 공유.
+# ---------------------------------------------------------------------------
+
+_agent_loop = None
+
+# HITL interrupt 대기 중인 task 저장 {task_id: {future, thread_id, ...}}
+_pending_interrupts: dict[str, dict[str, Any]] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _agent_loop
+    from coding_agent.core.loop import AgentLoop
+
+    log.info("app.startup", msg="Initializing AgentLoop")
+    _agent_loop = AgentLoop()
+    log.info("app.startup.done")
+    yield
+    if _agent_loop is not None:
+        _agent_loop.close()
+        log.info("app.shutdown", msg="AgentLoop closed")
+
+
+app = FastAPI(title="ax-coding-agent", version=__version__, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
 # Liveness / agent card
-# 라이브니스 / 에이전트 카드
 # ---------------------------------------------------------------------------
 
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    """K8s liveness probe — always ok in bootstrap mode.
-    K8s liveness probe — 부트스트랩 단계에서는 항상 ok 를 돌려준다.
-    """
+    """K8s liveness probe."""
     return {"status": "ok", "version": __version__}
 
 
 @app.get("/.well-known/agent.json")
 async def well_known_agent(request: Request) -> dict[str, Any]:
-    """Dynamic A2A agent card from the incoming request.
-    들어온 요청을 기반으로 동적 A2A agent card 를 생성한다.
-    """
+    """Dynamic A2A agent card."""
     return build_agent_card(request)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_message(body: dict[str, Any]) -> str:
+    """Extract user message from A2A request body.
+
+    Supports both flat ``{"message": "..."}`` and nested
+    ``{"params": {"message": {"parts": [{"text": "..."}]}}}`` (A2A spec).
+    """
+    if "message" in body and isinstance(body["message"], str):
+        return body["message"]
+
+    params = body.get("params", {})
+    msg = params.get("message", {})
+    if isinstance(msg, str):
+        return msg
+
+    parts = msg.get("parts", [])
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type", "text") == "text"]
+    if texts:
+        return "\n".join(texts)
+
+    if "content" in body:
+        return str(body["content"])
+
+    return json.dumps(body)
+
+
+def _build_a2a_response(task_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Build A2A-compliant JSON-RPC response from AgentLoop final state."""
+    final_response = state.get("final_response", "")
+    exit_reason = state.get("exit_reason", "completed")
+
+    a2a_status = "completed"
+    if exit_reason == "fatal_error":
+        a2a_status = "failed"
+    elif exit_reason == "no_ask_user_handler":
+        a2a_status = "input-required"
+    elif state.get("__interrupt__"):
+        a2a_status = "input-required"
+
+    result: dict[str, Any] = {
+        "id": task_id,
+        "status": {"state": a2a_status},
+        "artifacts": [
+            {
+                "parts": [{"type": "text", "text": final_response}],
+            }
+        ],
+    }
+
+    if exit_reason:
+        result["metadata"] = {
+            "exit_reason": exit_reason,
+            "iterations": state.get("iteration", 0),
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # A2A — synchronous tasks/send (+ portal probe fallbacks)
-# A2A — 동기 tasks/send (+ 포털 probe 호환 alias)
 # ---------------------------------------------------------------------------
 
 
 async def _handle_send(request: Request) -> JSONResponse:
-    """Dummy synchronous task handler.
+    """Synchronous task handler — runs AgentLoop.run() to completion."""
+    task_id = str(uuid.uuid4())
 
-    Reads the request body to verify JSON parsing works end-to-end, then
-    returns a stub envelope. Real orchestrator dispatch arrives later.
-
-    동기 task dummy 핸들러 — 본문 JSON 파싱이 동작하는지만 확인하고 스텁
-    응답을 돌려준다. 실제 orchestrator 위임은 추후 단계.
-    """
     try:
-        await request.json()
+        body = await request.json()
     except Exception:
-        # Empty body / invalid JSON is fine in bootstrap mode.
-        # 부트스트랩에선 빈 본문/잘못된 JSON 모두 허용.
-        pass
-    return JSONResponse(
-        {"status": "received", "note": "sync mode not implemented yet"}
-    )
+        body = {}
+
+    user_message = _extract_message(body)
+    if not user_message.strip():
+        return JSONResponse(
+            {"id": task_id, "status": {"state": "failed"}, "error": "empty message"},
+            status_code=400,
+        )
+
+    project_id = body.get("project_id") or body.get("params", {}).get("project_id")
+
+    log.info("a2a.tasks_send", task_id=task_id, message_length=len(user_message))
+
+    try:
+        state = await _agent_loop.run(
+            user_message=user_message,
+            project_id=project_id,
+        )
+        return JSONResponse(_build_a2a_response(task_id, state))
+    except Exception as e:
+        log.error("a2a.tasks_send.error", task_id=task_id, error=str(e))
+        return JSONResponse(
+            {
+                "id": task_id,
+                "status": {"state": "failed"},
+                "error": str(e),
+            },
+            status_code=500,
+        )
 
 
-# Portal Playground probes /a2a, /a2a/jsonrpc, /a2a/rest in order before
-# falling through to the canonical /a2a/tasks/send. Register all four.
-# 포털 플레이그라운드는 /a2a → /a2a/jsonrpc → /a2a/rest → /a2a/tasks/send
-# 순으로 probe 한다. 네 경로 모두 같은 핸들러로 등록.
 app.post("/a2a/tasks/send")(_handle_send)
 app.post("/a2a")(_handle_send)
 app.post("/a2a/jsonrpc")(_handle_send)
@@ -97,74 +194,108 @@ app.post("/a2a/rest")(_handle_send)
 
 
 # ---------------------------------------------------------------------------
-# A2A — streaming task (SSE dummy)
-# A2A — 스트리밍 task (SSE dummy)
+# A2A — streaming task (SSE)
 # ---------------------------------------------------------------------------
 
 
-async def _dummy_stream():
-    """Yield a single SSE event signaling the stub start.
-
-    Real implementation will wire ``Orchestrator`` events to SSE frames
-    via ``QueueHITLChannel``-style notifications. For now we emit one
-    event so clients can verify the SSE contract end-to-end.
-
-    한 번 발행되는 dummy SSE event. 실제 구현은 Orchestrator notifications
-    를 SSE frame 으로 변환할 예정. 지금은 클라이언트가 SSE contract 자체를
-    검증할 수 있도록 단일 이벤트만 보낸다.
-    """
+async def _stream_run(user_message: str, project_id: str | None, task_id: str):
+    """Generator that runs AgentLoop and yields SSE events."""
     yield (
-        b"event: orchestrator.run.start\n"
-        b"data: {\"note\":\"streaming not implemented yet\"}\n\n"
-    )
+        f"event: task.start\n"
+        f"data: {json.dumps({'id': task_id, 'status': {'state': 'working'}})}\n\n"
+    ).encode()
+
+    try:
+        state = await _agent_loop.run(
+            user_message=user_message,
+            project_id=project_id,
+        )
+
+        response = _build_a2a_response(task_id, state)
+        yield (
+            f"event: task.artifact\n"
+            f"data: {json.dumps(response)}\n\n"
+        ).encode()
+
+        final_status = response["status"]["state"]
+        yield (
+            f"event: task.status\n"
+            f"data: {json.dumps({'id': task_id, 'status': {'state': final_status}})}\n\n"
+        ).encode()
+
+    except Exception as e:
+        log.error("a2a.stream.error", task_id=task_id, error=str(e))
+        yield (
+            f"event: task.status\n"
+            f"data: {json.dumps({'id': task_id, 'status': {'state': 'failed'}, 'error': str(e)})}\n\n"
+        ).encode()
+
+    yield b"event: task.end\ndata: {}\n\n"
 
 
 @app.post("/a2a/stream")
 async def tasks_stream(request: Request) -> StreamingResponse:
-    """Dummy SSE stream — emits one ``orchestrator.run.start`` and ends.
-    dummy SSE 스트림 — orchestrator.run.start 한 번 발행 후 종료.
-    """
+    """SSE stream — runs the orchestrator and emits events."""
+    task_id = str(uuid.uuid4())
+
     try:
-        await request.json()
+        body = await request.json()
     except Exception:
-        pass
+        body = {}
+
+    user_message = _extract_message(body)
+    project_id = body.get("project_id") or body.get("params", {}).get("project_id")
+
+    log.info("a2a.stream", task_id=task_id, message_length=len(user_message))
+
     return StreamingResponse(
-        _dummy_stream(),
+        _stream_run(user_message, project_id, task_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 # ---------------------------------------------------------------------------
-# A2A — HITL response (dummy)
-# A2A — HITL 응답 (dummy)
+# A2A — HITL response
 # ---------------------------------------------------------------------------
 
 
 @app.post("/a2a/respond")
 async def respond(request: Request) -> JSONResponse:
-    """Dummy HITL response endpoint — answers from a paused interrupt.
-    dummy HITL respond endpoint — 일시정지된 interrupt 의 사용자 응답 수신.
+    """HITL response endpoint — resumes a paused interrupt.
+
+    Currently returns acknowledgement. Full interrupt-resume wiring
+    requires a task registry with pending interrupt futures — tracked
+    for the next iteration.
     """
     try:
-        await request.json()
+        body = await request.json()
     except Exception:
-        pass
+        body = {}
+
+    task_id = body.get("id") or body.get("task_id", "")
+    answer = body.get("answer") or body.get("response", "")
+
+    if task_id and task_id in _pending_interrupts:
+        entry = _pending_interrupts.pop(task_id)
+        future = entry.get("future")
+        if future and not future.done():
+            future.set_result(answer)
+            return JSONResponse({"status": "resumed", "task_id": task_id})
+
+    log.info("a2a.respond", task_id=task_id, has_answer=bool(answer))
     return JSONResponse(
-        {"status": "received", "note": "hitl not implemented yet"}
+        {"status": "received", "task_id": task_id, "note": "no pending interrupt for this task"}
     )
 
 
 # ---------------------------------------------------------------------------
-# Process entry — `ax-server` script binds here.
-# 프로세스 진입점 — pyproject 의 `ax-server` 스크립트가 이 함수로 매핑.
+# Process entry
 # ---------------------------------------------------------------------------
 
 
 def run() -> None:
-    """Run the daemon under uvicorn. Honours ``PORT`` env (default 8080).
-    uvicorn 으로 daemon 을 띄운다. ``PORT`` env 가 있으면 그 값(기본 8080).
-    """
+    """Run the daemon under uvicorn. Honours ``PORT`` env (default 8080)."""
     import uvicorn
 
     uvicorn.run(

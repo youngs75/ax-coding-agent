@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # .env 로드 (프로젝트 루트 또는 Docker /app/.env)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = Path(os.getenv("AX_PROJECT_ROOT", "")).resolve() if os.getenv("AX_PROJECT_ROOT") else Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 # Docker 내부에서는 /app/.env도 시도
 if (Path("/app/.env")).exists():
@@ -277,7 +277,7 @@ class Config:
         default_factory=lambda: float(os.getenv("AX_SUFF_LOW_PRD", "0.4"))
     )
 
-    # 프로젝트 경로
+    # 프로젝트 경로 — AX_PROJECT_ROOT env 로 오버라이드 가능
     project_root: Path = field(default_factory=lambda: _PROJECT_ROOT)
 
     @property
