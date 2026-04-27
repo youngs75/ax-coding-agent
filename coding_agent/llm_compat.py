@@ -17,11 +17,19 @@
      의 ``message.reasoning_content`` (또는 ``model_extra``) 를 직접 추출해
      변환 결과에 추가 (langchain-openai 의 dict 변환에서 벗겨지는 경우 대비)
 
+- **Portal LiteLLM model-id prefix policy** (``apply_litellm_model_prefix``):
+  사내 포털의 LiteLLM 게이트웨이는 KEY 단위로 허용 모델명 prefix 가 다르다
+  (apt-legal: ``"openai/"`` 부착, ax dev pod: prefix 없이 등록). 모델 ID 에
+  ``LITELLM_MODEL_PREFIX`` env 값을 강제 적용하는 helper. 빈 문자열이면
+  prefix 미부착(현재 ax dev pod 정책). z.ai/Anthropic 등 *직결* 경로는
+  건드리지 않으며, ``litellm_portal`` provider 분기에서만 호출한다.
+
 apply_compat_patches() 는 idempotent — 여러 번 호출해도 한 번만 patch.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import structlog
@@ -29,6 +37,32 @@ import structlog
 log = structlog.get_logger("llm_compat")
 
 _PATCH_APPLIED = False
+
+
+def apply_litellm_model_prefix(model: str) -> str:
+    """Apply ``LITELLM_MODEL_PREFIX`` to a portal-mode model id.
+
+    Behaviour:
+      - env unset / empty → return ``model`` untouched (ax dev pod default).
+      - env set (e.g. ``"openai/"``) → ensure ``model`` starts with that
+        prefix; idempotent if already prefixed.
+
+    This helper is for the ``LLM_PROVIDER=litellm_portal`` path *only*.
+    Direct providers (z.ai, Anthropic, dashscope, openrouter) must not
+    call this.
+
+    동작:
+      - env 미설정/빈 값 → ``model`` 그대로 반환(ax dev pod 기본 정책).
+      - env 설정(예: ``"openai/"``) → prefix 강제 부착; 이미 붙어 있으면 그대로.
+
+    portal mode 전용 helper — z.ai/Anthropic 등 직결 경로에서는 호출 금지.
+    """
+    prefix = os.environ.get("LITELLM_MODEL_PREFIX", "")
+    if not prefix:
+        return model
+    if model.startswith(prefix):
+        return model
+    return f"{prefix}{model}"
 
 
 def _extract_reasoning(raw_message: Any) -> str | None:
@@ -115,4 +149,4 @@ def apply_compat_patches() -> None:
     log.info("llm_compat.deepseek_thinking_mode_patched")
 
 
-__all__ = ["apply_compat_patches"]
+__all__ = ["apply_compat_patches", "apply_litellm_model_prefix"]

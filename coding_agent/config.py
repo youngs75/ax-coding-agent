@@ -16,6 +16,49 @@ if (Path("/app/.env")).exists():
     load_dotenv(Path("/app/.env"), override=False)
 
 
+# ── Portal observability env shim ──────────────────────────────────────────
+# The corporate portal (samsungsdscoe.com) injects ``AGENT_OBSERVABILITY_*``
+# env vars at pod-start, while every Langfuse client in this repo (and in
+# minyoung-mah) reads ``LANGFUSE_*``. Map the portal-side names to the
+# canonical Langfuse names *only* when the corresponding LANGFUSE_* slot
+# is empty — never override values explicitly set by .env / docker run.
+#
+# 사내 포털(samsungsdscoe.com) 은 Pod 기동 시 ``AGENT_OBSERVABILITY_*`` env 를
+# 주입하지만 이 repo / minyoung-mah 의 Langfuse 클라이언트는 모두
+# ``LANGFUSE_*`` 를 읽는다. 대응하는 LANGFUSE_* 가 *비어 있을 때만* 이름을
+# 옮긴다 — 명시 설정(.env/docker run -e) 은 절대 덮지 않음.
+_AGENT_OBS_LANGFUSE_MAP = (
+    ("AGENT_OBSERVABILITY_PROJECT_KEY", "LANGFUSE_PUBLIC_KEY"),
+    ("AGENT_OBSERVABILITY_SECRET_KEY", "LANGFUSE_SECRET_KEY"),
+    ("AGENT_OBSERVABILITY_BASE_URL", "LANGFUSE_HOST"),
+)
+
+
+def _apply_agent_observability_mapping() -> None:
+    """Mirror ``AGENT_OBSERVABILITY_*`` env into ``LANGFUSE_*`` if unset.
+
+    Idempotent — safe to call multiple times. Never overrides an existing
+    LANGFUSE_* value (so user-supplied .env wins). No-op when neither side
+    has anything.
+
+    ``AGENT_OBSERVABILITY_*`` env 를 ``LANGFUSE_*`` 로 미러링한다(비어 있을
+    때만). 멱등 — 여러 번 호출 안전. 기존 LANGFUSE_* 값은 절대 덮지 않으며
+    (사용자 .env 우선), 양쪽 모두 비어 있으면 아무 일도 안 한다.
+    """
+    for src, dst in _AGENT_OBS_LANGFUSE_MAP:
+        src_val = os.environ.get(src)
+        if src_val and not os.environ.get(dst):
+            os.environ[dst] = src_val
+
+
+# Apply at module import — both CLI and FastAPI daemon entry points read
+# Config after import, so by the time get_config() runs the LANGFUSE_*
+# slots are filled when the portal injected the AGENT_OBSERVABILITY_* set.
+# 모듈 import 시점에 매핑 적용 — CLI/daemon 양쪽 진입점 모두 import 이후
+# Config 를 읽으므로 포털 주입 케이스에서 LANGFUSE_* 가 올바로 채워진다.
+_apply_agent_observability_mapping()
+
+
 @dataclass(frozen=True)
 class ModelTier:
     """4-Tier 모델 설정."""
@@ -132,6 +175,25 @@ class Config:
         default_factory=lambda: os.getenv("LITELLM_MASTER_KEY", "")
     )
 
+    # ── Portal LiteLLM gateway (LLM_PROVIDER=litellm_portal) ──
+    # 사내 포털(samsungsdscoe.com) 의 LiteLLM 게이트웨이를 OpenAI-호환
+    # base_url 로 직접 호출하는 모드. 4-tier 가 모두 같은 모델로 fallback
+    # 되도록 의도(KEY 가 sonnet-4-6 하나만 허용하는 dev pod 환경 가정).
+    # `LITELLM_MODEL_PREFIX` 가 비어 있으면 prefix 미부착(KEY 가 prefix 없는
+    # 모델명만 허용하는 ax dev pod 케이스). apt-legal 처럼 "openai/" 등
+    # prefix 가 KEY 에 등록돼 있는 환경이면 명시 설정으로 부착.
+    litellm_base_url: str = field(
+        default_factory=lambda: os.getenv("LITELLM_BASE_URL", "")
+    )
+    litellm_api_key: str = field(
+        default_factory=lambda: os.getenv("LITELLM_API_KEY", "")
+    )
+    litellm_model: str = field(
+        default_factory=lambda: os.getenv(
+            "LITELLM_MODEL", "us.anthropic.claude-sonnet-4-6"
+        )
+    )
+
     # Langfuse
     langfuse_public_key: str = field(
         default_factory=lambda: os.getenv("LANGFUSE_PUBLIC_KEY", "")
@@ -210,6 +272,17 @@ class Config:
                 default=os.getenv("DEFAULT_MODEL", "default"),
                 fast=os.getenv("FAST_MODEL", "fast"),
             )
+        # Portal LiteLLM gateway — 4-tier all collapse onto one model.
+        # 포털 LiteLLM 게이트웨이 — 4-tier 가 한 모델로 수렴. dev pod 의 KEY 가
+        # sonnet-4-6 하나만 허용하는 케이스 기본 동작. tier 별 override 도 지원.
+        if self.provider == "litellm_portal":
+            base_model = self.litellm_model
+            return ModelTier(
+                reasoning=os.getenv("REASONING_MODEL", base_model),
+                strong=os.getenv("STRONG_MODEL", base_model),
+                default=os.getenv("DEFAULT_MODEL", base_model),
+                fast=os.getenv("FAST_MODEL", base_model),
+            )
         if self.provider == "dashscope":
             base = _DASHSCOPE_MODELS
         elif self.provider == "deepseek":
@@ -232,6 +305,8 @@ class Config:
         """현재 프로바이더의 API 키."""
         if self.provider == "litellm" or self.litellm_proxy_url:
             return self.litellm_master_key
+        if self.provider == "litellm_portal":
+            return self.litellm_api_key
         if self.provider == "dashscope":
             return self.dashscope_api_key
         if self.provider == "deepseek":
