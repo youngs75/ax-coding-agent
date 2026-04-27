@@ -71,9 +71,10 @@ app = FastAPI(title="ax-coding-agent", version=__version__, lifespan=lifespan)
 # ---------------------------------------------------------------------------
 
 
+@app.get("/")
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    """K8s liveness probe."""
+    """K8s liveness probe. ``/`` 는 ALB/포털 default health check 용."""
     return {"status": "ok", "version": __version__}
 
 
