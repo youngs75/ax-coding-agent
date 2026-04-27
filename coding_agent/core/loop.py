@@ -69,7 +69,9 @@ log = structlog.get_logger(__name__)
 # delegates a task with a description starting "TASK-NN:", repeated delegations
 # to the same id (verifier↔fixer cycles with slightly different prose) collapse
 # onto the same key, so the library guard catches them.
-_TASK_ID_PATTERN = re.compile(r"\bTASK-\d{2,}\b", re.IGNORECASE)
+# R-003 (2026-04-27) — keep aligned with task_tool._TASK_ID_PATTERN.
+# `\d{2,}` 가 `TASK-1`~`TASK-9` 를 silently 흘림. 1자리 + N.M 모두 흡수.
+_TASK_ID_PATTERN = re.compile(r"\bTASK-\d+(?:\.\d+)?\b", re.IGNORECASE)
 
 
 def _task_id_extractor(tool_name: str, tool_args: dict) -> str | None:

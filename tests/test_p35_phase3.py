@@ -49,7 +49,10 @@ def _task_guard(**kwargs) -> ProgressGuard:
         ("TASK-04-fixup something", "TASK-04"),
         ("no task id here", None),
         ("", None),
-        ("TASK-1 too short id", None),
+        # R-003 (2026-04-27) — 1자리 / N.M 모두 흡수해야 한다.
+        # planner 가 zero-pad 를 누락해도 ledger UI 가 stale 되지 않게.
+        ("TASK-1 single digit", "TASK-1"),
+        ("TASK-1.2 sub-task", "TASK-1.2"),
         ("multi: TASK-03 and TASK-07 — first wins", "TASK-03"),
     ],
 )

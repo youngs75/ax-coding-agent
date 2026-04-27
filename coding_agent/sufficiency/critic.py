@@ -27,6 +27,60 @@ log = structlog.get_logger("sufficiency.critic")
 _VALID_VERDICTS = {"pass", "retry_lookup", "replan", "escalate_hitl"}
 _VALID_TARGETS = {"coder", "fixer", "planner", "verifier", None}
 
+# R-003 (2026-04-27) — LLM 의 자연스러운 형식 변형을 흡수해 escalate_hitl
+# 폴백 비용을 줄인다. 기존 prompt 가 "JSON 한 줄, 엄격 준수" 를 강제하면서
+# `"PASS"` (대문자), `"passed"`, `"OK"` 같은 사소한 변형이 무조건 escalate
+# 로 빠지던 R-003 동형 사례. prompt 측 강화 대신 harness 정규화.
+_VERDICT_ALIASES = {
+    "pass": "pass",
+    "passed": "pass",
+    "ok": "pass",
+    "success": "pass",
+    "retry_lookup": "retry_lookup",
+    "retry-lookup": "retry_lookup",
+    "retry": "retry_lookup",
+    "lookup": "retry_lookup",
+    "replan": "replan",
+    "re-plan": "replan",
+    "re_plan": "replan",
+    "escalate_hitl": "escalate_hitl",
+    "escalate-hitl": "escalate_hitl",
+    "escalate": "escalate_hitl",
+    "hitl": "escalate_hitl",
+    "human": "escalate_hitl",
+}
+_TARGET_ALIASES = {
+    "coder": "coder",
+    "code": "coder",
+    "developer": "coder",
+    "fixer": "fixer",
+    "fix": "fixer",
+    "planner": "planner",
+    "plan": "planner",
+    "verifier": "verifier",
+    "verify": "verifier",
+    "test": "verifier",
+    "tester": "verifier",
+}
+
+
+def _normalize_verdict(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return _VERDICT_ALIASES.get(raw.strip().lower())
+
+
+def _normalize_target(raw: Any) -> str | None:
+    """None/null 은 자체 처리, 그 외 문자열만 alias 매핑."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "null", "none"):
+            return None
+        return _TARGET_ALIASES.get(s)
+    return None
+
 # Match the first balanced top-level JSON object. critic prompt 는 한 줄
 # JSON 만 요구하지만 LLM 이 가끔 ```json 펜스를 두르거나 짧은 머리말을
 # 붙이므로 첫 ``{...}`` 블록만 잘라낸다.
@@ -80,21 +134,18 @@ def _parse_verdict(raw_text: str) -> CriticVerdict:
             feedback_for_retry=None,
         )
 
-    verdict = obj.get("verdict")
-    if verdict not in _VALID_VERDICTS:
+    raw_verdict = obj.get("verdict")
+    verdict = _normalize_verdict(raw_verdict)
+    if verdict is None:
         return CriticVerdict(
             verdict="escalate_hitl",
             target_role=None,
-            reason=f"critic 이 알 수 없는 verdict 반환: {verdict!r}",
+            reason=f"critic 이 알 수 없는 verdict 반환: {raw_verdict!r}",
             feedback_for_retry=None,
         )
 
-    target = obj.get("target_role")
-    if isinstance(target, str) and target.lower() == "null":
-        target = None
-    if target not in _VALID_TARGETS:
-        # 잘못된 target 은 None 으로 정규화 (verdict 자체는 살림)
-        target = None
+    # target alias 매핑 — 잘못된 target 은 None 으로 정규화 (verdict 자체는 살림).
+    target = _normalize_target(obj.get("target_role"))
 
     reason = obj.get("reason") or "(critic 가 reason 을 제공하지 않음)"
     feedback = obj.get("feedback_for_retry")

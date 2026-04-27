@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from langchain_core.messages import SystemMessage
 
 from coding_agent.memory.schema import MemoryRecord
+
+# R-003 (2026-04-27) — prompt 가 "no markdown fences, no explanation" 를
+# 강제하던 형식 강제. LLM 이 머리말/설명을 섞으면 직접 ``json.loads`` 가
+# 실패해 빈 list silently 반환하던 회피. raw 안 어딘가의 첫 JSON array 를
+# 추출해 흡수 (앞뒤 자연어가 있어도 작동).
+_JSON_ARRAY_RE = re.compile(r"\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]", re.DOTALL)
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -118,11 +125,22 @@ class MemoryExtractor:
         if not text:
             return []
 
+        parsed: Any = None
         try:
-            parsed: Any = json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
-            log.warning("memory_extractor.json_parse_error", raw_text=text[:200])
-            return []
+            # Fallback — raw 안에서 첫 JSON array 패턴 추출 시도.
+            for m in _JSON_ARRAY_RE.finditer(text):
+                try:
+                    candidate = json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, list):
+                    parsed = candidate
+                    break
+            if parsed is None:
+                log.warning("memory_extractor.json_parse_error", raw_text=text[:200])
+                return []
 
         if not isinstance(parsed, list):
             log.warning("memory_extractor.unexpected_type", type=type(parsed).__name__)

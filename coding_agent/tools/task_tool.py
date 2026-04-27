@@ -63,7 +63,10 @@ log = structlog.get_logger("task_tool")
 # ---------------------------------------------------------------------------
 
 
-_TASK_ID_PATTERN = re.compile(r"\bTASK-\d{2,}\b", re.IGNORECASE)
+# R-003 (2026-04-27) — `\d{2,}` 가 `TASK-1`~`TASK-9` 1자리 ID 를 silently
+# drop 했음. planner 가 zero-pad 를 해줄 거라는 *기대* 로 형식 강제하던 회피.
+# 1자리 + N.M (sub-task) 모두 흡수해 LLM 출력 변형을 robust 하게 받는다.
+_TASK_ID_PATTERN = re.compile(r"\bTASK-\d+(?:\.\d+)?\b", re.IGNORECASE)
 
 
 def _extract_task_id(description: str) -> str | None:
