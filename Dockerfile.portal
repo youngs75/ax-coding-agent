@@ -41,9 +41,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8080
 
-# K8s liveness 가 /healthz 를 따로 찌르지만 docker run 단독 검증용으로도 두기.
+# Healthcheck — Python urllib (curl 의존 제거, apt-legal 패턴). K8s liveness
+# 가 별도로 /healthz 를 찌르지만 docker run 단독 검증용으로도 둔다.
 # K8s probes /healthz separately; this also helps standalone docker validation.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f "http://localhost:${PORT}/healthz" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os,urllib.request,sys; port=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3).status==200 else 1)"
 
-CMD ["python", "-m", "uvicorn", "coding_agent.web.app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Shell form — `${PORT}` 가 runtime 에 expand. 포털이 PORT env 로 다른 포트
+# 주입 시 자동 수용 (dev pod 의 8080 점유 등 회피). default 8080.
+# Shell form so ${PORT} expands at runtime — portal-injected PORT env wins,
+# default 8080 (apt-legal pattern).
+CMD uvicorn coding_agent.web.app:app --host 0.0.0.0 --port ${PORT:-8080}
