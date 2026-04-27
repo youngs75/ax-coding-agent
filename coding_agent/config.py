@@ -59,6 +59,27 @@ def _apply_agent_observability_mapping() -> None:
 _apply_agent_observability_mapping()
 
 
+# ── Portal LiteLLM defaults (apt-legal 패턴 차용) ──────────────────────────
+# Embed portal defaults here so the agent works on the corporate portal even
+# when no ENV is injected — same pattern as apt-legal-agent (config.py).
+# ENV-injected values still win via ``os.getenv(name, DEFAULT)``.
+#
+# config 에 portal default 를 박아두면 ENV 주입 없이도 portal 환경에서 자동
+# 동작한다 — apt-legal-agent 의 config.py 와 같은 패턴. ENV 가 있으면
+# 그쪽이 우선 (``os.getenv(name, DEFAULT)``).
+DEFAULT_LITELLM_BASE_URL = "https://litellm.samsungsdscoe.com"
+# apt-legal-agent 와 동일한 educational KEY. dev pod 정찰에서 sonnet-4-6
+# 호출 검증된 값. serving pod 는 포털 ENV 로 별도 KEY 주입(Opus 등 포함).
+# Same educational KEY as apt-legal-agent. Verified on dev pod recon for
+# sonnet-4-6 calls. Serving pod gets a richer KEY via portal ENV injection.
+DEFAULT_LITELLM_API_KEY = "sk-Yl1e-IupOCQ1_3s78368_w"
+# ax dev pod KEY 는 prefix 없는 모델명만 허용 (apt-legal KEY 는 'openai/'
+# prefix 등록). portal-infra.md §"모델 ID prefix 는 KEY 별로 다름" 참조.
+# ax dev pod KEY accepts model IDs without prefix (apt-legal KEY requires
+# 'openai/'). See portal-infra.md "model ID prefix differs per KEY".
+DEFAULT_LITELLM_MODEL = "us.anthropic.claude-sonnet-4-6"
+
+
 @dataclass(frozen=True)
 class ModelTier:
     """4-Tier 모델 설정."""
@@ -183,15 +204,13 @@ class Config:
     # 모델명만 허용하는 ax dev pod 케이스). apt-legal 처럼 "openai/" 등
     # prefix 가 KEY 에 등록돼 있는 환경이면 명시 설정으로 부착.
     litellm_base_url: str = field(
-        default_factory=lambda: os.getenv("LITELLM_BASE_URL", "")
+        default_factory=lambda: os.getenv("LITELLM_BASE_URL", DEFAULT_LITELLM_BASE_URL)
     )
     litellm_api_key: str = field(
-        default_factory=lambda: os.getenv("LITELLM_API_KEY", "")
+        default_factory=lambda: os.getenv("LITELLM_API_KEY", DEFAULT_LITELLM_API_KEY)
     )
     litellm_model: str = field(
-        default_factory=lambda: os.getenv(
-            "LITELLM_MODEL", "us.anthropic.claude-sonnet-4-6"
-        )
+        default_factory=lambda: os.getenv("LITELLM_MODEL", DEFAULT_LITELLM_MODEL)
     )
 
     # Langfuse
