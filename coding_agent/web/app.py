@@ -32,6 +32,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .agent_card import _resolve_version, build_agent_card
+from .sse_emitter import stream_agent_events
 
 log = structlog.get_logger()
 
@@ -198,44 +199,20 @@ app.post("/a2a/rest")(_handle_send)
 # ---------------------------------------------------------------------------
 
 
-async def _stream_run(user_message: str, project_id: str | None, task_id: str):
-    """Generator that runs AgentLoop and yields SSE events."""
-    yield (
-        f"event: task.start\n"
-        f"data: {json.dumps({'id': task_id, 'status': {'state': 'working'}})}\n\n"
-    ).encode()
-
-    try:
-        state = await _agent_loop.run(
-            user_message=user_message,
-            project_id=project_id,
-        )
-
-        response = _build_a2a_response(task_id, state)
-        yield (
-            f"event: task.artifact\n"
-            f"data: {json.dumps(response)}\n\n"
-        ).encode()
-
-        final_status = response["status"]["state"]
-        yield (
-            f"event: task.status\n"
-            f"data: {json.dumps({'id': task_id, 'status': {'state': final_status}})}\n\n"
-        ).encode()
-
-    except Exception as e:
-        log.error("a2a.stream.error", task_id=task_id, error=str(e))
-        yield (
-            f"event: task.status\n"
-            f"data: {json.dumps({'id': task_id, 'status': {'state': 'failed'}, 'error': str(e)})}\n\n"
-        ).encode()
-
-    yield b"event: task.end\ndata: {}\n\n"
-
-
 @app.post("/a2a/stream")
 async def tasks_stream(request: Request) -> StreamingResponse:
-    """SSE stream — runs the orchestrator and emits events."""
+    """SSE stream — runs the orchestrator and emits A2A spec events.
+
+    Emits the rich event spec used by apt-web chat UI:
+
+    - ``orchestrator.run.start`` / ``orchestrator.run.end``
+    - ``orchestrator.role.invoke.start`` / ``orchestrator.role.invoke.end``
+    - ``role.tool.call.start`` / ``role.tool.call.end``
+    - ``orchestrator.todo.change``
+    - ``input_required`` (HITL — paired with ``POST /a2a/respond``)
+
+    Mapping is in :mod:`coding_agent.web.sse_emitter`.
+    """
     task_id = str(uuid.uuid4())
 
     try:
@@ -249,7 +226,13 @@ async def tasks_stream(request: Request) -> StreamingResponse:
     log.info("a2a.stream", task_id=task_id, message_length=len(user_message))
 
     return StreamingResponse(
-        _stream_run(user_message, project_id, task_id),
+        stream_agent_events(
+            agent_loop=_agent_loop,
+            user_message=user_message,
+            task_id=task_id,
+            project_id=project_id,
+            pending_interrupts=_pending_interrupts,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -262,18 +245,30 @@ async def tasks_stream(request: Request) -> StreamingResponse:
 
 @app.post("/a2a/respond")
 async def respond(request: Request) -> JSONResponse:
-    """HITL response endpoint — resumes a paused interrupt.
+    """HITL response endpoint — resolves a paused ask_user_question interrupt.
 
-    Currently returns acknowledgement. Full interrupt-resume wiring
-    requires a task registry with pending interrupt futures — tracked
-    for the next iteration.
+    Body shape (apt-web chat UI 가 보내는 형태):
+
+    - ``session_id`` (또는 ``id`` / ``task_id``) — :func:`stream_agent_events`
+      가 ``input_required`` SSE 에 실어보낸 식별자
+    - ``answer`` (또는 ``response``) — 사용자 선택지 id 혹은 자유 답변 텍스트
+
+    Resolution flow:
+
+    1. ``_pending_interrupts[session_id]`` 에서 ``Future`` 조회
+    2. ``Future.set_result(answer)`` 로 깨움
+    3. ``stream_agent_events`` generator 가 ``Command(resume=answer)`` 로
+       LangGraph 그래프 재개 → 후속 SSE event 같은 stream 으로 emit
     """
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    task_id = body.get("id") or body.get("task_id", "")
+    # apt-web chat UI 는 ``session_id`` 로 보낸다 (sse_emitter 가
+    # ``input_required`` payload 의 ``session_id`` 필드로 emit). ``id`` /
+    # ``task_id`` 는 backward-compat fallback.
+    task_id = body.get("session_id") or body.get("id") or body.get("task_id", "")
     answer = body.get("answer") or body.get("response", "")
 
     if task_id and task_id in _pending_interrupts:
@@ -281,9 +276,10 @@ async def respond(request: Request) -> JSONResponse:
         future = entry.get("future")
         if future and not future.done():
             future.set_result(answer)
+            log.info("a2a.respond.resumed", task_id=task_id)
             return JSONResponse({"status": "resumed", "task_id": task_id})
 
-    log.info("a2a.respond", task_id=task_id, has_answer=bool(answer))
+    log.info("a2a.respond.no_pending", task_id=task_id, has_answer=bool(answer))
     return JSONResponse(
         {"status": "received", "task_id": task_id, "note": "no pending interrupt for this task"}
     )

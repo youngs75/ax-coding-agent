@@ -129,14 +129,121 @@ def test_a2a_respond_no_pending(client: TestClient) -> None:
 
 
 def test_a2a_stream_returns_sse(client: TestClient, mock_loop) -> None:
-    """POST /a2a/stream returns SSE events."""
+    """POST /a2a/stream returns SSE with rich A2A event spec.
+
+    SSE 스트림이 새 spec 이벤트를 emit 하는지 검증. mock_graph 가 빈
+    astream_events + interrupts=None 을 반환하므로 기본 흐름만 통과.
+    실제 LangGraph 통합은 EKS Pod E2E 검증이 담당.
+    """
+    # mock _graph — empty event stream + no interrupts
+    async def fake_astream(*args, **kwargs):
+        if False:  # never executes — turns this into an async generator
+            yield  # pragma: no cover
+
+    fake_state_snap = MagicMock(
+        interrupts=None,
+        values={"messages": [], "final_response": "mock final"},
+    )
+    mock_graph = MagicMock()
+    mock_graph.astream_events = fake_astream
+    mock_graph.aget_state = AsyncMock(return_value=fake_state_snap)
+    mock_loop._graph = mock_graph
+
     resp = client.post("/a2a/stream", json={"message": "hello"})
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers.get("content-type", "")
     text = resp.text
-    assert "event: task.start" in text
-    assert "event: task.artifact" in text
-    assert "event: task.end" in text
+
+    # Rich A2A spec — apt-web chat UI 가 시각화하는 이벤트 이름
+    assert "event: orchestrator.run.start" in text
+    assert "event: orchestrator.run.end" in text
+    # session_id 가 SSE payload 에 들어있어야 (apt-web 의 hitlModal.session_id 기반)
+    assert "\"session_id\":" in text
+
+
+def test_a2a_stream_emits_input_required_on_interrupt(client: TestClient, mock_loop) -> None:
+    """When AgentLoop hits an ask_user_question interrupt, the stream emits
+    ``input_required`` and registers a pending Future for ``/a2a/respond``.
+
+    AgentLoop 이 ask_user_question interrupt 에 도달하면 SSE 가
+    ``input_required`` event 를 emit 하고 ``_pending_interrupts`` 에 Future 를
+    등록한다 (HITL 라운드트립의 절반 검증 — 답변 라운드트립은 별도 단위 테스트).
+    """
+    pytest.importorskip("langgraph")
+    import asyncio
+
+    async def fake_astream(*args, **kwargs):
+        if False:
+            yield  # pragma: no cover
+
+    interrupt_payload = {
+        "kind": "ask_user_question",
+        "question": "Vue 또는 React?",
+        "choices": [{"id": "vue", "label": "Vue"}, {"id": "react", "label": "React"}],
+        "allow_free_text": False,
+    }
+    interrupt_marker = MagicMock(value=interrupt_payload)
+    fake_state_with_interrupt = MagicMock(
+        interrupts=[interrupt_marker],
+        values={"messages": [], "final_response": ""},
+    )
+    mock_graph = MagicMock()
+    mock_graph.astream_events = fake_astream
+    mock_graph.aget_state = AsyncMock(return_value=fake_state_with_interrupt)
+    mock_loop._graph = mock_graph
+
+    # 답변이 도착하지 않으면 stream_agent_events 가 5분 대기 — 테스트 빠르게
+    # 끝내기 위해 _HITL_TIMEOUT_S 를 짧게 monkey-patch.
+    import coding_agent.web.sse_emitter as emitter_mod
+    original_timeout = emitter_mod._HITL_TIMEOUT_S
+    emitter_mod._HITL_TIMEOUT_S = 0.5  # 0.5s timeout for test
+
+    try:
+        resp = client.post("/a2a/stream", json={"message": "hello"})
+        assert resp.status_code == 200
+        text = resp.text
+        # input_required 가 SSE 로 발행됨
+        assert "event: input_required" in text
+        assert "Vue 또는 React?" in text
+        # timeout 후 run.end 가 success=False 로
+        assert "event: orchestrator.run.end" in text
+    finally:
+        emitter_mod._HITL_TIMEOUT_S = original_timeout
+
+
+def test_a2a_respond_resumes_pending_interrupt() -> None:
+    """``/a2a/respond`` resolves the registered Future so the SSE stream
+    can resume.
+
+    ``/a2a/respond`` 가 등록된 Future 를 resolve 해서 SSE stream 이 재개되는지.
+    """
+    import asyncio
+    import coding_agent.web.app as app_module
+
+    loop_ = asyncio.new_event_loop()
+    try:
+        future = loop_.create_future()
+        app_module._pending_interrupts["session-xyz"] = {
+            "future": future,
+            "thread_id": "a2a-session-xyz",
+        }
+
+        client = TestClient(app_module.app)
+        resp = client.post(
+            "/a2a/respond",
+            json={"session_id": "session-xyz", "answer": "vue"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resumed"
+
+        # Future 가 resolve 됐는지 (loop_.run_until_complete 로 결과 확인)
+        assert future.done()
+        assert future.result() == "vue"
+        # _pending_interrupts 에서 제거됐는지
+        assert "session-xyz" not in app_module._pending_interrupts
+    finally:
+        loop_.close()
+        app_module._pending_interrupts.pop("session-xyz", None)
 
 
 def test_all_json_routes_return_valid_json(client: TestClient) -> None:
