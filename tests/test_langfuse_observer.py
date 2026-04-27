@@ -1,8 +1,10 @@
 """LangfuseForwardObserver — SDK 호환성 회귀 방지 테스트.
 
-Langfuse v4 SDK 는 ``client.span()`` / ``client.event()`` 를 더 이상 제공하지
-않는다. 올바른 호출 경로는 ``client.start_observation()`` / ``client.create_event()``
-이고, 반환된 span 은 ``update(output=...)`` + ``end()`` 로 마무리해야 한다.
+이 repo 는 ``langfuse>=2.0,<3`` 핀을 사용하므로 올바른 호출 경로는
+``client.span()`` / ``client.event()`` 다. v3+ 의 ``start_observation`` /
+``create_event`` 는 *v2 SDK 에 존재하지 않아* runtime AttributeError 로
+silently 떨어진다 (2026-04-27 회귀 — 실 e2e 에서 trace 누락으로 발견).
+반환된 span 은 ``update(output=...)`` + ``end()`` 로 마무리한다.
 SDK 이름이 다시 틀어져 매 이벤트마다 예외가 나도 메인 플로가 멈추지 않도록
 silent fallback 동작도 확인한다.
 """
@@ -29,21 +31,22 @@ def _mk_event(name: str, **meta):
 
 
 class TestSDKCompatibility:
-    async def test_start_event_calls_start_observation(self):
+    async def test_start_event_calls_span(self):
         client = MagicMock()
         obs = LangfuseForwardObserver(client=client)
 
         await obs.emit(_mk_event("orchestrator.role.invoke.start", run_id="r1"))
 
-        client.start_observation.assert_called_once()
-        assert client.span.called is False  # v2/legacy API must not be used
-        kwargs = client.start_observation.call_args.kwargs
+        client.span.assert_called_once()
+        # v3+ API must not be used on this v2-pinned client
+        assert client.start_observation.called is False
+        kwargs = client.span.call_args.kwargs
         assert kwargs["name"] == "orchestrator.role.invoke.start"
 
     async def test_end_event_updates_then_ends_span(self):
         client = MagicMock()
         span = MagicMock()
-        client.start_observation.return_value = span
+        client.span.return_value = span
         obs = LangfuseForwardObserver(client=client)
 
         await obs.emit(_mk_event("orchestrator.role.invoke.start", run_id="r1"))
@@ -59,10 +62,8 @@ class TestSDKCompatibility:
 
         span.update.assert_called_once()
         span.end.assert_called_once()
-        # v4 end() accepts only end_time — never output=
-        assert "output" not in span.end.call_args.kwargs
 
-    async def test_orphan_end_uses_create_event(self):
+    async def test_orphan_end_uses_event(self):
         client = MagicMock()
         obs = LangfuseForwardObserver(client=client)
 
@@ -76,14 +77,14 @@ class TestSDKCompatibility:
         )
         await obs.emit(end_evt)
 
-        client.create_event.assert_called_once()
-        assert client.event.called is False
+        client.event.assert_called_once()
+        assert client.create_event.called is False
 
 
 class TestFailSilent:
     async def test_sdk_exception_does_not_propagate(self):
         client = MagicMock()
-        client.start_observation.side_effect = RuntimeError("SDK drift")
+        client.span.side_effect = RuntimeError("SDK drift")
         obs = LangfuseForwardObserver(client=client)
 
         # Must not raise.

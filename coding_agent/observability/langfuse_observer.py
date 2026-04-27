@@ -68,8 +68,11 @@ class LangfuseForwardObserver:
         meta = event.metadata or {}
         key = self._event_key(event)
 
+        # langfuse 2.x SDK API: ``span()`` / ``event()``. v3 의
+        # ``start_observation`` / ``create_event`` 는 본 SDK (>=2,<3) 에 없음.
+        # 2026-04-27 — v2 환경에서 silently 실패하던 호출 정정.
         if name.endswith(".start"):
-            span = self._client.start_observation(
+            span = self._client.span(
                 name=name,
                 input=meta,
                 metadata={"role": event.role, "tool": event.tool},
@@ -80,7 +83,7 @@ class LangfuseForwardObserver:
             span = self._spans.pop(key, None) if key else None
             if span is None:
                 # No matching start — record a point-in-time event instead.
-                self._client.create_event(
+                self._client.event(
                     name=name,
                     metadata={
                         "role": event.role,
