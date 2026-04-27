@@ -1301,6 +1301,7 @@ class AgentLoop:
         user_message: str,
         project_id: str | None = None,
         ask_user: "AskUserCallback | None" = None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """사용자 메시지를 처리하고 최종 상태를 반환한다.
 
@@ -1309,6 +1310,13 @@ class AgentLoop:
         payload (a dict produced by the tool) and must return the
         user's answer (any JSON-serializable value). If omitted and
         an interrupt fires, the run aborts with exit_reason='no_ask_user_handler'.
+
+        ``thread_id`` lets the caller pin the LangGraph checkpointer thread
+        so consecutive turns from the same conversation accumulate state.
+        Defaults to a per-call uuid (legacy behavior — independent turns).
+
+        ``thread_id`` 를 명시하면 같은 thread 의 conversation state 가 누적.
+        미지정 시 호출마다 새 uuid (기존 동작 — 독립 turn).
         """
         self._progress_guard.reset()
 
@@ -1318,10 +1326,12 @@ class AgentLoop:
             "working_directory": get_config().project_root.as_posix(),
         }
 
-        # Each user request gets its own thread so checkpointer state
-        # does not leak between turns. The interrupt-resume loop below
-        # uses the same thread_id to continue execution.
-        thread_id = f"orch-{uuid.uuid4()}"
+        # 명시 thread_id 가 있으면 같은 conversation 의 state (memory, todo,
+        # 진행 상황) 가 누적된다. 없으면 매 turn 독립 (기존 cli 동작).
+        # Provided thread_id pins the conversation; otherwise per-call uuid
+        # keeps turns isolated (legacy CLI behavior).
+        if thread_id is None:
+            thread_id = f"orch-{uuid.uuid4()}"
         config = {
             "recursion_limit": 500,
             "configurable": {"thread_id": thread_id},

@@ -111,6 +111,45 @@ def test_a2a_tasks_send_empty_message(client: TestClient) -> None:
     assert resp.status_code == 400
 
 
+def test_a2a_tasks_send_propagates_session_id_as_thread_id(
+    client: TestClient, mock_loop
+) -> None:
+    """``params.metadata.session_id`` 가 AgentLoop.run 의 thread_id 인자로 전달.
+
+    apt-web 이 보내는 JSON-RPC envelope 형식 (params.metadata.session_id) 을
+    추출해서 LangGraph checkpointer 의 thread_id 로 사용 — 같은 session 의
+    multi-turn 이 누적되는지 확인.
+    """
+    resp = client.post(
+        "/a2a/tasks/send",
+        json={
+            "jsonrpc": "2.0",
+            "method": "tasks/send",
+            "params": {
+                "message": {"role": "user", "parts": [{"type": "text", "text": "hello"}]},
+                "metadata": {"session_id": "user-abc-123", "user_id": "u1"},
+            },
+        },
+    )
+    assert resp.status_code == 200
+    # mock_loop.run 호출 시 thread_id kwarg 확인
+    call_kwargs = mock_loop.run.call_args.kwargs
+    assert call_kwargs.get("thread_id") == "a2a-user-abc-123"
+
+
+def test_a2a_tasks_send_no_session_id_falls_back_to_task_id(
+    client: TestClient, mock_loop
+) -> None:
+    """session_id 가 없으면 task_id 기반 thread_id 로 fallback (turn 독립)."""
+    resp = client.post("/a2a/tasks/send", json={"message": "hello"})
+    assert resp.status_code == 200
+    call_kwargs = mock_loop.run.call_args.kwargs
+    thread_id = call_kwargs.get("thread_id", "")
+    # task_id 가 uuid 라 정확히 알 수 없지만 prefix 는 a2a- + uuid 패턴
+    assert thread_id.startswith("a2a-")
+    assert "user-abc-123" not in thread_id
+
+
 @pytest.mark.parametrize("path", ["/a2a", "/a2a/jsonrpc", "/a2a/rest"])
 def test_a2a_probe_fallbacks(client: TestClient, path: str) -> None:
     """Portal probe fallbacks delegate to the same handler."""

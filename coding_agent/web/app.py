@@ -114,6 +114,42 @@ def _extract_message(body: dict[str, Any]) -> str:
     return json.dumps(body)
 
 
+def _extract_session_id(body: dict[str, Any]) -> str | None:
+    """Extract conversation session id from A2A request body.
+
+    apt-web sends the session id under ``params.metadata.session_id`` (a
+    localStorage-backed value that stays the same across turns of the same
+    coding conversation). Falls back to top-level ``session_id`` / ``id``.
+
+    apt-web 은 같은 코딩 대화의 모든 turn 동안 유지되는 session_id 를
+    ``params.metadata.session_id`` 로 보낸다 (localStorage 기반). top-level
+    ``session_id`` / ``id`` 도 fallback 으로 받는다.
+    """
+    params = body.get("params", {})
+    if isinstance(params, dict):
+        meta = params.get("metadata", {})
+        if isinstance(meta, dict):
+            sid = meta.get("session_id")
+            if sid:
+                return str(sid)
+    sid = body.get("session_id") or body.get("id")
+    if sid:
+        return str(sid)
+    return None
+
+
+def _thread_id_for(session_id: str | None, task_id: str) -> str:
+    """Build LangGraph checkpointer thread_id from session_id (preferred)
+    or fall back to per-call task_id (legacy behaviour).
+
+    같은 session_id 의 turn 들은 같은 thread 에서 conversation state 누적;
+    session_id 가 없으면 task_id 기반으로 turn 독립.
+    """
+    if session_id:
+        return f"a2a-{session_id}"
+    return f"a2a-{task_id}"
+
+
 def _build_a2a_response(task_id: str, state: dict[str, Any]) -> dict[str, Any]:
     """Build A2A-compliant JSON-RPC response from AgentLoop final state."""
     final_response = state.get("final_response", "")
@@ -168,13 +204,22 @@ async def _handle_send(request: Request) -> JSONResponse:
         )
 
     project_id = body.get("project_id") or body.get("params", {}).get("project_id")
+    session_id = _extract_session_id(body)
+    thread_id = _thread_id_for(session_id, task_id)
 
-    log.info("a2a.tasks_send", task_id=task_id, message_length=len(user_message))
+    log.info(
+        "a2a.tasks_send",
+        task_id=task_id,
+        session_id=session_id,
+        thread_id=thread_id,
+        message_length=len(user_message),
+    )
 
     try:
         state = await _agent_loop.run(
             user_message=user_message,
             project_id=project_id,
+            thread_id=thread_id,
         )
         return JSONResponse(_build_a2a_response(task_id, state))
     except Exception as e:
@@ -223,8 +268,14 @@ async def tasks_stream(request: Request) -> StreamingResponse:
 
     user_message = _extract_message(body)
     project_id = body.get("project_id") or body.get("params", {}).get("project_id")
+    session_id = _extract_session_id(body)
 
-    log.info("a2a.stream", task_id=task_id, message_length=len(user_message))
+    log.info(
+        "a2a.stream",
+        task_id=task_id,
+        session_id=session_id,
+        message_length=len(user_message),
+    )
 
     return StreamingResponse(
         stream_agent_events(
@@ -232,6 +283,7 @@ async def tasks_stream(request: Request) -> StreamingResponse:
             user_message=user_message,
             task_id=task_id,
             project_id=project_id,
+            session_id=session_id,
             pending_interrupts=_pending_interrupts,
         ),
         media_type="text/event-stream",

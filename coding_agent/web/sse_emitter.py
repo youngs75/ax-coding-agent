@@ -232,6 +232,7 @@ async def stream_agent_events(
     task_id: str,
     project_id: str | None,
     pending_interrupts: dict[str, dict[str, Any]],
+    session_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Run AgentLoop and yield A2A SSE events.
 
@@ -265,9 +266,15 @@ async def stream_agent_events(
 
     graph = agent_loop._graph
     cfg = get_config()
+    # 같은 session_id 의 모든 turn 이 같은 LangGraph thread 에서 누적되도록
+    # checkpointer thread_id 를 session_id 기반으로 고정. session_id 없으면
+    # task_id 로 fallback (turn 독립).
+    # Pin LangGraph checkpointer thread to session_id so multi-turn state
+    # accumulates; fall back to task_id when no session is supplied.
+    thread_id = f"a2a-{session_id}" if session_id else f"a2a-{task_id}"
     config = {
         "recursion_limit": 500,
-        "configurable": {"thread_id": f"a2a-{task_id}"},
+        "configurable": {"thread_id": thread_id},
     }
     initial_state = {
         "messages": [HumanMessage(content=user_message)],
