@@ -286,6 +286,17 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         base_url = cfg.zai_base_url
         # GLM 4.5/4.6/5.1 도 reasoning_content 반환 — deepseek 와 동일 워크어라운드.
         extra_kwargs["disable_streaming"] = True
+    elif cfg.provider == "litellm_portal":
+        # Portal LiteLLM gateway (samsungsdscoe.com).  OpenAI-compatible path
+        # to Bedrock-served Anthropic Claude models (sonnet/opus 4-6).  No
+        # reasoning_content quirks → streaming stays enabled.  config.py
+        # already exposes ``litellm_base_url`` / ``litellm_api_key`` for this
+        # provider; without an explicit branch here, the else fell through to
+        # openrouter (silent 401, 2026-04-28 portal e2e regression).
+        # 사내 포털 LiteLLM 게이트웨이. OpenAI 호환 path 로 Bedrock Claude 호출.
+        # 분기 누락 시 else 의 openrouter 로 silent fallback 됐던 회귀 차단.
+        api_key = cfg.litellm_api_key
+        base_url = cfg.litellm_base_url
     else:
         os.environ.setdefault("OPENROUTER_API_KEY", cfg.openrouter_api_key)
         api_key = cfg.openrouter_api_key
