@@ -128,18 +128,31 @@ def _map_langgraph_event(
             {"role": state.get("last_role", "auto"), "success": success, "elapsed_ms": elapsed_ms},
         )
 
+    # ``write_todos`` / ``update_todo`` MUST surface as ``orchestrator.todo.change``
+    # regardless of where the call originates — orchestrator-direct *or* inside
+    # a SubAgent (planner typically registers the ledger from inside its own
+    # task loop).  Handle these *before* the SubAgent-suppression filter below.
+    # 2026-04-28 회귀: planner 안에서 write_todos 가 호출되면 SubAgent 억제
+    # 분기에 먼저 걸려 todo.change 가 emit 되지 않아 chat UI 의 todo panel 이
+    # 비어있던 회귀 차단.
+    if kind == "on_tool_start" and name in ("write_todos", "update_todo"):
+        return None  # start 는 emit 안 함 (end 에서 todos 추출)
+    if kind == "on_tool_end" and name in ("write_todos", "update_todo"):
+        output = data.get("output", "")
+        todos = _extract_todos(output)
+        if todos is not None:
+            return sse("orchestrator.todo.change", {"todos": todos})
+        return None
+
     # Inside SubAgent — suppress most events to reduce SSE noise
     # SubAgent 내부 — SSE 노이즈 줄이기 위해 대부분 이벤트 억제
     if state.get("subagent_depth", 0) > 0:
         return None
 
     # Top-level tool call (Orchestrator 직접 호출)
-    # role.tool.call.* — note role name inferred as orchestrator-direct
+    # role.tool.call.* — note role name inferred as orchestrator-direct.
+    # write_todos / update_todo 는 위쪽에서 todo.change 로 이미 처리됨.
     if kind == "on_tool_start":
-        # write_todos 는 별도 todo.change 이벤트로 대체하므로 여기서 emit 안 함.
-        # The write_todos call is surfaced as todo.change later, not here.
-        if name == "write_todos":
-            return None
         brief = _brief_from_tool_input(data.get("input"))
         return sse(
             "role.tool.call.start",
@@ -147,15 +160,6 @@ def _map_langgraph_event(
         )
 
     if kind == "on_tool_end":
-        # write_todos 결과는 todo.change 로 별도 emit
-        # write_todos result → emit as todo.change
-        if name == "write_todos" or name == "update_todo":
-            output = data.get("output", "")
-            todos = _extract_todos(output)
-            if todos is not None:
-                return sse("orchestrator.todo.change", {"todos": todos})
-            return None
-
         output = data.get("output", "")
         preview = _output_preview(output)
         return sse(
@@ -206,6 +210,61 @@ def _extract_todos(output: Any) -> list[dict[str, Any]] | None:
             pass
 
     return None
+
+
+def _input_required_payload(payload: dict[str, Any], task_id: str) -> dict[str, Any]:
+    """Translate an ``ask_user_question``-shaped interrupt payload into the
+    ``input_required`` SSE data field consumed by apt-web's chat UI.
+
+    Two payload shapes are accepted:
+
+    - **CLI list-of-questions** (the canonical form produced by
+      ``_build_decomposition_interrupt_payload`` and the
+      ``ask_user_question`` tool): ``{"questions": [{"question": ...,
+      "options": [{"label", "description"}, ...], "allow_other": ...}]}``.
+    - **Legacy flat** (older callers / tests):
+      ``{"question": ..., "choices": [...], "allow_free_text": ...}``.
+
+    The helper unifies both into the apt-web-friendly
+    ``{question, choices: [{id, label, description}], allow_free_text}``.
+
+    ``ask_user_question`` 형태 interrupt payload 를 apt-web chat UI 가 받는
+    ``input_required`` SSE 의 data 필드로 변환. CLI 의 ``questions[]`` 형태와
+    legacy flat 형태 둘 다 지원. CLI 형태는 ``options[].label`` 을
+    ``choices[].id`` 로 매핑.
+    """
+    questions = payload.get("questions") or []
+    first_q = questions[0] if questions else {}
+
+    question_text = (
+        first_q.get("question")
+        or payload.get("question")
+        or "추가 결정이 필요합니다"
+    )
+
+    options = first_q.get("options") or []
+    if options:
+        choices = [
+            {
+                "id": opt.get("label", ""),
+                "label": opt.get("label", ""),
+                "description": opt.get("description", ""),
+            }
+            for opt in options
+        ]
+    else:
+        choices = payload.get("choices") or []
+
+    allow_free_text = bool(
+        first_q.get("allow_other") or payload.get("allow_free_text", False)
+    )
+
+    return {
+        "session_id": task_id,
+        "question": question_text,
+        "choices": choices,
+        "allow_free_text": allow_free_text,
+    }
 
 
 def _extract_final_response(state: dict[str, Any] | None) -> str:
@@ -333,15 +392,7 @@ async def stream_agent_events(
                 "thread_id": config["configurable"]["thread_id"],
             }
 
-            yield sse(
-                "input_required",
-                {
-                    "session_id": task_id,
-                    "question": payload.get("question", "추가 결정이 필요합니다"),
-                    "choices": payload.get("choices", []),
-                    "allow_free_text": payload.get("allow_free_text", False),
-                },
-            )
+            yield sse("input_required", _input_required_payload(payload, task_id))
 
             try:
                 answer = await asyncio.wait_for(future, timeout=_HITL_TIMEOUT_S)
