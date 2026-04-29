@@ -144,6 +144,13 @@ def _map_langgraph_event(
         else:
             raw_desc, agent_type = "", "auto"
         state["subagent_started_at"] = time.monotonic()
+        # Track the role so the matching ``role.invoke.end`` can report the
+        # same value — without this, ``invoke.end`` always falls back to the
+        # initial ``"auto"`` and the chat UI shows ``: planner / : auto`` as
+        # two separate lines (2026-04-29 regression).
+        # invoke.end 가 같은 role 을 보고할 수 있도록 저장 — 누락 시 항상
+        # 초기값 "auto" 로 떨어져 chat UI 에 두 줄로 보이는 회귀.
+        state["last_role"] = agent_type
         return sse(
             "orchestrator.role.invoke.start",
             {"role": agent_type, "description": str(raw_desc)[:200]},

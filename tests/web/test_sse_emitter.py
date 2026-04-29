@@ -93,6 +93,40 @@ def test_top_level_tool_call_still_emits_role_tool_call_start() -> None:
     assert b"read_file" in frame
 
 
+# ── role.invoke role tracking ─────────────────────────────────────────────
+
+
+def test_role_invoke_end_reports_same_role_as_start() -> None:
+    """task start 의 agent_type 이 invoke.end 까지 같은 값으로 흘러야 한다.
+
+    Regression (2026-04-29): start 분기에서 ``last_role`` 저장 누락으로
+    invoke.end 가 항상 초기값 ``"auto"`` 를 보내 chat UI 에
+    ``: planner / : auto`` 두 줄로 표시되던 회귀.
+    """
+    state = {"subagent_depth": 0, "subagent_started_at": 0.0, "last_role": "auto"}
+
+    start_frame = _map_langgraph_event(
+        "on_tool_start",
+        "task",
+        {"input": {"agent_type": "planner", "description": "분해해줘"}},
+        state,
+    )
+    assert start_frame is not None
+    assert b"orchestrator.role.invoke.start" in start_frame
+    assert b'"role": "planner"' in start_frame
+    assert state["last_role"] == "planner"
+
+    end_frame = _map_langgraph_event(
+        "on_tool_end",
+        "task",
+        {"output": "COMPLETED"},
+        state,
+    )
+    assert end_frame is not None
+    assert b"orchestrator.role.invoke.end" in end_frame
+    assert b'"role": "planner"' in end_frame
+
+
 # ── input_required payload extraction ──────────────────────────────────────
 
 
