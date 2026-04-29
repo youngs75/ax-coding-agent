@@ -42,6 +42,21 @@ log = structlog.get_logger()
 _HITL_TIMEOUT_S = 300.0
 
 
+# Keep-alive interval for SSE — emit a ``: keep-alive\n\n`` comment frame
+# every N seconds when no real event has yielded so the ALB idle timeout
+# (typically 60s) doesn't drop the connection while a long LLM call is in
+# flight (Opus reasoning frequently exceeds 30s of silence).
+# SSE keep-alive 주기 — ALB idle timeout (보통 60s) 회피용. Opus reasoning
+# 등 장시간 LLM 호출 중에도 connection 유지.
+_KEEPALIVE_INTERVAL_S = 30.0
+
+
+# Sentinel placed on the internal queue to mark the end of the underlying
+# ``graph.astream_events`` async iterator. A tuple is used (not bare None)
+# so it can never collide with a real event payload.
+_QUEUE_DONE = ("__sse_emitter_done__", None)
+
+
 def sse(event_name: str, data: dict[str, Any] | None = None) -> bytes:
     """Build a single SSE frame: ``event: NAME\\ndata: JSON\\n\\n``.
 
@@ -101,6 +116,23 @@ def _map_langgraph_event(
 
     Map a single LangGraph event to an SSE frame, or None to skip.
     """
+    # Diagnostic — log every incoming event's kind/name so the harness/SSE
+    # spec drift can be correlated to what astream_events actually publishes.
+    # Only logs the high-signal events (tool start/end, key chain boundaries)
+    # to keep production noise low; token-streaming events are skipped.
+    # 2026-04-29 진단 — chat UI 가 input_required 외 events 를 0개 받는 회귀
+    # 의 근본 원인 좁히기. 주요 events 만 logging (chat_model_stream 노이즈 제외).
+    if kind in ("on_tool_start", "on_tool_end") or (
+        kind in ("on_chain_start", "on_chain_end")
+        and name in ("agent", "task", "tools", "planner", "coder", "reviewer", "verifier", "fixer", "critic")
+    ):
+        log.info(
+            "a2a.sse.event_in",
+            kind=kind,
+            name=name,
+            depth=state.get("subagent_depth", 0),
+        )
+
     # SubAgent (task tool) 위임 — orchestrator.role.invoke.* 로 변환
     # SubAgent (task tool) delegation → orchestrator.role.invoke.*
     if kind == "on_tool_start" and name == "task":
@@ -354,16 +386,60 @@ async def stream_agent_events(
 
     try:
         while True:
-            async for event in graph.astream_events(
+            # Wrap ``graph.astream_events`` with an asyncio.Queue + a
+            # background drain task so the main loop can interleave
+            # keep-alive comment frames whenever the graph is silent for
+            # longer than ``_KEEPALIVE_INTERVAL_S`` seconds.  Without this,
+            # an Opus reasoning step (often 30s+) would let the ALB idle
+            # timeout fire and the apt-web proxy would see ``ReadTimeout``.
+            # graph.astream_events 를 background drain + asyncio.Queue 로
+            # 감싸 30s 침묵 시 keep-alive frame 을 흘린다 (ALB idle timeout 회피).
+            event_iter = graph.astream_events(
                 next_input, version="v2", config=config
-            ):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
+            )
+            event_queue: asyncio.Queue = asyncio.Queue()
 
-                frame = _map_langgraph_event(kind, name, data, map_state)
-                if frame:
-                    yield frame
+            async def _drain_events() -> None:
+                try:
+                    async for ev in event_iter:
+                        await event_queue.put(("event", ev))
+                except Exception as exc:  # noqa: BLE001
+                    await event_queue.put(("exc", exc))
+                finally:
+                    await event_queue.put(_QUEUE_DONE)
+
+            drain_task = asyncio.create_task(_drain_events())
+
+            try:
+                while True:
+                    try:
+                        queue_kind, payload = await asyncio.wait_for(
+                            event_queue.get(),
+                            timeout=_KEEPALIVE_INTERVAL_S,
+                        )
+                    except asyncio.TimeoutError:
+                        yield b": keep-alive\n\n"
+                        continue
+
+                    if queue_kind == "exc":
+                        raise payload  # type: ignore[misc]
+                    if queue_kind == _QUEUE_DONE[0]:
+                        break
+
+                    event = payload
+                    kind = event.get("event", "")
+                    name = event.get("name", "")
+                    data = event.get("data", {})
+
+                    frame = _map_langgraph_event(kind, name, data, map_state)
+                    if frame:
+                        yield frame
+            finally:
+                drain_task.cancel()
+                try:
+                    await drain_task
+                except asyncio.CancelledError:
+                    pass
 
             # Stream ended — check for interrupt
             # 스트림 끝 — interrupt 검사
@@ -394,15 +470,42 @@ async def stream_agent_events(
 
             yield sse("input_required", _input_required_payload(payload, task_id))
 
+            # Wait for the user's HITL answer while interleaving keep-alive
+            # frames so the SSE connection survives the modal-open window
+            # (apt-web → ax through ALB).  ``asyncio.shield`` prevents the
+            # per-tick timeout from cancelling the long-lived future.
+            # Modal 열려있는 동안 30s 주기 keep-alive frame 으로 ALB connection
+            # 유지. asyncio.shield 로 future 가 취소되지 않게 보호.
+            deadline = time.monotonic() + _HITL_TIMEOUT_S
+            answer = None
+            hitl_timed_out = False
             try:
-                answer = await asyncio.wait_for(future, timeout=_HITL_TIMEOUT_S)
-            except asyncio.TimeoutError:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        hitl_timed_out = True
+                        break
+                    chunk_timeout = min(remaining, _KEEPALIVE_INTERVAL_S)
+                    try:
+                        answer = await asyncio.wait_for(
+                            asyncio.shield(future),
+                            timeout=chunk_timeout,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if future.done():
+                            answer = future.result()
+                            break
+                        yield b": keep-alive\n\n"
+            finally:
                 pending_interrupts.pop(task_id, None)
+
+            if hitl_timed_out:
+                if not future.done():
+                    future.cancel()
                 success = False
                 error_msg = "hitl timeout (5min)"
                 break
-            finally:
-                pending_interrupts.pop(task_id, None)
 
             # Resume graph — Command import 도 lazy (interrupt 케이스만 사용).
             from langgraph.types import Command  # noqa: WPS433
