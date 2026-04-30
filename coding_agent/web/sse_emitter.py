@@ -191,9 +191,15 @@ def _map_langgraph_event(
         todos = _todos_from_store(state.get("todo_store"))
         if todos is None:
             todos = _extract_todos(data.get("output", ""))
-        if todos is not None:
-            return sse("orchestrator.todo.change", {"todos": todos})
-        return None
+        if todos is None:
+            return None
+        # Skip if the per-event store-diff path already emitted this exact
+        # snapshot — keeps the wire frame count tight when both paths agree.
+        # store-diff 분기와 중복 emit 방지.
+        if todos == state.get("last_todos_snapshot"):
+            return None
+        state["last_todos_snapshot"] = todos
+        return sse("orchestrator.todo.change", {"todos": todos})
 
     # Inside SubAgent — suppress most events to reduce SSE noise
     # SubAgent 내부 — SSE 노이즈 줄이기 위해 대부분 이벤트 억제
@@ -225,6 +231,34 @@ def _map_langgraph_event(
     # Skip everything else (chat model streaming, chain start/end internal)
     # 기타는 skip — 채팅 모델 스트리밍·내부 chain 이벤트는 너무 잦아 noise
     return None
+
+
+def _todo_change_frame_if_changed(
+    map_state: dict[str, Any], todo_store: Any
+) -> bytes | None:
+    """Emit a ``todo.change`` SSE frame iff the live store snapshot differs
+    from the last one we emitted. Updates ``map_state`` in place.
+
+    The LangGraph ``update_todo`` tool is *not* the only path that mutates
+    the ledger: ``coding_agent.tools.task_tool._auto_advance`` writes status
+    transitions (pending → in_progress → completed) directly on the
+    ``TodoStore`` around each SubAgent delegation, bypassing the tool layer
+    entirely (no ``astream_events`` published). Polling the store at every
+    LangGraph event is the only way the chat UI can see those transitions.
+
+    write_todos / update_todo 도구 호출 외에도 task_tool.auto_advance 가 store
+    에 직접 status 갱신 → astream_events 우회. 매 event 마다 store snapshot
+    diff 검사로 보완.
+    """
+    if todo_store is None:
+        return None
+    todos = _todos_from_store(todo_store)
+    if todos is None:
+        return None
+    if todos == map_state.get("last_todos_snapshot"):
+        return None
+    map_state["last_todos_snapshot"] = todos
+    return sse("orchestrator.todo.change", {"todos": todos})
 
 
 def _todos_from_store(store: Any) -> list[dict[str, Any]] | None:
@@ -490,6 +524,20 @@ async def stream_agent_events(
                     kind = event.get("event", "")
                     name = event.get("name", "")
                     data = event.get("data", {})
+
+                    # Live store-diff probe — surfaces task_tool.auto_advance
+                    # status transitions (pending → in_progress → completed)
+                    # that bypass the LangGraph tool layer. Without this the
+                    # chat UI would only see the planner's initial write_todos
+                    # snapshot and freeze every entry at its initial status
+                    # for the rest of the run (2026-04-30 0003 regression).
+                    # task_tool 의 auto_advance 가 store 에 직접 status 갱신 →
+                    # 매 event 마다 store snapshot 비교로 보완.
+                    diff_frame = _todo_change_frame_if_changed(
+                        map_state, todo_store
+                    )
+                    if diff_frame:
+                        yield diff_frame
 
                     frame = _map_langgraph_event(kind, name, data, map_state)
                     if frame:

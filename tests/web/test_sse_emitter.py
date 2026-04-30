@@ -25,7 +25,38 @@ from __future__ import annotations
 from coding_agent.web.sse_emitter import (
     _input_required_payload,
     _map_langgraph_event,
+    _todo_change_frame_if_changed,
 )
+
+
+class _StubTodoItem:
+    """Lightweight TodoItem stand-in for sse_emitter store-snapshot tests.
+
+    sse_emitter._todos_from_store reads ``id``, ``content``, ``status`` via
+    getattr — Pydantic 의존성을 끌어들이지 않고 동일 shape 흉내.
+    """
+
+    def __init__(self, id: str, content: str, status: str) -> None:
+        self.id = id
+        self.content = content
+        self.status = status
+
+
+class _StubTodoStore:
+    """Mutable stub mirroring TodoStore.list_items() for diff-path tests."""
+
+    def __init__(self, items: list[_StubTodoItem]) -> None:
+        self._items = list(items)
+
+    def list_items(self) -> list[_StubTodoItem]:
+        return list(self._items)
+
+    def set_status(self, todo_id: str, status: str) -> None:
+        for i, it in enumerate(self._items):
+            if it.id == todo_id:
+                self._items[i] = _StubTodoItem(it.id, it.content, status)
+                return
+        raise KeyError(todo_id)
 
 
 # ── write_todos inside SubAgent ───────────────────────────────────────────
@@ -83,23 +114,15 @@ def test_write_todos_string_output_uses_store_snapshot() -> None:
     실제 production 의 write_todos 가 string 을 반환할 때, store snapshot 으로
     todos 를 surface 해야 한다. 회귀 차단.
     """
-
-    class _StubItem:
-        def __init__(self, id: str, content: str, status: str) -> None:
-            self.id, self.content, self.status = id, content, status
-
-    class _StubStore:
-        def list_items(self) -> list[_StubItem]:
-            return [
-                _StubItem("TASK-1", "FastAPI 앱 작성", "in_progress"),
-                _StubItem("TASK-2", "pytest 5개 작성", "pending"),
-            ]
-
+    store = _StubTodoStore([
+        _StubTodoItem("TASK-1", "FastAPI 앱 작성", "in_progress"),
+        _StubTodoItem("TASK-2", "pytest 5개 작성", "pending"),
+    ])
     state = {
         "subagent_depth": 1,
         "subagent_started_at": 0.0,
         "last_role": "planner",
-        "todo_store": _StubStore(),
+        "todo_store": store,
     }
     # Simulate the *real* tool ToolMessage payload — a human-readable summary,
     # not a JSON list. Previously this caused _extract_todos → None → emit skip.
@@ -140,20 +163,12 @@ def test_write_todos_string_output_without_store_skips_emit() -> None:
 
 def test_update_todo_string_output_uses_store_snapshot() -> None:
     """update_todo 도 같은 store-우선 경로를 따라야 한다."""
-
-    class _StubItem:
-        def __init__(self, id: str, content: str, status: str) -> None:
-            self.id, self.content, self.status = id, content, status
-
-    class _StubStore:
-        def list_items(self) -> list[_StubItem]:
-            return [_StubItem("TASK-1", "FastAPI 앱", "completed")]
-
+    store = _StubTodoStore([_StubTodoItem("TASK-1", "FastAPI 앱", "completed")])
     state = {
         "subagent_depth": 1,
         "subagent_started_at": 0.0,
         "last_role": "coder",
-        "todo_store": _StubStore(),
+        "todo_store": store,
     }
     frame = _map_langgraph_event(
         "on_tool_end",
@@ -164,6 +179,72 @@ def test_update_todo_string_output_uses_store_snapshot() -> None:
     assert frame is not None
     assert b"orchestrator.todo.change" in frame
     assert b"completed" in frame
+
+
+def test_todo_change_frame_emits_on_first_call() -> None:
+    """첫 호출 — last_todos_snapshot 없음 → 현재 store 그대로 emit."""
+    store = _StubTodoStore([
+        _StubTodoItem("TASK-1", "...", "pending"),
+        _StubTodoItem("TASK-2", "...", "pending"),
+    ])
+    map_state: dict = {}
+    frame = _todo_change_frame_if_changed(map_state, store)
+    assert frame is not None
+    assert b"orchestrator.todo.change" in frame
+    assert b"TASK-1" in frame and b"TASK-2" in frame
+    # snapshot 캐시 확인
+    assert map_state["last_todos_snapshot"][0]["id"] == "TASK-1"
+
+
+def test_todo_change_frame_skips_when_unchanged() -> None:
+    """동일 store snapshot 두 번 — 두 번째는 emit 안 함 (wire frame 절약)."""
+    store = _StubTodoStore([_StubTodoItem("TASK-1", "...", "pending")])
+    map_state: dict = {}
+    first = _todo_change_frame_if_changed(map_state, store)
+    second = _todo_change_frame_if_changed(map_state, store)
+    assert first is not None
+    assert second is None
+
+
+def test_todo_change_frame_emits_on_status_transition() -> None:
+    """task_tool.auto_advance 가 store 의 status 만 갱신 (LangGraph tool 우회).
+
+    회귀 (2026-04-30 0003): write_todos 의 *초기* snapshot 만 wire 에
+    도달하고 그 후 auto_advance 의 pending → in_progress → completed 가
+    silently dropped 되어 chat UI 의 모든 todo 가 끝까지 pending 으로 동결.
+    매 LangGraph event 마다 store snapshot 비교로 cover.
+    """
+    store = _StubTodoStore([_StubTodoItem("TASK-1", "...", "pending")])
+    map_state: dict = {}
+
+    # Initial — pending 으로 emit
+    f1 = _todo_change_frame_if_changed(map_state, store)
+    assert f1 is not None
+    assert b"pending" in f1
+
+    # task_tool.auto_advance(in_progress) 가 store 직접 갱신
+    store.set_status("TASK-1", "in_progress")
+    f2 = _todo_change_frame_if_changed(map_state, store)
+    assert f2 is not None
+    assert b"in_progress" in f2
+
+    # SubAgent 작업 완료 후 auto_advance(completed)
+    store.set_status("TASK-1", "completed")
+    f3 = _todo_change_frame_if_changed(map_state, store)
+    assert f3 is not None
+    assert b"completed" in f3
+
+    # 변화 없음 — None
+    f4 = _todo_change_frame_if_changed(map_state, store)
+    assert f4 is None
+
+
+def test_todo_change_frame_no_store_returns_none() -> None:
+    """store reference 없을 때 (단위 테스트 / legacy AgentLoop) — None."""
+    map_state: dict = {}
+    assert _todo_change_frame_if_changed(map_state, None) is None
+    # snapshot 도 갱신 안 함
+    assert "last_todos_snapshot" not in map_state
 
 
 def test_normal_tool_inside_subagent_still_suppressed() -> None:
