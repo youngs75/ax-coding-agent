@@ -36,10 +36,12 @@ These are plugged into the library via hooks (``resolve_role``,
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import re
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Callable
 
 import structlog
 from langchain_core.tools import StructuredTool
@@ -74,6 +76,67 @@ def _extract_task_id(description: str) -> str | None:
         return None
     m = _TASK_ID_PATTERN.search(description)
     return m.group(0).upper() if m else None
+
+
+# ---------------------------------------------------------------------------
+# Auto-chain SubAgent invoke listener — surfaces verifier/fixer to the chat UI
+# ---------------------------------------------------------------------------
+# v22 #2 의 ``_auto_verify_chain`` 은 verifier/fixer 를 ``inner_func`` Python
+# 호출로 직접 invoke (LangGraph tool 우회) — 따라서 ``astream_events`` 가
+# 이 호출들을 발행하지 않아 chat UI 에서 verifier 가 실제로 호출됐는지 확인
+# 불가. 사용자 보고: "verifier 나 fixer 는 왜 안 쓰지?" — 사실 호출됐지만
+# wire 에 안 보였던 것.
+#
+# Web stream (``coding_agent.web.sse_emitter``) 이 stream 시작 시 contextvar
+# 에 listener 를 등록하고, 이 모듈은 verifier/fixer invoke 전후로 listener 를
+# 호출. listener 는 ``orchestrator.role.invoke.{start,end}`` SSE frame 으로
+# 변환해서 chat UI 에 발행 → 사용자가 모든 SubAgent 협응을 볼 수 있다.
+#
+# CLI 모드는 listener 등록 안 함 (default ``None``) → emit 비용 0.
+# ContextVar 사용 — multi-stream concurrent (서로 다른 asyncio task) 에서도
+# 정확히 격리.
+
+SubAgentInvokeListener = Callable[[str, str, "dict[str, Any]"], None]
+"""(role, event_type "start"|"end", data) → None.
+
+data keys:
+  - start: ``description`` (str, ≤200 chars), ``attempt`` (int, 1-based)
+  - end:   ``success`` (bool), ``elapsed_ms`` (int), ``attempt`` (int)
+"""
+
+_subagent_invoke_listener: contextvars.ContextVar[
+    SubAgentInvokeListener | None
+] = contextvars.ContextVar("task_tool_subagent_invoke_listener", default=None)
+
+
+def set_subagent_invoke_listener(
+    listener: SubAgentInvokeListener | None,
+) -> contextvars.Token:
+    """Register a listener for auto-chain (verifier/fixer) SubAgent invokes.
+
+    Returns a ``Token`` for ``contextvars.ContextVar.reset`` so the caller
+    can scope the listener to its own stream / request.
+
+    web stream 이 verifier/fixer invoke 를 chat UI 로 surface 하기 위한 hook.
+    CLI 모드는 호출 안 함.
+    """
+    return _subagent_invoke_listener.set(listener)
+
+
+def _emit_subagent_invoke(role: str, event_type: str, data: dict[str, Any]) -> None:
+    """Notify the registered listener if any. Swallow listener errors."""
+    listener = _subagent_invoke_listener.get()
+    if listener is None:
+        return
+    try:
+        listener(role, event_type, data)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "task_tool.subagent_invoke_listener.error",
+            role=role,
+            event_type=event_type,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +449,14 @@ def _auto_verify_chain(
             attempt=attempt + 1,
             max_attempts=_AUTO_VERIFY_MAX_ATTEMPTS,
         )
+        # Surface to chat UI (auto-chain bypasses LangGraph tool layer).
+        _emit_subagent_invoke(
+            "verifier",
+            "start",
+            {"description": verifier_desc[:200], "attempt": attempt + 1},
+        )
+        verifier_started_at = time.monotonic()
+        verifier_success = False
         try:
             verifier_text = inner_func(
                 description=verifier_desc,
@@ -394,10 +465,38 @@ def _auto_verify_chain(
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("task_tool.auto_verify.invoke_failed", attempt=attempt + 1)
+            _emit_subagent_invoke(
+                "verifier",
+                "end",
+                {
+                    "success": False,
+                    "elapsed_ms": int((time.monotonic() - verifier_started_at) * 1000),
+                    "attempt": attempt + 1,
+                },
+            )
             cycles_log.append(
                 f"### auto-verify attempt {attempt + 1} → INVOCATION ERROR\n{exc}"
             )
             break
+
+        # Verifier 의 PASS 판정은 아래 분기와 *동일 로직* — 여기서 미리 평가해
+        # invoke.end 의 success 필드에 정확히 반영. 이중 평가지만 비용 미미.
+        # PASS 판정: COMPLETED 마커 + execute 실패 마커 부재.
+        verifier_success = (
+            "[Task COMPLETED" in verifier_text
+            and not any(
+                marker in verifier_text for marker in _EXECUTE_FAILURE_MARKERS
+            )
+        )
+        _emit_subagent_invoke(
+            "verifier",
+            "end",
+            {
+                "success": verifier_success,
+                "elapsed_ms": int((time.monotonic() - verifier_started_at) * 1000),
+                "attempt": attempt + 1,
+            },
+        )
 
         last_verifier_text = verifier_text
         cycles_log.append(
@@ -434,6 +533,12 @@ def _auto_verify_chain(
         # fixer 호출
         fixer_desc = _build_auto_fixer_description(coder_description, verifier_text)
         fixer_id = f"{base_tool_call_id}-auto-fix-{attempt}"
+        _emit_subagent_invoke(
+            "fixer",
+            "start",
+            {"description": fixer_desc[:200], "attempt": attempt + 1},
+        )
+        fixer_started_at = time.monotonic()
         try:
             fixer_text = inner_func(
                 description=fixer_desc,
@@ -442,10 +547,28 @@ def _auto_verify_chain(
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("task_tool.auto_verify.fixer_failed", attempt=attempt + 1)
+            _emit_subagent_invoke(
+                "fixer",
+                "end",
+                {
+                    "success": False,
+                    "elapsed_ms": int((time.monotonic() - fixer_started_at) * 1000),
+                    "attempt": attempt + 1,
+                },
+            )
             cycles_log.append(
                 f"### auto-fix attempt {attempt + 1} → INVOCATION ERROR\n{exc}"
             )
             break
+        _emit_subagent_invoke(
+            "fixer",
+            "end",
+            {
+                "success": "[Task COMPLETED" in fixer_text,
+                "elapsed_ms": int((time.monotonic() - fixer_started_at) * 1000),
+                "attempt": attempt + 1,
+            },
+        )
 
         cycles_log.append(f"### auto-fix attempt {attempt + 1}\n{fixer_text}")
 
@@ -815,9 +938,11 @@ def build_parallel_tasks_tool(
 
 
 __all__ = [
+    "SubAgentInvokeListener",
     "_auto_advance_todo",
     "_extract_task_id",
     "_verifier_signals_success",
     "build_parallel_tasks_tool",
     "build_task_tool",
+    "set_subagent_invoke_listener",
 ]

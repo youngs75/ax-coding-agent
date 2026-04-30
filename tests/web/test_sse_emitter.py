@@ -22,8 +22,11 @@ apt-web chat UI 가 받는 SSE event 매핑 회귀 차단. 위 두 회귀가 같
 
 from __future__ import annotations
 
+from collections import deque
+
 from coding_agent.web.sse_emitter import (
     _input_required_payload,
+    _make_subagent_invoke_listener,
     _map_langgraph_event,
     _todo_change_frame_if_changed,
 )
@@ -237,6 +240,101 @@ def test_todo_change_frame_emits_on_status_transition() -> None:
     # 변화 없음 — None
     f4 = _todo_change_frame_if_changed(map_state, store)
     assert f4 is None
+
+
+# ── auto-chain (verifier / fixer) invoke surfacing ─────────────────────────
+
+
+def test_subagent_invoke_listener_start_emits_role_invoke_start() -> None:
+    """task_tool._auto_verify_chain 이 verifier 호출 직전 emit("start", ...) 하면
+    listener 가 ``orchestrator.role.invoke.start`` SSE frame 을 push.
+
+    회귀 (2026-04-30 0004): _auto_verify_chain 이 LangGraph tool 우회 →
+    astream_events 발행 안 함 → chat UI 가 verifier/fixer 호출을 못 봐서
+    사용자가 "verifier 안 쓰는 것 같다" 고 오해. listener path 가 cover.
+    """
+    frames: deque = deque()
+    listener = _make_subagent_invoke_listener(frames)
+    listener("verifier", "start", {"description": "verify TASK-1", "attempt": 1})
+    assert len(frames) == 1
+    text = frames[0].decode("utf-8")
+    assert "orchestrator.role.invoke.start" in text
+    assert '"role": "verifier"' in text
+    # description 이 attempt 라벨로 prefix 됨 — chat UI 에서 auto-chain 인지
+    # 사용자가 시각적으로 구분
+    assert "[auto-chain attempt 1]" in text
+    assert "verify TASK-1" in text
+
+
+def test_subagent_invoke_listener_end_emits_role_invoke_end() -> None:
+    """end emit 이 success/elapsed_ms 메타데이터 포함 frame 생성."""
+    frames: deque = deque()
+    listener = _make_subagent_invoke_listener(frames)
+    listener(
+        "verifier",
+        "end",
+        {"success": True, "elapsed_ms": 12345, "attempt": 1},
+    )
+    assert len(frames) == 1
+    text = frames[0].decode("utf-8")
+    assert "orchestrator.role.invoke.end" in text
+    assert '"role": "verifier"' in text
+    assert '"success": true' in text
+    assert "12345" in text
+
+
+def test_subagent_invoke_listener_fixer_failure_surfaces() -> None:
+    """fixer 호출 실패 시 success=false 로 surface — chat UI 가 시각적으로 구분."""
+    frames: deque = deque()
+    listener = _make_subagent_invoke_listener(frames)
+    listener("fixer", "start", {"description": "fix TASK-1", "attempt": 2})
+    listener("fixer", "end", {"success": False, "elapsed_ms": 9999, "attempt": 2})
+    assert len(frames) == 2
+    end_text = frames[1].decode("utf-8")
+    assert '"role": "fixer"' in end_text
+    assert '"success": false' in end_text
+
+
+def test_subagent_invoke_listener_full_chain_sequence() -> None:
+    """전형적 auto-chain 흐름 — verifier×3 + fixer×2 (Decision D 최악 케이스)."""
+    frames: deque = deque()
+    listener = _make_subagent_invoke_listener(frames)
+
+    # attempt 1: verifier FAIL → fixer 1
+    listener("verifier", "start", {"description": "v1", "attempt": 1})
+    listener("verifier", "end", {"success": False, "elapsed_ms": 5000, "attempt": 1})
+    listener("fixer", "start", {"description": "f1", "attempt": 1})
+    listener("fixer", "end", {"success": True, "elapsed_ms": 8000, "attempt": 1})
+
+    # attempt 2: verifier FAIL → fixer 2
+    listener("verifier", "start", {"description": "v2", "attempt": 2})
+    listener("verifier", "end", {"success": False, "elapsed_ms": 4500, "attempt": 2})
+    listener("fixer", "start", {"description": "f2", "attempt": 2})
+    listener("fixer", "end", {"success": True, "elapsed_ms": 7500, "attempt": 2})
+
+    # attempt 3: verifier PASS — fixer 추가 호출 안 함
+    listener("verifier", "start", {"description": "v3", "attempt": 3})
+    listener("verifier", "end", {"success": True, "elapsed_ms": 4000, "attempt": 3})
+
+    assert len(frames) == 10
+    # 마지막 verifier end 가 success=true (Decision D — 통과 시 Hard escalate 안 함)
+    last_text = frames[-1].decode("utf-8")
+    assert '"role": "verifier"' in last_text
+    assert '"success": true' in last_text
+
+
+def test_subagent_invoke_listener_swallows_exceptions() -> None:
+    """listener 자체 결함이 _auto_verify_chain 을 깨뜨려선 안 됨.
+
+    한 stream 에서 sse() 가 어떤 이유로 예외 던져도 (e.g. memory pressure),
+    auto-chain 은 정상 진행 — 단지 그 frame 만 lost. 다음 invoke 는 재시도.
+    """
+    frames: deque = deque()
+    listener = _make_subagent_invoke_listener(frames)
+
+    # event_type 가 "start"/"end" 도 아닌 unknown — 분기 통과 + no append
+    listener("verifier", "unknown_event", {})
+    assert len(frames) == 0
 
 
 def test_todo_change_frame_no_store_returns_none() -> None:

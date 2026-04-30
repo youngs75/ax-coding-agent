@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from typing import Any, AsyncIterator
 
 import structlog
@@ -231,6 +232,56 @@ def _map_langgraph_event(
     # Skip everything else (chat model streaming, chain start/end internal)
     # 기타는 skip — 채팅 모델 스트리밍·내부 chain 이벤트는 너무 잦아 noise
     return None
+
+
+def _make_subagent_invoke_listener(
+    extra_frames: deque,  # type: ignore[type-arg]
+) -> Any:
+    """Build the closure that ``task_tool`` will call before/after each
+    auto-chain SubAgent invoke (verifier / fixer).
+
+    The listener appends ``orchestrator.role.invoke.{start,end}`` SSE frames
+    to ``extra_frames``; the main stream loop drains the queue at every
+    LangGraph event tick so the chat UI sees the invokes interleaved with
+    coder activity in roughly real time.
+
+    Factored out so unit tests can verify frame shape without spinning up a
+    full LangGraph stream — the closure is otherwise inaccessible from
+    outside ``stream_agent_events``.
+
+    auto-chain (verifier/fixer) invoke 마다 SSE frame 을 queue 에 push 하는
+    closure. 단위 테스트 가능하도록 별도 factory 로 분리 — stream 안의 closure
+    는 직접 접근 불가능하므로.
+    """
+
+    def _listener(role: str, event_type: str, data: dict[str, Any]) -> None:
+        try:
+            if event_type == "start":
+                desc = str(data.get("description", ""))
+                attempt = data.get("attempt")
+                if attempt:
+                    desc = f"[auto-chain attempt {attempt}] {desc}"
+                extra_frames.append(
+                    sse(
+                        "orchestrator.role.invoke.start",
+                        {"role": role, "description": desc[:200]},
+                    )
+                )
+            elif event_type == "end":
+                extra_frames.append(
+                    sse(
+                        "orchestrator.role.invoke.end",
+                        {
+                            "role": role,
+                            "success": bool(data.get("success", True)),
+                            "elapsed_ms": int(data.get("elapsed_ms", 0)),
+                        },
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("a2a.sse.subagent_invoke_listener.error", error=str(exc))
+
+    return _listener
 
 
 def _todo_change_frame_if_changed(
@@ -474,6 +525,25 @@ async def stream_agent_events(
         "todo_store": todo_store,
     }
 
+    # Out-of-band SSE frames — for events that don't come from
+    # ``graph.astream_events``. v22 #2 의 ``_auto_verify_chain`` 이
+    # verifier/fixer 를 LangGraph tool 호출이 아니라 ``inner_func`` Python
+    # 직접 호출로 invoke 하므로, 별도 listener 를 task_tool 에 등록해
+    # invoke.start/end 를 이 queue 로 push → main loop 가 매 iteration drain.
+    # 이렇게 해야 chat UI 에 모든 SubAgent (planner / coder / verifier /
+    # fixer) 협응이 보인다.
+    extra_frames: deque[bytes] = deque()
+    invoke_listener = _make_subagent_invoke_listener(extra_frames)
+
+    # Register listener — scoped to this stream via ContextVar token reset.
+    # CLI 모드는 register 안 하므로 default ``None`` 그대로.
+    invoke_listener_token = None
+    try:
+        from coding_agent.tools.task_tool import set_subagent_invoke_listener
+        invoke_listener_token = set_subagent_invoke_listener(invoke_listener)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("a2a.stream.invoke_listener.unavailable", error=str(exc))
+
     next_input: Any = initial_state
     success = True
     error_msg = ""
@@ -538,6 +608,11 @@ async def stream_agent_events(
                     )
                     if diff_frame:
                         yield diff_frame
+
+                    # Drain extra frames (verifier/fixer auto-chain invokes)
+                    # accumulated since the last LangGraph event tick.
+                    while extra_frames:
+                        yield extra_frames.popleft()
 
                     frame = _map_langgraph_event(kind, name, data, map_state)
                     if frame:
@@ -624,6 +699,26 @@ async def stream_agent_events(
         log.error("a2a.stream.error", task_id=task_id, error=str(exc))
         success = False
         error_msg = f"{type(exc).__name__}: {exc}"
+    finally:
+        # Reset the per-stream subagent invoke listener so it can't outlive
+        # the generator (esp. when the client disconnects mid-stream and the
+        # generator is garbage-collected — the contextvar would otherwise
+        # leak the closure).
+        # listener token reset — generator 가 GC 되거나 클라이언트가 중간에
+        # 끊어도 closure leak 방지.
+        if invoke_listener_token is not None:
+            try:
+                from coding_agent.tools.task_tool import (
+                    _subagent_invoke_listener,
+                )
+                _subagent_invoke_listener.reset(invoke_listener_token)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("a2a.stream.invoke_listener.reset_failed", error=str(exc))
+
+    # Drain any verifier/fixer invoke frames that landed after the LangGraph
+    # stream closed (auto-chain may complete in tail-end of the final task).
+    while extra_frames:
+        yield extra_frames.popleft()
 
     # Final response from graph state
     final_response = ""
