@@ -73,6 +73,99 @@ def test_write_todos_start_inside_subagent_is_silent() -> None:
     assert frame is None
 
 
+def test_write_todos_string_output_uses_store_snapshot() -> None:
+    """Production write_todos returns a *summary string* (render_todo_summary),
+    not a structured list. Without a TodoStore reference the mapper used to
+    fall back to JSON parsing of that string, fail, and silently drop every
+    todo.change event — the chat UI's todo panel stayed empty for the entire
+    portal e2e (2026-04-30).
+
+    실제 production 의 write_todos 가 string 을 반환할 때, store snapshot 으로
+    todos 를 surface 해야 한다. 회귀 차단.
+    """
+
+    class _StubItem:
+        def __init__(self, id: str, content: str, status: str) -> None:
+            self.id, self.content, self.status = id, content, status
+
+    class _StubStore:
+        def list_items(self) -> list[_StubItem]:
+            return [
+                _StubItem("TASK-1", "FastAPI 앱 작성", "in_progress"),
+                _StubItem("TASK-2", "pytest 5개 작성", "pending"),
+            ]
+
+    state = {
+        "subagent_depth": 1,
+        "subagent_started_at": 0.0,
+        "last_role": "planner",
+        "todo_store": _StubStore(),
+    }
+    # Simulate the *real* tool ToolMessage payload — a human-readable summary,
+    # not a JSON list. Previously this caused _extract_todos → None → emit skip.
+    summary_string = (
+        "Todos: 2 total — pending=1, in_progress=1, completed=0.\n"
+        "  [~] TASK-1: FastAPI 앱 작성\n"
+        "  [ ] TASK-2: pytest 5개 작성"
+    )
+    frame = _map_langgraph_event(
+        "on_tool_end", "write_todos", {"output": summary_string}, state
+    )
+    assert frame is not None, (
+        "write_todos with string summary output must still emit todo.change "
+        "via the TodoStore snapshot (regression: portal e2e 2026-04-30)."
+    )
+    text = frame.decode("utf-8")
+    assert "orchestrator.todo.change" in text
+    assert "TASK-1" in text
+    assert "TASK-2" in text
+    assert "in_progress" in text
+
+
+def test_write_todos_string_output_without_store_skips_emit() -> None:
+    """No store + string output → skip cleanly (no false positive frame).
+
+    Defensive: if AgentLoop ever ships without ``get_todo_store`` we should
+    skip rather than emit a malformed frame.
+    """
+    state = {"subagent_depth": 1, "subagent_started_at": 0.0, "last_role": "planner"}
+    frame = _map_langgraph_event(
+        "on_tool_end",
+        "write_todos",
+        {"output": "Todos: 1 total — pending=1, in_progress=0, completed=0."},
+        state,
+    )
+    assert frame is None
+
+
+def test_update_todo_string_output_uses_store_snapshot() -> None:
+    """update_todo 도 같은 store-우선 경로를 따라야 한다."""
+
+    class _StubItem:
+        def __init__(self, id: str, content: str, status: str) -> None:
+            self.id, self.content, self.status = id, content, status
+
+    class _StubStore:
+        def list_items(self) -> list[_StubItem]:
+            return [_StubItem("TASK-1", "FastAPI 앱", "completed")]
+
+    state = {
+        "subagent_depth": 1,
+        "subagent_started_at": 0.0,
+        "last_role": "coder",
+        "todo_store": _StubStore(),
+    }
+    frame = _map_langgraph_event(
+        "on_tool_end",
+        "update_todo",
+        {"output": "Updated TASK-1 → completed."},
+        state,
+    )
+    assert frame is not None
+    assert b"orchestrator.todo.change" in frame
+    assert b"completed" in frame
+
+
 def test_normal_tool_inside_subagent_still_suppressed() -> None:
     """기존 동작 보존 — SubAgent 안의 일반 tool 은 여전히 SSE 노이즈로 억제."""
     state = {"subagent_depth": 1, "subagent_started_at": 0.0, "last_role": "planner"}

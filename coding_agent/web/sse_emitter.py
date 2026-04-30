@@ -177,8 +177,20 @@ def _map_langgraph_event(
     if kind == "on_tool_start" and name in ("write_todos", "update_todo"):
         return None  # start 는 emit 안 함 (end 에서 todos 추출)
     if kind == "on_tool_end" and name in ("write_todos", "update_todo"):
-        output = data.get("output", "")
-        todos = _extract_todos(output)
+        # Prefer the live ``TodoStore`` snapshot — the tool's own return value
+        # is a human-readable summary string (``render_todo_summary``), not a
+        # structured list, so parsing the ToolMessage output silently dropped
+        # every todo.change frame on the wire (2026-04-30 portal e2e). When a
+        # store reference is available we read straight from the source of
+        # truth; otherwise we fall back to best-effort output parsing for unit
+        # tests that exercise the mapper without a live AgentLoop.
+        # write_todos 의 ToolMessage output 은 사람-읽기-용 summary string 이라
+        # _extract_todos 가 None 으로 떨어져 todo.change 가 모든 호출에서
+        # silently dropped 됐다. store snapshot 을 우선 사용하고, store 가
+        # 없을 때만 (단위 테스트 경로) output 파싱 fallback.
+        todos = _todos_from_store(state.get("todo_store"))
+        if todos is None:
+            todos = _extract_todos(data.get("output", ""))
         if todos is not None:
             return sse("orchestrator.todo.change", {"todos": todos})
         return None
@@ -213,6 +225,34 @@ def _map_langgraph_event(
     # Skip everything else (chat model streaming, chain start/end internal)
     # 기타는 skip — 채팅 모델 스트리밍·내부 chain 이벤트는 너무 잦아 noise
     return None
+
+
+def _todos_from_store(store: Any) -> list[dict[str, Any]] | None:
+    """Read the live todo ledger from a ``TodoStore`` reference, if provided.
+
+    Returns ``None`` when *store* is ``None`` or does not expose
+    ``list_items()``. Returns ``[]`` when the ledger exists but is currently
+    empty — that is still a meaningful change (``write_todos`` may have been
+    called with a fresh empty list, or the planner reset the ledger).
+
+    AgentLoop 의 TodoStore 에서 직접 todo 목록을 읽는다. tool output 의 사람-읽기-용
+    string 을 파싱하지 않고 source-of-truth 를 그대로 surface — write_todos /
+    update_todo 의 반환 형식 변경에 견고.
+    """
+    if store is None:
+        return None
+    list_items = getattr(store, "list_items", None)
+    if not callable(list_items):
+        return None
+    items = list_items()
+    return [
+        {
+            "id": str(getattr(it, "id", "")),
+            "content": str(getattr(it, "content", "")),
+            "status": str(getattr(it, "status", "pending")),
+        }
+        for it in items
+    ]
 
 
 def _extract_todos(output: Any) -> list[dict[str, Any]] | None:
@@ -380,11 +420,24 @@ async def stream_agent_events(
         "working_directory": os.getcwd(),
     }
 
-    # Per-stream mapping state — subagent depth, last role, etc.
+    # Per-stream mapping state — subagent depth, last role, plus a live
+    # reference to the AgentLoop's TodoStore so write_todos / update_todo
+    # events can publish the ledger snapshot directly (the tool's own
+    # ToolMessage output is a human-readable summary string, not parseable).
+    # AgentLoop 의 TodoStore 를 주입 — write_todos / update_todo 이벤트가
+    # tool output (string summary) 대신 store snapshot 을 직접 읽는다.
+    todo_store = None
+    get_store = getattr(agent_loop, "get_todo_store", None)
+    if callable(get_store):
+        try:
+            todo_store = get_store()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("a2a.stream.todo_store.unavailable", error=str(exc))
     map_state: dict[str, Any] = {
         "subagent_depth": 0,
         "subagent_started_at": 0.0,
         "last_role": "auto",
+        "todo_store": todo_store,
     }
 
     next_input: Any = initial_state
