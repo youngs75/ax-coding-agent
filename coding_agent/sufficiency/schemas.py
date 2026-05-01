@@ -22,7 +22,7 @@ class CodeQualityGateResult:
 
     metrics 는 free-form dict — 보통 다음 키를 포함:
     ``pytest_exit, lint_errors, todo_done, todo_total, todo_ratio,
-    prd_coverage``. None 값은 "신호 없음" 으로 간주.
+    artifacts_missing, done_condition_violations``. None 값은 "신호 없음".
     """
 
     level: GateLevel

@@ -118,7 +118,7 @@ write_todos(todos=[
 - pure text                ← glob 아님
 ```
 
-### ❌ 자연어 조건이 섞인 패턴 (v22.4 — v25 회귀의 직접 원인)
+### ❌ 자연어 조건이 섞인 패턴 (v25 회귀의 직접 원인)
 ```markdown
 ## Forbidden Patterns
 - **/requirements.txt must exist (Python backend)
@@ -126,16 +126,18 @@ write_todos(todos=[
 - **/package.json (if containing non-frontend dependencies)
   ← ``if`` 조건은 harness 가 평가 못 함
 - *.vue should not appear when React was chosen
-  ← ``should not`` 자연어 — 같은 줄에서 거부됨
+  ← ``should not`` 자연어 — bullet 자체가 forbidden 의도가 아님
 - *.py 가 있어야 함
-  ← 한국어 ``있어야 함`` — 거부됨
+  ← 반대 의미. 필수 파일을 forbidden 으로 등록하면 안 됨
 ```
 
 **규칙**: `## Forbidden Patterns` 의 모든 bullet 은 *순수 glob* 이어야
-한다. ``must`` / ``should`` / ``if`` / ``when`` / ``only`` / ``except`` /
-``필수`` / ``있어야`` / ``없어야`` 같은 자연어 조건어가 같은 줄에 있으면
-sufficiency.signals 가 그 패턴을 무효화 (안전망). bullet 끝 괄호 메모는
-허용 (`- *.vue (React was chosen)`) — 위 키워드만 피하면 된다.
+한다. bullet 은 sufficiency.gate 가 *기계적* 으로 워크스페이스에 매치
+시도하는 입력 — 자연어 조건이 섞이면 매치 시도가 무의미해지거나
+*반대 의미* 가 된다. 같은 줄에 ``must`` / ``should`` / ``if`` / ``when`` /
+``unless`` / ``except`` / ``필수`` / ``있어야`` / ``없어야`` 같은 조건어를
+넣지 말 것. bullet 끝 괄호 메모는 허용 (`- *.vue (React was chosen)`) —
+glob 자체가 forbidden 의도를 표현해야 한다.
 
 ### ❌ 헤더 텍스트 다름
 ```markdown

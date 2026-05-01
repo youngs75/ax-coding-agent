@@ -291,12 +291,8 @@ class Config:
     sufficiency_low_todo: float = field(
         default_factory=lambda: float(os.getenv("AX_SUFF_LOW_TODO", "0.5"))
     )
-    sufficiency_high_prd: float = field(
-        default_factory=lambda: float(os.getenv("AX_SUFF_HIGH_PRD", "0.85"))
-    )
-    sufficiency_low_prd: float = field(
-        default_factory=lambda: float(os.getenv("AX_SUFF_LOW_PRD", "0.4"))
-    )
+    # NOTE — ``sufficiency_high_prd`` / ``sufficiency_low_prd`` 는 R-003 폐기
+    # (2026-05-01) 와 함께 제거. PRD ↔ 산출물 정합성은 critic LLM 의 영역.
 
     # 프로젝트 경로 — AX_PROJECT_ROOT env 로 오버라이드 가능
     project_root: Path = field(default_factory=lambda: _PROJECT_ROOT)

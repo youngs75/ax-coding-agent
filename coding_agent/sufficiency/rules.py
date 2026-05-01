@@ -4,11 +4,15 @@ LLM critic 호출 없이 휴리스틱 verdict 를 만든다.
 apt-legal 의 ``rules.evaluate_sufficiency`` + ``_route_low_to_verdict``
 패턴을 ax 코딩 도메인 신호에 맞게 재구성:
 
-- HIGH: pytest pass + lint 0 + todo_ratio 충분 + PRD 커버리지 충분
-- LOW : pytest fail / todo_ratio 매우 낮음 / PRD 커버리지 매우 낮음
-- MEDIUM: 그 외 — LLM critic 으로 판정
+- HIGH: pytest pass + lint 0 + todo_ratio 충분 + DONE_CONDITION 위반 0
+- LOW : pytest fail / todo_ratio 매우 낮음 / DONE_CONDITION 위반 / 산출물 누락
+- MEDIUM: 그 외 — LLM critic 으로 판정 (PRD ↔ 산출물 의미 정합성은 critic 영역)
 
 None 신호는 "신호 없음" 으로 다뤄 HIGH 쪽을 막지 않는다 (보수).
+
+R-003 폐기 (2026-05-01): ``prd_coverage`` 신호 + ``high_prd`` / ``low_prd``
+임계값 분기 모두 제거. PRD ↔ 산출물 정합성은 substring matching + 임계값
+분류로 처리할 수 없는 *판단 영역* — critic LLM 으로 위임.
 """
 
 from __future__ import annotations
@@ -38,8 +42,6 @@ def evaluate(
     *,
     high_todo: float,
     low_todo: float,
-    high_prd: float,
-    low_prd: float,
 ) -> CodeQualityGateResult:
     """Classify signals into HIGH/MEDIUM/LOW.
 
@@ -47,12 +49,10 @@ def evaluate(
     - ``pytest_exit is None`` : 테스트 미실행 — HIGH 막지 않음, LOW 도 안 만듦
     - ``lint_errors is None`` : reviewer 미동작 — HIGH 막지 않음
     - ``todo_total == 0``     : ledger 미사용 — todo_ratio 는 1.0 으로 간주
-    - ``prd_coverage`` 가 1.0 : PRD 부재 — HIGH 막지 않음
     """
     pytest_exit = signals.get("pytest_exit")
     lint_errors = signals.get("lint_errors")
     todo_ratio = float(signals.get("todo_ratio", 1.0))
-    prd_coverage = float(signals.get("prd_coverage", 1.0))
     artifacts_missing = list(signals.get("artifacts_missing") or [])
     done_condition_violations = list(signals.get("done_condition_violations") or [])
 
@@ -115,40 +115,27 @@ def evaluate(
             metrics=dict(signals),
             reason="; ".join(reasons),
         )
-    if prd_coverage < low_prd:
-        triggered.append(f"prd_coverage={prd_coverage:.2f}<{low_prd}")
-        reasons.append(f"PRD 커버리지 {prd_coverage:.0%} < {low_prd:.0%}")
-        return CodeQualityGateResult(
-            level="LOW",
-            triggered_signals=triggered,
-            metrics=dict(signals),
-            reason="; ".join(reasons),
-        )
 
     # ── HIGH ──
     high_pytest = pytest_exit in (0, None)
     high_lint = lint_errors is None or lint_errors == 0
     high_todo_ok = todo_ratio >= high_todo
-    high_prd_ok = prd_coverage >= high_prd
-    if high_pytest and high_lint and high_todo_ok and high_prd_ok:
+    if high_pytest and high_lint and high_todo_ok:
         if pytest_exit == 0:
             triggered.append("pytest_pass")
         if lint_errors == 0:
             triggered.append("lint_zero")
         triggered.append(f"todo_ratio={todo_ratio:.2f}>={high_todo}")
-        triggered.append(f"prd_coverage={prd_coverage:.2f}>={high_prd}")
         return CodeQualityGateResult(
             level="HIGH",
             triggered_signals=triggered,
             metrics=dict(signals),
-            reason="모든 신호가 임계값 통과",
+            reason="결정론 신호 모두 임계값 통과 — PRD ↔ 산출물 정합성은 critic 영역",
         )
 
     # ── MEDIUM ──
     if not high_todo_ok:
         triggered.append(f"todo_ratio={todo_ratio:.2f}")
-    if not high_prd_ok:
-        triggered.append(f"prd_coverage={prd_coverage:.2f}")
     if not high_pytest:
         triggered.append(f"pytest_exit={pytest_exit}")
     if not high_lint:
@@ -166,10 +153,14 @@ def heuristic_verdict_for_low(
 ) -> CriticVerdict:
     """LOW band 에서 LLM critic 비용 없이 retry/replan 결정을 만든다.
 
-    apt-legal `_route_low_to_verdict` 의 ax 도메인 적용:
-    - pytest 실패 → ``target_role="fixer"`` retry
-    - todo_ratio 부족 → ``target_role="coder"`` retry
-    - PRD 커버리지만 낮음 → ``target_role="planner"`` replan
+    apt-legal `_route_low_to_verdict` 의 ax 도메인 적용 (결정론 신호만):
+    - DONE_CONDITION 위반 → ``fixer``
+    - 산출물 누락 → ``planner`` replan
+    - pytest 실패 → ``fixer`` retry
+    - todo_ratio 부족 → ``coder`` retry
+
+    PRD ↔ 산출물의 의미적 정합성은 LLM critic 의 영역이라 LOW heuristic 에선
+    분기하지 않는다 — MEDIUM 에서 critic 이 직접 판정.
 
     어떤 분기든 작은 자연어 feedback 을 ``feedback_for_retry`` 에 채워
     다음 iteration 에 HumanMessage 로 주입된다.
@@ -177,7 +168,6 @@ def heuristic_verdict_for_low(
     metrics = gate.metrics
     pytest_exit = metrics.get("pytest_exit")
     todo_ratio = float(metrics.get("todo_ratio", 1.0))
-    prd_coverage = float(metrics.get("prd_coverage", 1.0))
     artifacts_missing = list(metrics.get("artifacts_missing") or [])
     done_condition_violations = list(metrics.get("done_condition_violations") or [])
 
@@ -259,19 +249,19 @@ def heuristic_verdict_for_low(
             ),
         )
 
-    # PRD coverage 만 낮은 케이스 → 분해를 다시 봐야 한다
+    # 결정론 신호는 모두 통과했지만 LOW 가 발화한 경우 — 위 early return
+    # 들이 모든 LOW 케이스를 흡수하므로 사실상 dead path. contract 상 verdict
+    # 는 반환해야 하므로 보수적으로 planner replan (사용자가 종료 의사 결정).
     return CriticVerdict(
         verdict="replan",
         target_role="planner",
         reason=(
-            f"결정론 게이트 LOW — PRD 커버리지 {prd_coverage:.0%}. "
-            f"분해가 사용자 요청의 일부를 빠뜨린 것으로 보인다."
+            "LOW 게이트 발화했으나 결정론 신호 (DONE_CONDITION / artifacts / "
+            "pytest / todo) 는 모두 통과 — 분해 재검토 권장."
         ),
         feedback_for_retry=(
-            "산출물 텍스트에서 사용자 요청의 핵심 명사구가 충분히 다뤄지지 "
-            "않았다. planner 를 다시 호출해 누락된 영역을 식별하고 보완 "
-            "task 를 분해해 ledger 에 등록한 뒤, 사용자에게 변경 사항을 "
-            "확인받고 진행하라."
+            "결정론 신호는 모두 통과했지만 LOW 게이트가 발화했다. "
+            "planner 에게 사용자 원 요청 vs 현 산출물을 다시 검토하도록 위임하라."
         ),
     )
 

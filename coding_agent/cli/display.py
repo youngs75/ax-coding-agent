@@ -234,7 +234,7 @@ def render_critic_escalate_panel(event_data: dict) -> None:
     metric_lines: list[str] = []
     for k in (
         "pytest_exit", "lint_errors", "todo_done", "todo_total",
-        "todo_ratio", "prd_coverage",
+        "todo_ratio",
     ):
         if k in metrics:
             v = metrics[k]

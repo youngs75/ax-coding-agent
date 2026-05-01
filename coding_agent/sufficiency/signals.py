@@ -9,11 +9,16 @@ ax 는 LangGraph 메시지 기반이므로:
                   pair 에서 ``[exit code: N]`` 정규식 추출. 없으면 None.
 - ``lint_errors``: 마지막 reviewer ``ToolMessage`` 본문에서 정수 추출 (best-effort).
                    파싱 실패 시 None — "신호 없음" 으로 처리.
-- ``prd_coverage``: working_directory 의 PRD 파일 (있을 때) 의 명사구가 산출
-                   디렉토리 텍스트에 얼마나 등장하는지 비율. PRD 부재 시 1.0.
 
-신호 누락은 항상 보수적으로 (1.0 / None) — rule_gate 가 잘못 LOW 판정해
-불필요한 retry 를 트리거하지 않도록 한다.
+신호 누락은 항상 보수적으로 (None) — rule_gate 가 잘못 LOW 판정해 불필요한
+retry 를 트리거하지 않도록 한다.
+
+R-003 폐기 (2026-05-01): ``prd_coverage`` 및 관련 정규식 키워드 추출
+(``_extract_prd_keywords`` / ``_scan_workspace_text``) 를 *전부* 제거.
+PRD ↔ 산출물의 의미적 정합성은 LLM critic 의 영역 — substring matching
++ 임계값 분류 (R-003: format coercion 으로 robustness 메우기 금지) 로는
+한국어/영어 PRD 모두에서 false-positive 폭주. critic prompt 에 PRD 본문
++ 산출물 첨부로 위임.
 """
 
 from __future__ import annotations
@@ -46,21 +51,6 @@ _LINT_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# PRD 파일 후보 (working_directory 에 있을 때) — planner 가 보통 이 위치에
-# 분해 산출물을 둔다. 첫 매치 우선.
-_PRD_CANDIDATES = (
-    "PRD.md",
-    "prd.md",
-    "docs/PRD.md",
-    "docs/prd.md",
-    "integrated_tasks.md",
-    "tasks.md",
-)
-
-# PRD 에서 키워드로 추출할 명사구 — 한국어/영어 헤더 라인과 bullet 항목
-_PRD_KEYWORD_RE = re.compile(
-    r"^[\s\-\*\#0-9\.]*([A-Za-z가-힣][\w가-힣\s\-/]{2,40})", re.MULTILINE
-)
 
 
 def _last_tool_message_for(messages: list[Any], tool_name: str) -> ToolMessage | None:
@@ -122,126 +112,6 @@ def _extract_lint_errors(messages: list[Any]) -> int | None:
         return None
 
 
-def _read_prd(working_directory: str | None) -> tuple[str | None, str | None]:
-    """Returns (prd_text, prd_relpath). Both None when no PRD file exists."""
-    if not working_directory:
-        return None, None
-    base = Path(working_directory)
-    if not base.exists():
-        return None, None
-    for candidate in _PRD_CANDIDATES:
-        path = base / candidate
-        if path.is_file():
-            try:
-                return path.read_text(encoding="utf-8", errors="replace"), candidate
-            except Exception as exc:  # noqa: BLE001
-                log.debug("sufficiency.prd.read_failed", path=str(path), error=str(exc))
-                continue
-    return None, None
-
-
-def _extract_prd_keywords(prd_text: str) -> list[str]:
-    """Extract candidate noun-phrases from the PRD text.
-
-    Heuristic only — picks lines that look like headings or bullets and
-    keeps the first 2-40 character word run. Duplicates dropped.
-    """
-    seen: set[str] = set()
-    out: list[str] = []
-    for m in _PRD_KEYWORD_RE.finditer(prd_text):
-        kw = m.group(1).strip()
-        if len(kw) < 3 or kw.lower() in {"todo", "task", "summary"}:
-            continue
-        norm = kw.lower()
-        if norm in seen:
-            continue
-        seen.add(norm)
-        out.append(kw)
-        if len(out) >= 40:
-            break
-    return out
-
-
-def _scan_workspace_text(
-    working_directory: str | None,
-    *,
-    skip_paths: set[str] | None = None,
-) -> str:
-    """Aggregate text from common output locations for keyword matching.
-
-    Walks the working directory but skips heavy / vendor dirs and the
-    PRD source files (``skip_paths``) themselves — including the PRD
-    in the haystack would auto-match every keyword and inflate coverage
-    to 1.0 regardless of actual implementation. Capped at ~512 KB to
-    keep matching cheap. Includes file *paths* so keywords like "Order"
-    can match ``backend/src/order/...`` even if the file content uses
-    English identifiers.
-    """
-    if not working_directory:
-        return ""
-    base = Path(working_directory)
-    if not base.exists():
-        return ""
-    skip_dirs = {
-        ".git", ".ax-agent", "node_modules", "__pycache__", ".venv",
-        "venv", "dist", "build", ".pytest_cache", "memory_store",
-    }
-    skip_paths = skip_paths or set()
-    parts: list[str] = []
-    total = 0
-    cap = 512 * 1024
-    for path in base.rglob("*"):
-        if any(p in skip_dirs for p in path.parts):
-            continue
-        if not path.is_file():
-            continue
-        try:
-            rel = str(path.relative_to(base))
-        except ValueError:
-            rel = str(path)
-        if rel in skip_paths:
-            continue
-        if path.stat().st_size > 64 * 1024:
-            continue
-        if path.suffix.lower() not in {
-            ".md", ".txt", ".py", ".ts", ".tsx", ".js", ".jsx",
-            ".json", ".yaml", ".yml", ".toml", ".prisma",
-        }:
-            # Path 만이라도 포함 — 키워드가 디렉토리 명에서만 잡혀도 OK.
-            parts.append(str(path.relative_to(base)))
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            parts.append(str(path.relative_to(base)))
-            continue
-        parts.append(str(path.relative_to(base)))
-        parts.append(text)
-        total += len(text)
-        if total > cap:
-            break
-    return "\n".join(parts)
-
-
-def _compute_prd_coverage(working_directory: str | None) -> float:
-    """0.0~1.0 — PRD 의 키워드가 워크스페이스 산출물 텍스트에 등장한 비율.
-
-    PRD 가 없으면 1.0 (= 신호 없음). 키워드가 추출되지 않으면 1.0.
-    """
-    prd_text, prd_path = _read_prd(working_directory)
-    if not prd_text:
-        return 1.0
-    keywords = _extract_prd_keywords(prd_text)
-    if not keywords:
-        return 1.0
-    skip = {prd_path} if prd_path else None
-    haystack = _scan_workspace_text(working_directory, skip_paths=skip).lower()
-    if not haystack:
-        return 0.0
-    hits = sum(1 for kw in keywords if kw.lower() in haystack)
-    return hits / len(keywords)
-
-
 _ARTIFACT_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # (artifact_id, search keywords) — 사용자 요청 텍스트에서 키워드 매칭 시
     # 그 산출물이 *기대됨* 으로 표시. 워크스페이스에서 실제 파일/디렉토리
@@ -285,19 +155,6 @@ _FORBIDDEN_HEADER_RE = re.compile(
 # 다음 ## 헤더 또는 EOF 까지를 섹션 끝으로 본다.
 _NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
 _BULLET_PATTERN_RE = re.compile(r"^\s*[-*]\s+([^\s(]+)", re.MULTILINE)
-
-# v22.4 — Forbidden Patterns bullet 에 자연어 조건어가 섞이면 그 패턴은
-# 무효화. v25 회귀 — planner 가 ``**/requirements.txt must exist`` 같은
-# *반대 의미* bullet 작성 → harness 가 그대로 채택해 false-positive 위반
-# 폭주. 안전망: bullet line 의 *괄호 밖* 텍스트에 키워드가 보이면 거부.
-# 괄호 안 메모 (e.g., ``(React was chosen)``) 는 자유 텍스트로 허용.
-_NL_CONDITION_RE = re.compile(
-    r"\b(?:must|should|shall|if|when|unless|only|except|cannot|can\s*not|"
-    r"will|need(?:ed|s)?)\b"
-    r"|필수|있어야|없어야|해야|하는\s*경우|할\s*때",
-    re.IGNORECASE,
-)
-_PAREN_NOTE_RE = re.compile(r"\([^)]*\)")
 
 
 def _user_request_text(messages: list) -> str:
@@ -383,10 +240,10 @@ def _extract_forbidden_patterns(done_condition_text: str) -> list[str]:
     ```
     → ``["*.vue", "*.svelte"]``
 
-    v22.4 — bullet 라인의 *괄호 밖* 텍스트에 자연어 조건어 (must/should/if/
-    필수/있어야 등) 가 보이면 그 패턴은 *무효화*. planner skill 가이드
-    (``done-condition.md``) 가 동일 규칙을 명시하지만 이 함수가 *deterministic
-    안전망* 으로 회귀 차단.
+    이 함수는 *결정론* 영역만 다룬다 — bullet 의 첫 토큰 (glob) 추출만.
+    bullet 이 *의미적으로* 올바른 forbidden pattern 인지의 판단은 planner
+    skill (``done-condition.md``) 가 LLM 에게 위임하고, 의심 시 critic
+    LLM 이 catch — 정규식 안전망 (R-003 위반) 을 두지 않는다.
     """
     m = _FORBIDDEN_HEADER_RE.search(done_condition_text)
     if not m:
@@ -395,25 +252,7 @@ def _extract_forbidden_patterns(done_condition_text: str) -> list[str]:
     next_h = _NEXT_H2_RE.search(done_condition_text, section_start)
     section_end = next_h.start() if next_h else len(done_condition_text)
     section = done_condition_text[section_start:section_end]
-
-    patterns: list[str] = []
-    for line in section.splitlines():
-        bm = _BULLET_PATTERN_RE.match(line)
-        if bm is None:
-            continue
-        pattern = bm.group(1).strip()
-        # 괄호 안 메모는 검사 제외 — `(React was chosen)` 같은 자연스런
-        # 영어 메모를 허용. 괄호 *밖* 에서만 자연어 키워드 검사.
-        outside = _PAREN_NOTE_RE.sub(" ", line)
-        if _NL_CONDITION_RE.search(outside):
-            log.debug(
-                "sufficiency.forbidden_pattern_rejected_natural_language",
-                line=line.strip(),
-                pattern=pattern,
-            )
-            continue
-        patterns.append(pattern)
-    return patterns
+    return [b.group(1).strip() for b in _BULLET_PATTERN_RE.finditer(section)]
 
 
 def _detect_forbidden_violations(
@@ -508,7 +347,6 @@ def collect_signals(
         "todo_done": todo_done,
         "todo_total": todo_total,
         "todo_ratio": todo_ratio,
-        "prd_coverage": _compute_prd_coverage(working_directory),
         "done_condition_violations": done_condition_violations,
     }
 

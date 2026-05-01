@@ -175,7 +175,7 @@ def _build_task_summary(
     metric_lines = []
     for k in (
         "pytest_exit", "lint_errors", "todo_done", "todo_total",
-        "todo_ratio", "prd_coverage",
+        "todo_ratio",
     ):
         if k in metrics:
             metric_lines.append(f"  - {k}: {metrics[k]}")
