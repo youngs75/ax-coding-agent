@@ -286,6 +286,17 @@ def get_model(tier: TierName = "default", temperature: float = 0.0) -> ChatOpenA
         base_url = cfg.zai_base_url
         # GLM 4.5/4.6/5.1 도 reasoning_content 반환 — deepseek 와 동일 워크어라운드.
         extra_kwargs["disable_streaming"] = True
+    elif cfg.provider == "mimo":
+        # Xiaomi Mimo (token-plan-sgp.xiaomimimo.com) — OpenAI 호환.
+        # mimo-v2.5* 모두 reasoning_content 를 반환하는 thinking 모델 →
+        # langchain-openai 1.2.x 의 streaming 경로가 reasoning_content 를
+        # 무시하는 동일 회귀가 발생할 수 있어 deepseek/zai 와 같은
+        # disable_streaming 적용. probe (2026-05-01): "hi" 한 마디에도
+        # reasoning_tokens=14 소모 — fast tier 비용 모니터링 필요.
+        os.environ.setdefault("MIMO_API_KEY", cfg.mimo_api_key)
+        api_key = cfg.mimo_api_key
+        base_url = cfg.mimo_base_url
+        extra_kwargs["disable_streaming"] = True
     elif cfg.provider == "litellm_portal":
         # Portal LiteLLM gateway (samsungsdscoe.com).  OpenAI-compatible path
         # to Bedrock-served Anthropic Claude models (sonnet/opus 4-6).  No
