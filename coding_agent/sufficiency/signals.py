@@ -286,6 +286,19 @@ _FORBIDDEN_HEADER_RE = re.compile(
 _NEXT_H2_RE = re.compile(r"^##\s+", re.MULTILINE)
 _BULLET_PATTERN_RE = re.compile(r"^\s*[-*]\s+([^\s(]+)", re.MULTILINE)
 
+# v22.4 — Forbidden Patterns bullet 에 자연어 조건어가 섞이면 그 패턴은
+# 무효화. v25 회귀 — planner 가 ``**/requirements.txt must exist`` 같은
+# *반대 의미* bullet 작성 → harness 가 그대로 채택해 false-positive 위반
+# 폭주. 안전망: bullet line 의 *괄호 밖* 텍스트에 키워드가 보이면 거부.
+# 괄호 안 메모 (e.g., ``(React was chosen)``) 는 자유 텍스트로 허용.
+_NL_CONDITION_RE = re.compile(
+    r"\b(?:must|should|shall|if|when|unless|only|except|cannot|can\s*not|"
+    r"will|need(?:ed|s)?)\b"
+    r"|필수|있어야|없어야|해야|하는\s*경우|할\s*때",
+    re.IGNORECASE,
+)
+_PAREN_NOTE_RE = re.compile(r"\([^)]*\)")
+
 
 def _user_request_text(messages: list) -> str:
     """첫 HumanMessage 의 content. 사용자 의도 추출용 단일 진입점."""
@@ -369,6 +382,11 @@ def _extract_forbidden_patterns(done_condition_text: str) -> list[str]:
     - *.svelte
     ```
     → ``["*.vue", "*.svelte"]``
+
+    v22.4 — bullet 라인의 *괄호 밖* 텍스트에 자연어 조건어 (must/should/if/
+    필수/있어야 등) 가 보이면 그 패턴은 *무효화*. planner skill 가이드
+    (``done-condition.md``) 가 동일 규칙을 명시하지만 이 함수가 *deterministic
+    안전망* 으로 회귀 차단.
     """
     m = _FORBIDDEN_HEADER_RE.search(done_condition_text)
     if not m:
@@ -377,7 +395,25 @@ def _extract_forbidden_patterns(done_condition_text: str) -> list[str]:
     next_h = _NEXT_H2_RE.search(done_condition_text, section_start)
     section_end = next_h.start() if next_h else len(done_condition_text)
     section = done_condition_text[section_start:section_end]
-    return [b.group(1).strip() for b in _BULLET_PATTERN_RE.finditer(section)]
+
+    patterns: list[str] = []
+    for line in section.splitlines():
+        bm = _BULLET_PATTERN_RE.match(line)
+        if bm is None:
+            continue
+        pattern = bm.group(1).strip()
+        # 괄호 안 메모는 검사 제외 — `(React was chosen)` 같은 자연스런
+        # 영어 메모를 허용. 괄호 *밖* 에서만 자연어 키워드 검사.
+        outside = _PAREN_NOTE_RE.sub(" ", line)
+        if _NL_CONDITION_RE.search(outside):
+            log.debug(
+                "sufficiency.forbidden_pattern_rejected_natural_language",
+                line=line.strip(),
+                pattern=pattern,
+            )
+            continue
+        patterns.append(pattern)
+    return patterns
 
 
 def _detect_forbidden_violations(

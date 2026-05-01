@@ -356,6 +356,14 @@ _FIXER_RETRY_WARN_THRESHOLD = int(os.getenv("AX_FIXER_RETRY_WARN", "3"))
 # Default 4 = WARN 임계값(3) 다음 1회 + ProgressGuard frequency=3 도달 전.
 _FIXER_HARD_CAP = int(os.getenv("AX_FIXER_HARD_CAP", "4"))
 
+# v22.4 — task_id 가 description 에 *없는* gate-level fixer 호출도 cap 으로
+# 보호하기 위한 sentinel key. v25 회귀 — sufficiency.critic 이 fixer 위임할
+# 때 description 에 ``TASK-NN`` prefix 가 없어 v22.1 의 task_id 기반 cap 이
+# catch 못 함. 모든 task_id-free fixer 호출이 같은 sentinel 로 누적 → 무한
+# loop 차단. (다행히 sufficiency.critic.loop_detection 이 v25 에선 잡았지만
+# layer 별 다중 안전망이 정상.)
+_FIXER_GATE_CAP_KEY = "__gate__"
+
 
 def _build_auto_verifier_description(
     coder_description: str,
@@ -662,14 +670,17 @@ def build_task_tool(
         # Fixer 재시도 가드 — coder/verifier 같은 다른 role 호출이 끼어도
         # 같은 task_id 의 fixer 누적 카운트가 임계값에 도달하는 시점을
         # 검출. 카운트는 fixer 위임 시에만 증가, 다른 role 위임은 누적
-        # 무시.
-        if role_name == "fixer" and task_id:
-            count = _fixer_attempts.get(task_id, 0) + 1
-            _fixer_attempts[task_id] = count
+        # 무시. v22.4 — task_id 가 없으면 ``_FIXER_GATE_CAP_KEY`` sentinel
+        # 로 누적 (sufficiency.critic 발 gate-level fixer 도 cap 적용).
+        if role_name == "fixer":
+            cap_key = task_id or _FIXER_GATE_CAP_KEY
+            count = _fixer_attempts.get(cap_key, 0) + 1
+            _fixer_attempts[cap_key] = count
             if count >= _FIXER_RETRY_WARN_THRESHOLD:
                 log.warning(
                     "task_tool.fixer_retry_warn",
-                    task_id=task_id,
+                    task_id=task_id or "<gate>",
+                    cap_key=cap_key,
                     attempts=count,
                     threshold=_FIXER_RETRY_WARN_THRESHOLD,
                     progress_guard_abort_at=6,
@@ -701,13 +712,19 @@ def build_task_tool(
         task_id = _extract_task_id(description)
         if not task_id:
             return
-        # v10 회귀: 기존 로직은 ``coder`` / ``verifier(success)`` 만 마킹.
-        # planner/fixer/researcher/reviewer 가 처리한 task 도 ledger 가
-        # ``in_progress`` 그대로 남아 graph 흐름이 깨졌다 (TASK-02 가
-        # planner 에게 위임돼서 PRD 작업했는데도 ◐ 영원). harness 가
-        # 모든 SubAgent role 의 COMPLETED 를 동일하게 다룬다.
-        # verifier 만 ``execute`` 실패 마커가 있으면 마킹 보류 (테스트가
-        # 실제 통과한 경우만 ``completed`` 로 옮기는 안전망 — 기존 동작).
+        # v22.4 — coder 의 COMPLETED 만으로는 advance 하지 않는다. v25 회귀
+        # ("CLI ✓ 의 거짓말") 차단: coder COMPLETED 후 _auto_verify_chain 이
+        # 진입해 verifier PASS / FAIL 마커를 result_text 에 부착, _run_wrapped
+        # 이 마커를 보고 ``completed`` (PASS) 또는 ``verify_failed`` (FAIL)
+        # 로 별도 advance. 외부에서 verifier 우회로 직접 coder 호출하는
+        # 경로는 advance 안 됨 — _auto_verify_chain 이 *반드시* 따라오므로
+        # 정상 흐름엔 영향 없음.
+        if role_name == "coder":
+            return
+        # v10 회귀 (기존 처방): planner/fixer/researcher/reviewer 가 처리한
+        # task 도 ledger advance 필요. 그래야 task 가 ``in_progress`` 그대로
+        # 남지 않음. verifier 만 ``execute`` 실패 마커가 있으면 마킹 보류
+        # (테스트가 실제 통과한 경우만 ``completed`` — 기존 안전망).
         if role_name == "verifier":
             if not _verifier_signals_success(result):
                 return
@@ -779,19 +796,26 @@ def build_task_tool(
         # 단, _on_start 의 _fixer_attempts 카운터는 inner_func 호출 시점에
         # 증가 → 여기선 *현재* 카운터를 보고 *다음 호출이 hard cap 도달 여부*
         # 판단. 즉 이미 cap 도달 = 직전 호출이 cap-1 회 = 이번이 cap+1 회.
+        # v22.4 — task_id 가 없는 gate-level fixer 도 ``_FIXER_GATE_CAP_KEY``
+        # sentinel 로 cap 적용. v25 회귀 (sufficiency.critic 발 fixer 무한
+        # loop) layer-별 안전망.
         if resolved == "fixer":
             task_id_for_cap = _extract_task_id(description)
-            if task_id_for_cap and _fixer_attempts.get(task_id_for_cap, 0) >= _FIXER_HARD_CAP:
+            cap_key = task_id_for_cap or _FIXER_GATE_CAP_KEY
+            if _fixer_attempts.get(cap_key, 0) >= _FIXER_HARD_CAP:
+                attempts = _fixer_attempts[cap_key]
+                target_label = task_id_for_cap or "<gate-level>"
                 log.warning(
                     "task_tool.fixer_hard_cap_reached",
                     task_id=task_id_for_cap,
-                    attempts=_fixer_attempts[task_id_for_cap],
+                    cap_key=cap_key,
+                    attempts=attempts,
                     cap=_FIXER_HARD_CAP,
                 )
                 return (
                     f"[Task INCOMPLETE — fixer]\n"
-                    f"⚠ fixer for {task_id_for_cap} hard-capped after "
-                    f"{_fixer_attempts[task_id_for_cap]} attempts (cap={_FIXER_HARD_CAP}).\n"
+                    f"⚠ fixer for {target_label} hard-capped after "
+                    f"{attempts} attempts (cap={_FIXER_HARD_CAP}).\n"
                     f"이 task 는 사용자 검토가 필요합니다 (자동 수정 한계 도달).\n"
                     f"**다음 pending task 로 진행하세요. 이 task 에 대해 fixer 를 "
                     f"다시 호출하지 마세요** — 같은 무한 루프 발생.\n"
@@ -823,6 +847,22 @@ def build_task_tool(
                 coder_result=result_text,
                 base_tool_call_id=tool_call_id,
             )
+
+            # v22.4 — chain 결과 마커로 todo advance. coder 의 _on_end 에서
+            # 보류된 advance 를 여기서 결정 — PASS 면 completed, FAIL 이면
+            # verify_failed. v25 회귀 ("CLI ✓ 의 거짓말") 의 마지막 처방.
+            task_id_for_advance = _extract_task_id(description)
+            if task_id_for_advance:
+                if _AUTO_VERIFY_PASSED_MARKER in result_text:
+                    _auto_advance_todo(
+                        todo_store, task_id_for_advance,
+                        "completed", todo_change_callback,
+                    )
+                elif _AUTO_VERIFY_FAILED_MARKER in result_text:
+                    _auto_advance_todo(
+                        todo_store, task_id_for_advance,
+                        "verify_failed", todo_change_callback,
+                    )
 
         return result_text
 

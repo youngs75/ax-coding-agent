@@ -286,6 +286,9 @@ _TODO_GLYPHS = {
     "pending": ("☐", "white"),
     "in_progress": ("◐", "yellow"),
     "completed": ("✓", "green"),
+    # v22.4 — auto-verify chain 이 _AUTO_VERIFY_MAX_ATTEMPTS 회 fail 후
+    # 자동 마킹하는 터미널 상태. 사용자 검토 필요 신호.
+    "verify_failed": ("⚠", "red"),
 }
 
 
@@ -323,7 +326,9 @@ def _render_todo_panel(items: list) -> None:
         )
         return
 
-    counts = {"pending": 0, "in_progress": 0, "completed": 0}
+    counts = {
+        "pending": 0, "in_progress": 0, "completed": 0, "verify_failed": 0,
+    }
     for it in items:
         status = getattr(it, "status", "pending")
         counts[status] = counts.get(status, 0) + 1
@@ -338,14 +343,20 @@ def _render_todo_panel(items: list) -> None:
             lines.append(f"[{color}]{glyph}[/{color}] [dim strike]{item_id}: {content}[/dim strike]")
         elif status == "in_progress":
             lines.append(f"[{color}]{glyph}[/{color}] [bold]{item_id}: {content}[/bold]")
+        elif status == "verify_failed":
+            # v22.4 — 자동 검증 한계 도달, 사용자 검토 필요. 빨강 + 굵게.
+            lines.append(f"[{color}]{glyph}[/{color}] [bold red]{item_id}: {content}[/bold red]")
         else:
             lines.append(f"[{color}]{glyph}[/{color}] {item_id}: {content}")
 
-    title = (
-        f"📋 Todos · {counts['completed']}/{len(items)} done"
-        f" · [yellow]{counts['in_progress']} active[/yellow]"
-        f" · [dim]{counts['pending']} pending[/dim]"
-    )
+    title_parts = [
+        f"📋 Todos · {counts['completed']}/{len(items)} done",
+        f"[yellow]{counts['in_progress']} active[/yellow]",
+        f"[dim]{counts['pending']} pending[/dim]",
+    ]
+    if counts.get("verify_failed", 0) > 0:
+        title_parts.append(f"[red]{counts['verify_failed']} verify-failed[/red]")
+    title = " · ".join(title_parts)
     console.print(
         Panel(
             "\n".join(lines),

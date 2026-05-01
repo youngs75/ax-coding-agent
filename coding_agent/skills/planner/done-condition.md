@@ -110,12 +110,35 @@ write_todos(todos=[
 - bullet 패턴은 glob 형식 (``*.ext``, ``**/dir/*``).
 
 ## 잘못된 예
+
+### ❌ glob 형식이 아님
 ```markdown
 ## Forbidden Patterns
-- 사용하지 마세요: Vue   ← ❌ glob 형식 아님 — 매치 안 됨
-- pure text                ← ❌ glob 아님
+- 사용하지 마세요: Vue   ← glob 형식 아님 — 매치 안 됨
+- pure text                ← glob 아님
 ```
+
+### ❌ 자연어 조건이 섞인 패턴 (v22.4 — v25 회귀의 직접 원인)
 ```markdown
-## Banned Files               ← ❌ 헤더 텍스트 다름 — 인식 안 됨
+## Forbidden Patterns
+- **/requirements.txt must exist (Python backend)
+  ← ``must exist`` 는 *반대 의미* (필수 파일을 forbidden 으로 등록)
+- **/package.json (if containing non-frontend dependencies)
+  ← ``if`` 조건은 harness 가 평가 못 함
+- *.vue should not appear when React was chosen
+  ← ``should not`` 자연어 — 같은 줄에서 거부됨
+- *.py 가 있어야 함
+  ← 한국어 ``있어야 함`` — 거부됨
+```
+
+**규칙**: `## Forbidden Patterns` 의 모든 bullet 은 *순수 glob* 이어야
+한다. ``must`` / ``should`` / ``if`` / ``when`` / ``only`` / ``except`` /
+``필수`` / ``있어야`` / ``없어야`` 같은 자연어 조건어가 같은 줄에 있으면
+sufficiency.signals 가 그 패턴을 무효화 (안전망). bullet 끝 괄호 메모는
+허용 (`- *.vue (React was chosen)`) — 위 키워드만 피하면 된다.
+
+### ❌ 헤더 텍스트 다름
+```markdown
+## Banned Files               ← 헤더 텍스트 다름 — 인식 안 됨
 - *.vue
 ```

@@ -80,8 +80,12 @@ class _CapturingInnerTool:
                 "tool_call_id": tool_call_id,
             }
         )
-        # Fire the on_tool_call_end hook the way the real library does so
-        # the wrapper's verifier evidence cache is exercised end-to-end.
+        # Fire start/end hooks the way the real library does so the wrapper's
+        # closures (verifier evidence cache + fixer attempt counter) are
+        # exercised end-to-end. Real library sequence: start → role exec → end.
+        on_start = self._hooks.get("on_tool_call_start")
+        if on_start is not None:
+            on_start(self.next_role, description)
         if self.next_result is not None:
             on_end = self._hooks.get("on_tool_call_end")
             if on_end is not None:
@@ -318,3 +322,107 @@ def test_system_prompt_no_longer_demands_manual_evidence_copy():
     # the line is gone — both must be absent.
     assert "6 회 이상" not in SYSTEM_PROMPT
     assert "ProgressGuard" not in SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Tests — v22.1 task_id 기반 fixer hard cap + v22.4 gate-level (task_id-free) 확장
+# ---------------------------------------------------------------------------
+
+
+def _drive_fixer(captured_tool, description: str, n: int) -> list[str]:
+    """fixer 위임을 ``n`` 번 반복 후 반환된 ToolMessage 의 content 문자열.
+
+    StructuredTool.invoke 는 ToolMessage 를 반환 — assertion 에선 ``.content``
+    를 봐야 한다.
+    """
+    inner = captured_tool["inner"]
+    inner.next_role = "fixer"
+    inner.next_result = None
+    inner.next_status = "COMPLETED"
+    out = []
+    for i in range(n):
+        msg = _invoke(
+            captured_tool["wrapper"],
+            description=description,
+            agent_type="fixer",
+            tool_call_id=f"tc-f-{i}",
+        )
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        out.append(content)
+    return out
+
+
+def test_fixer_cap_with_task_id(captured_tool, monkeypatch: pytest.MonkeyPatch):
+    """v22.1 — 같은 TASK-NN 의 fixer 가 cap 회 도달하면 다음 호출은 INCOMPLETE."""
+    monkeypatch.setattr(task_tool_module, "_FIXER_HARD_CAP", 3)
+    inner = captured_tool["inner"]
+
+    # 첫 3회는 inner_func 까지 도달
+    out = _drive_fixer(captured_tool, "TASK-07: keep failing", n=3)
+    for r in out:
+        assert "fake-output" in r  # inner_func 호출됨
+    assert len(inner.calls) == 3
+
+    # 4회째는 wrapper 가 short-circuit → INCOMPLETE 반환, inner_func 미호출
+    final = _drive_fixer(captured_tool, "TASK-07: keep failing", n=1)[0]
+    assert "[Task INCOMPLETE — fixer]" in final
+    assert "TASK-07" in final
+    assert "hard-capped" in final
+    assert len(inner.calls) == 3  # call count 변화 없음
+
+
+def test_fixer_cap_isolates_per_task_id(captured_tool, monkeypatch: pytest.MonkeyPatch):
+    """다른 TASK-NN 은 별도 카운트 — 한 task 의 cap 도달이 다른 task 막지 않음."""
+    monkeypatch.setattr(task_tool_module, "_FIXER_HARD_CAP", 2)
+    inner = captured_tool["inner"]
+
+    _drive_fixer(captured_tool, "TASK-01: one", n=2)
+    # TASK-01 cap 도달
+    capped = _drive_fixer(captured_tool, "TASK-01: one", n=1)[0]
+    assert "[Task INCOMPLETE — fixer]" in capped
+
+    # TASK-02 는 fresh — 정상 호출
+    fresh = _drive_fixer(captured_tool, "TASK-02: two", n=1)[0]
+    assert "fake-output" in fresh
+
+
+def test_fixer_cap_gate_level_task_id_free(captured_tool, monkeypatch: pytest.MonkeyPatch):
+    """v22.4 — description 에 TASK-NN 이 *없는* gate-level fixer 도 cap 적용.
+
+    sufficiency.critic 발 fixer 위임은 보통 task_id-free description (e.g.,
+    ``"reduce stack misalignment"`` 같은 자연어). v22.1 의 cap 은 task_id
+    기반이라 이 케이스를 catch 못 했고 v25 마지막에 fixer 가 false-positive
+    cycle 빠짐. v22.4 에서 ``_FIXER_GATE_CAP_KEY`` sentinel 로 누적 → cap 적용.
+    """
+    monkeypatch.setattr(task_tool_module, "_FIXER_HARD_CAP", 3)
+    inner = captured_tool["inner"]
+
+    # task_id 가 없는 description 으로 3회 호출 → inner_func 도달
+    out = _drive_fixer(captured_tool, "stack misalignment 수정", n=3)
+    for r in out:
+        assert "fake-output" in r
+    assert len(inner.calls) == 3
+
+    # 4회째 — gate sentinel 로 cap 적용
+    final = _drive_fixer(captured_tool, "stack misalignment 수정", n=1)[0]
+    assert "[Task INCOMPLETE — fixer]" in final
+    assert "<gate-level>" in final
+    assert "hard-capped" in final
+    assert len(inner.calls) == 3  # inner_func 미호출
+
+
+def test_fixer_cap_gate_level_isolated_from_task_id(
+    captured_tool, monkeypatch: pytest.MonkeyPatch
+):
+    """gate-level (sentinel) 와 task_id 기반은 별도 카운트."""
+    monkeypatch.setattr(task_tool_module, "_FIXER_HARD_CAP", 2)
+    inner = captured_tool["inner"]
+
+    # gate-level 로 2회 (cap 도달)
+    _drive_fixer(captured_tool, "general fix", n=2)
+    capped_gate = _drive_fixer(captured_tool, "general fix", n=1)[0]
+    assert "[Task INCOMPLETE — fixer]" in capped_gate
+
+    # TASK-09 는 fresh — 정상 호출 (sentinel 카운트와 분리)
+    fresh = _drive_fixer(captured_tool, "TASK-09: specific", n=1)[0]
+    assert "fake-output" in fresh

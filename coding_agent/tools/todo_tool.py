@@ -33,9 +33,16 @@ from typing import Literal
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-TodoStatus = Literal["pending", "in_progress", "completed"]
+TodoStatus = Literal["pending", "in_progress", "completed", "verify_failed"]
 
-_VALID_STATUSES: tuple[str, ...] = ("pending", "in_progress", "completed")
+# v22.4 — ``verify_failed`` 추가. coder COMPLETED 만으로 ✓ 표시되던
+# v25 회귀 (auto-verify 가 그 이후 background 라 CLI 가 거짓말) 차단:
+# coder 의 advance 보류 + auto-verify 결과로 ``completed`` (PASS) 또는
+# ``verify_failed`` (FAIL) 분기. v23 라이브러리 추출 시 minyoung-mah 의
+# todo schema 로 승격 예정 (승격 후보 E).
+_VALID_STATUSES: tuple[str, ...] = (
+    "pending", "in_progress", "completed", "verify_failed",
+)
 
 
 class TodoItem(BaseModel):
@@ -54,7 +61,11 @@ class TodoItem(BaseModel):
     )
     status: TodoStatus = Field(
         default="pending",
-        description="One of: 'pending', 'in_progress', 'completed'.",
+        description=(
+            "One of: 'pending', 'in_progress', 'completed', 'verify_failed'. "
+            "``verify_failed`` 는 harness 가 auto-verifier chain 에서 "
+            "_AUTO_VERIFY_MAX_ATTEMPTS 회 fail 했을 때 자동 마킹."
+        ),
     )
 
 
@@ -75,7 +86,10 @@ class UpdateTodoInput(BaseModel):
         min_length=1,
     )
     status: TodoStatus = Field(
-        description="New status: 'pending', 'in_progress', or 'completed'.",
+        description=(
+            "New status. ``verify_failed`` 는 harness 만 마킹 — "
+            "orchestrator/SubAgent 는 사용 금지."
+        ),
     )
 
 
@@ -98,18 +112,23 @@ class TodoStore:
         """Replace the entire ledger. Returns the new ordered list.
 
         Raises ``ValueError`` if the current ledger already contains any
-        ``completed`` entry. Strategy: hard-reject rather than append-only,
-        so the orchestrator surfaces the mistake instead of silently losing
-        prior progress when it tries to re-register a fresh SPEC mid-run.
+        terminal entry (``completed`` or ``verify_failed``). Strategy:
+        hard-reject rather than append-only, so the orchestrator surfaces
+        the mistake instead of silently losing prior progress when it tries
+        to re-register a fresh SPEC mid-run. ``verify_failed`` is terminal
+        too — harness gave up after auto-verify exhausted, replacing erases
+        that signal.
         """
         with self._lock:
-            if any(item.status == "completed" for item in self._items.values()):
-                completed_ids = [
-                    i for i in self._order if self._items[i].status == "completed"
-                ]
+            terminal = {"completed", "verify_failed"}
+            terminal_ids = [
+                i for i in self._order
+                if self._items[i].status in terminal
+            ]
+            if terminal_ids:
                 raise ValueError(
-                    "ledger already has completed entries "
-                    f"({', '.join(completed_ids)}); use update_todo to "
+                    "ledger already has terminal entries "
+                    f"({', '.join(terminal_ids)}); use update_todo to "
                     "advance existing tasks instead of replacing the ledger."
                 )
             self._items = {}
@@ -166,6 +185,7 @@ _STATUS_GLYPHS: dict[str, str] = {
     "pending": "[ ]",
     "in_progress": "[~]",
     "completed": "[x]",
+    "verify_failed": "[!]",
 }
 
 
@@ -176,12 +196,14 @@ def render_todo_summary(items: list[TodoItem]) -> str:
     counts = {s: 0 for s in _VALID_STATUSES}
     for it in items:
         counts[it.status] = counts.get(it.status, 0) + 1
-    header = (
-        f"Todos: {len(items)} total — "
-        f"pending={counts['pending']}, "
-        f"in_progress={counts['in_progress']}, "
-        f"completed={counts['completed']}."
-    )
+    header_parts = [
+        f"pending={counts['pending']}",
+        f"in_progress={counts['in_progress']}",
+        f"completed={counts['completed']}",
+    ]
+    if counts.get("verify_failed", 0) > 0:
+        header_parts.append(f"verify_failed={counts['verify_failed']}")
+    header = f"Todos: {len(items)} total — {', '.join(header_parts)}."
     lines = [header]
     for it in items:
         glyph = _STATUS_GLYPHS.get(it.status, "[?]")
@@ -208,8 +230,9 @@ def build_write_todos_tool(
         try:
             items = store.replace(todos)
         except ValueError as e:
-            # Guard: ledger already has completed entries. Refuse to clobber
-            # prior progress; orchestrator must use update_todo to advance.
+            # Guard: ledger already has terminal entries (completed or
+            # verify_failed). Refuse to clobber prior progress; orchestrator
+            # must use update_todo to advance.
             return f"REJECTED: {e}"
         if on_change is not None:
             try:
@@ -246,6 +269,17 @@ def build_update_todo_tool(
             return (
                 f"REJECTED: status must be one of "
                 f"{', '.join(_VALID_STATUSES)} (got {status!r})."
+            )
+        if status == "verify_failed":
+            # v22.4 — harness-managed terminal status. orchestrator/SubAgent
+            # 가 직접 마킹하면 auto-verify 결과 추적이 망가짐 — task_tool 의
+            # _run_wrapped 가 _AUTO_VERIFY_FAILED_MARKER 를 보고 store.update
+            # 직접 호출하는 경로만 허용.
+            return (
+                "REJECTED: 'verify_failed' 는 harness 가 auto-verifier "
+                "chain exhausted 시 자동 마킹하는 터미널 상태입니다. "
+                "orchestrator/SubAgent 는 'pending' / 'in_progress' / "
+                "'completed' 만 사용하세요."
             )
         try:
             store.update(id, status)
