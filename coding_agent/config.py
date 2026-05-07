@@ -133,6 +133,15 @@ _ZAI_MODELS = ModelTier(
     fast="glm-4.5-air",                  # memory extractor — 경량
 )
 
+# Xiaomi Mimo — 직접 호출 (OpenAI 호환). v2.5-pro / v2.5 두 사이즈.
+# reasoning_content 반환 → glm/deepseek 패턴과 동일 (disable_streaming 적용).
+_MIMO_MODELS = ModelTier(
+    reasoning="mimo-v2.5-pro",           # planner / critic — pro 추론
+    strong="mimo-v2.5-pro",              # coder / fixer — tool calling + 코드
+    default="mimo-v2.5",                 # reviewer / researcher — 경량
+    fast="mimo-v2.5",                    # memory extractor — 경량
+)
+
 # 추가 프로바이더 프리셋 (GLM, Nemotron 등 — .env에서 모델명 오버라이드로 사용)
 # 예: STRONG_MODEL=openrouter/z-ai/glm-5.1
 #     DEFAULT_MODEL=openrouter/nvidia/nemotron-3-super-120b-a12b
@@ -185,6 +194,18 @@ class Config:
     zai_base_url: str = field(
         default_factory=lambda: os.getenv(
             "ZAI_BASE_URL", "https://api.z.ai/api/paas/v4"
+        )
+    )
+
+    # Xiaomi Mimo (token-plan-sgp.xiaomimimo.com) — OpenAI 호환 API.
+    # mimo-v2.5-pro: REASONING/STRONG, mimo-v2.5: DEFAULT/FAST.
+    # reasoning_content 반환 → glm/deepseek 와 동일하게 disable_streaming.
+    mimo_api_key: str = field(
+        default_factory=lambda: os.getenv("MIMO_API_KEY", "")
+    )
+    mimo_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"
         )
     )
 
@@ -270,12 +291,8 @@ class Config:
     sufficiency_low_todo: float = field(
         default_factory=lambda: float(os.getenv("AX_SUFF_LOW_TODO", "0.5"))
     )
-    sufficiency_high_prd: float = field(
-        default_factory=lambda: float(os.getenv("AX_SUFF_HIGH_PRD", "0.85"))
-    )
-    sufficiency_low_prd: float = field(
-        default_factory=lambda: float(os.getenv("AX_SUFF_LOW_PRD", "0.4"))
-    )
+    # NOTE — ``sufficiency_high_prd`` / ``sufficiency_low_prd`` 는 R-003 폐기
+    # (2026-05-01) 와 함께 제거. PRD ↔ 산출물 정합성은 critic LLM 의 영역.
 
     # 프로젝트 경로 — AX_PROJECT_ROOT env 로 오버라이드 가능
     project_root: Path = field(default_factory=lambda: _PROJECT_ROOT)
@@ -310,6 +327,8 @@ class Config:
             base = _ANTHROPIC_MODELS
         elif self.provider == "zai":
             base = _ZAI_MODELS
+        elif self.provider == "mimo":
+            base = _MIMO_MODELS
         else:
             base = _OPENROUTER_MODELS
         return ModelTier(
@@ -334,6 +353,8 @@ class Config:
             return self.anthropic_api_key
         if self.provider == "zai":
             return self.zai_api_key
+        if self.provider == "mimo":
+            return self.mimo_api_key
         return self.openrouter_api_key
 
 

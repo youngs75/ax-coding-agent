@@ -15,7 +15,7 @@ from coding_agent.sufficiency.rules import (
 )
 
 
-_DEFAULTS = dict(high_todo=0.9, low_todo=0.5, high_prd=0.85, low_prd=0.4)
+_DEFAULTS = dict(high_todo=0.9, low_todo=0.5)
 
 
 def _signals(**overrides):
@@ -25,7 +25,6 @@ def _signals(**overrides):
         "todo_done": 9,
         "todo_total": 10,
         "todo_ratio": 0.9,
-        "prd_coverage": 0.9,
         "artifact_intent": [],
         "artifacts_missing": [],
     }
@@ -49,8 +48,8 @@ def test_high_when_pytest_and_lint_signals_missing():
     assert g.level == "HIGH"
 
 
-def test_high_when_prd_and_todo_at_threshold():
-    g = evaluate(_signals(todo_ratio=0.9, prd_coverage=0.85), **_DEFAULTS)
+def test_high_when_todo_at_threshold():
+    g = evaluate(_signals(todo_ratio=0.9), **_DEFAULTS)
     assert g.level == "HIGH"
 
 
@@ -73,11 +72,6 @@ def test_low_when_todo_ratio_below_threshold():
     assert g.level == "LOW"
 
 
-def test_low_when_prd_coverage_below_threshold():
-    g = evaluate(_signals(prd_coverage=0.39), **_DEFAULTS)
-    assert g.level == "LOW"
-
-
 # ── MEDIUM (LLM critic 필요) ────────────────────────────────────────────────
 
 
@@ -86,19 +80,14 @@ def test_medium_when_todo_ratio_between_thresholds():
     assert g.level == "MEDIUM"
 
 
-def test_medium_when_prd_coverage_between_thresholds():
-    g = evaluate(_signals(prd_coverage=0.6), **_DEFAULTS)
-    assert g.level == "MEDIUM"
-
-
 def test_medium_when_lint_errors_nonzero_but_pytest_ok():
     g = evaluate(_signals(lint_errors=3), **_DEFAULTS)
     assert g.level == "MEDIUM"  # lint 만으론 LOW 안 만듦
 
 
-def test_medium_when_only_lint_signal_missing_and_others_borderline():
+def test_medium_when_only_lint_signal_missing_and_todo_borderline():
     g = evaluate(
-        _signals(lint_errors=None, todo_ratio=0.6, prd_coverage=0.7),
+        _signals(lint_errors=None, todo_ratio=0.6),
         **_DEFAULTS,
     )
     assert g.level == "MEDIUM"
@@ -123,14 +112,6 @@ def test_heuristic_low_todo_routes_to_coder():
     assert v.target_role == "coder"
 
 
-def test_heuristic_low_prd_only_routes_to_planner_replan():
-    g = evaluate(
-        _signals(prd_coverage=0.3, pytest_exit=0, todo_ratio=0.95),
-        **_DEFAULTS,
-    )
-    v = heuristic_verdict_for_low(g)
-    assert v.verdict == "replan"
-    assert v.target_role == "planner"
 
 
 # ── Misc ────────────────────────────────────────────────────────────────────
@@ -163,7 +144,7 @@ def test_gate_level_label(level, label):
 def test_high_when_pytest_signal_missing_is_intentional():
     """pytest_exit=None + lint=None 은 *신호 없음* (verifier/reviewer 미호출).
     이게 HIGH 로 직행하면 critic 도 안 도는데, 그건 코드 도메인의 정상
-    flow 라 의도된 동작. todo_ratio + prd_coverage 가 신뢰 신호."""
+    flow 라 의도된 동작. todo_ratio 가 신뢰 신호."""
     g = evaluate(
         _signals(pytest_exit=None, lint_errors=None),
         **_DEFAULTS,
@@ -172,11 +153,10 @@ def test_high_when_pytest_signal_missing_is_intentional():
     assert g.metrics["pytest_exit"] is None  # raw 신호 보존 — critic 이 알 수 있음
 
 
-def test_medium_when_prd_coverage_borderline_with_no_pytest():
-    """반대 케이스: pytest 신호 부재 + prd_coverage 보더라인 → MEDIUM 으로
-    critic 호출. critic 이 raw metrics 로 verifier 누락을 인지 가능."""
+def test_medium_when_todo_borderline_with_no_pytest():
+    """pytest 신호 부재 + todo 보더라인 → MEDIUM 으로 critic 호출."""
     g = evaluate(
-        _signals(pytest_exit=None, lint_errors=None, prd_coverage=0.7),
+        _signals(pytest_exit=None, lint_errors=None, todo_ratio=0.7),
         **_DEFAULTS,
     )
     assert g.level == "MEDIUM"
@@ -193,7 +173,7 @@ def test_low_when_artifacts_missing_overrides_other_signals():
         _signals(
             artifacts_missing=["prd", "spec"],
             pytest_exit=0, lint_errors=0,
-            todo_ratio=1.0, prd_coverage=1.0,  # 다른 신호는 모두 양호
+            todo_ratio=1.0,  # 다른 신호는 모두 양호
         ),
         **_DEFAULTS,
     )

@@ -31,7 +31,9 @@ def test_store_starts_empty() -> None:
     store = TodoStore()
     assert store.is_empty()
     assert store.list_items() == []
-    assert store.counts() == {"pending": 0, "in_progress": 0, "completed": 0}
+    assert store.counts() == {
+        "pending": 0, "in_progress": 0, "completed": 0, "verify_failed": 0,
+    }
 
 
 def test_store_replace_preserves_order() -> None:
@@ -59,7 +61,9 @@ def test_store_update_changes_status() -> None:
     store = TodoStore()
     store.replace([TodoItem(id="TASK-01", content="A")])
     store.update("TASK-01", "in_progress")
-    assert store.counts() == {"pending": 0, "in_progress": 1, "completed": 0}
+    assert store.counts() == {
+        "pending": 0, "in_progress": 1, "completed": 0, "verify_failed": 0,
+    }
     store.update("TASK-01", "completed")
     assert store.counts()["completed"] == 1
 
@@ -83,13 +87,25 @@ def test_store_replace_refuses_when_completed_entries_exist() -> None:
     store = TodoStore()
     store.replace([TodoItem(id="TASK-01", content="A")])
     store.update("TASK-01", "completed")
-    with pytest.raises(ValueError, match="completed"):
+    with pytest.raises(ValueError, match="terminal"):
         store.replace([TodoItem(id="TASK-09", content="Fresh SPEC")])
     # Prior ledger must remain intact.
     items = store.list_items()
     assert len(items) == 1
     assert items[0].id == "TASK-01"
     assert items[0].status == "completed"
+
+
+def test_store_replace_refuses_when_verify_failed_entries_exist() -> None:
+    # v22.4 — verify_failed 도 terminal. replace 가 erase 못 하게 보호.
+    store = TodoStore()
+    store.replace([TodoItem(id="TASK-01", content="A")])
+    store.update("TASK-01", "verify_failed")
+    with pytest.raises(ValueError, match="terminal"):
+        store.replace([TodoItem(id="TASK-09", content="Fresh SPEC")])
+    items = store.list_items()
+    assert len(items) == 1
+    assert items[0].status == "verify_failed"
 
 
 def test_write_todos_tool_returns_rejected_when_completed_exists() -> None:
@@ -196,6 +212,39 @@ def test_update_todo_tool_rejects_unknown_id() -> None:
     out = update.invoke({"id": "TASK-99", "status": "completed"})
     assert "REJECTED" in out
     assert "TASK-99" in out
+
+
+def test_update_todo_tool_rejects_verify_failed_directly() -> None:
+    """v22.4 — verify_failed 는 harness-managed terminal status.
+
+    orchestrator/SubAgent 가 ``update_todo`` 도구로 직접 마킹하면 거짓
+    실패 신호를 만들 수 있어 reject. harness 의 ``_auto_advance_todo``
+    가 store.update 를 직접 호출하는 경로만 허용.
+    """
+    store = TodoStore()
+    write = build_write_todos_tool(store=store)
+    update = build_update_todo_tool(store=store)
+    write.invoke({"todos": [{"id": "TASK-01", "content": "A"}]})
+
+    out = update.invoke({"id": "TASK-01", "status": "verify_failed"})
+    assert "REJECTED" in out
+    assert "verify_failed" in out
+    assert "harness" in out
+    # store 는 변경되지 않았어야 함 — 첫 status 그대로.
+    assert store.list_items()[0].status == "pending"
+
+
+def test_store_update_accepts_verify_failed_directly() -> None:
+    """``TodoStore.update`` 자체는 verify_failed 허용 — harness 내부 경로용.
+
+    `_auto_advance_todo` 가 이 경로로 호출. update_todo *tool* (LLM-facing)
+    만 reject 하고, 직접 API 는 통과 — 두 경계의 정책이 다름.
+    """
+    store = TodoStore()
+    store.replace([TodoItem(id="TASK-01", content="A")])
+    store.update("TASK-01", "verify_failed")
+    assert store.list_items()[0].status == "verify_failed"
+    assert store.counts()["verify_failed"] == 1
 
 
 def test_update_todo_tool_fires_on_change_callback() -> None:

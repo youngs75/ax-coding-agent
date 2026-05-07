@@ -107,6 +107,10 @@ def _simulate_on_end(
     task_id = _extract_task_id(description)
     if not task_id:
         return
+    # v22.4 — coder 의 advance 는 _run_wrapped 가 _auto_verify_chain 결과
+    # 마커로 별도 처리. _on_end 단계에선 보류.
+    if role_name == "coder":
+        return
     if role_name == "verifier" and not _verifier_signals_success(result):
         return
     _auto_advance_todo(store, task_id, "completed", None)
@@ -115,8 +119,8 @@ def _simulate_on_end(
 # ── role-agnostic 마킹 ──
 
 
-@pytest.mark.parametrize("role", ["coder", "planner", "fixer", "researcher", "reviewer"])
-def test_completion_marks_for_any_role(role):
+@pytest.mark.parametrize("role", ["planner", "fixer", "researcher", "reviewer"])
+def test_completion_marks_for_any_non_coder_role(role):
     store = _FakeTodoStore([_FakeTodoItem("TASK-02", status="in_progress")])
     _simulate_on_end(
         store, role, "TASK-02: 분해 결과 작성",
@@ -124,6 +128,19 @@ def test_completion_marks_for_any_role(role):
         "COMPLETED",
     )
     assert store.list_items()[0].status == "completed"
+
+
+def test_coder_completion_does_not_advance(_unused=None):
+    """v22.4 — coder COMPLETED 만으로 todo 가 ``completed`` 로 advance 되면
+    안 된다. _auto_verify_chain 결과 마커로 별도 advance 함."""
+    store = _FakeTodoStore([_FakeTodoItem("TASK-02", status="in_progress")])
+    _simulate_on_end(
+        store, "coder", "TASK-02: 구현",
+        _FakeRoleResult(),
+        "COMPLETED",
+    )
+    # advance 안 됨 — in_progress 유지
+    assert store.list_items()[0].status == "in_progress"
 
 
 def test_verifier_marks_only_when_all_executes_pass():

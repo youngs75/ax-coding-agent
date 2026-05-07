@@ -918,8 +918,6 @@ class AgentLoop:
                 signals,
                 high_todo=cfg.sufficiency_high_todo,
                 low_todo=cfg.sufficiency_low_todo,
-                high_prd=cfg.sufficiency_high_prd,
-                low_prd=cfg.sufficiency_low_prd,
             )
             log.info(
                 "sufficiency.gate",

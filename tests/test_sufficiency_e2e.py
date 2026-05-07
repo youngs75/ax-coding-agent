@@ -32,7 +32,7 @@ from coding_agent.sufficiency.rules import evaluate, heuristic_verdict_for_low
 from coding_agent.sufficiency.signals import collect_signals
 
 
-_DEFAULTS = dict(high_todo=0.9, low_todo=0.5, high_prd=0.85, low_prd=0.4)
+_DEFAULTS = dict(high_todo=0.9, low_todo=0.5)
 
 
 # ── 가짜 인프라 ─────────────────────────────────────────────────────────────
@@ -106,7 +106,8 @@ def test_collect_signals_pytest_pass(tmp_path):
     assert s["todo_done"] == 9
     assert s["todo_total"] == 10
     assert abs(s["todo_ratio"] - 0.9) < 1e-6
-    assert s["prd_coverage"] == 1.0  # PRD 부재 → 신호 없음 (1.0)
+    # prd_coverage 키는 폐기 (R-003) — 결정론으로 처리할 수 없는 영역.
+    assert "prd_coverage" not in s
 
 
 def test_collect_signals_pytest_fail(tmp_path):
@@ -193,25 +194,6 @@ def test_collect_signals_no_artifact_intent_when_simple_request(tmp_path):
     sigs = collect_signals(state, _FakeTodoStore({}))
     assert sigs["artifact_intent"] == []
     assert sigs["artifacts_missing"] == []
-
-
-def test_collect_signals_prd_keyword_match(tmp_path):
-    """PRD 안의 키워드가 워크스페이스 텍스트에 등장하면 coverage > 0."""
-    (tmp_path / "PRD.md").write_text(
-        "# PRD\n## Order\n## Inventory\n## Notification\n",
-        encoding="utf-8",
-    )
-    src = tmp_path / "backend" / "src"
-    src.mkdir(parents=True)
-    (src / "order.py").write_text("# order module\nclass Order: ...\n", encoding="utf-8")
-    state = {
-        "messages": [HumanMessage(content="x")],
-        "working_directory": str(tmp_path),
-    }
-    todo = _FakeTodoStore({})
-    s = collect_signals(state, todo)
-    # 3개 키워드 중 'order' 만 매칭 (Inventory / Notification 미구현)
-    assert 0 < s["prd_coverage"] < 1.0
 
 
 # ── 시나리오 1: HIGH pass ──────────────────────────────────────────────────

@@ -196,7 +196,6 @@ async def test_invoke_critic_passes_metrics_into_summary():
         "pytest_exit": 1,
         "lint_errors": 5,
         "todo_ratio": 0.6,
-        "prd_coverage": 0.7,
     }
     await invoke_critic(
         orch,  # type: ignore[arg-type]
