@@ -51,6 +51,8 @@ _EXCLUDE_DIRS: frozenset[str] = frozenset({
     "target",  # rust
     ".idea",
     ".vscode",
+    # ax-coding-agent system dirs — agent runtime, never user-generated.
+    "memory_store",
 })
 
 # 제외할 *파일명* 또는 정확히 매칭되는 path. .env 는 secrets 보호.

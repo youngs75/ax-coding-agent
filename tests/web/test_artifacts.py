@@ -207,7 +207,11 @@ def test_workspace_reset_clears_user_files(fake_workspace, client: TestClient) -
 
 
 def test_workspace_reset_preserves_excluded_dirs(fake_workspace, client: TestClient) -> None:
-    """POST /workspace/reset 이 .git / .venv / node_modules 등은 건드리지 않음."""
+    """POST /workspace/reset 이 .git / .venv / node_modules / memory_store 등은 건드리지 않음."""
+    # memory_store 생성 (ax runtime dir — 삭제 대상 아님)
+    (fake_workspace / "memory_store").mkdir()
+    (fake_workspace / "memory_store" / "ax.v2.db").write_text("db", encoding="utf-8")
+
     resp = client.post("/workspace/reset")
     assert resp.status_code == 200
 
@@ -215,6 +219,8 @@ def test_workspace_reset_preserves_excluded_dirs(fake_workspace, client: TestCli
     assert (fake_workspace / ".git").exists()
     assert (fake_workspace / "node_modules").exists()
     assert (fake_workspace / ".venv").exists()
+    assert (fake_workspace / "memory_store").exists()
+    assert (fake_workspace / "memory_store" / "ax.v2.db").exists()
 
 
 def test_workspace_reset_is_idempotent(fake_workspace, client: TestClient) -> None:
