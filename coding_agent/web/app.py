@@ -16,6 +16,7 @@ Routes:
 - ``POST /a2a``                      — portal probe fallback → tasks/send.
 - ``POST /a2a/jsonrpc``              — portal probe fallback → tasks/send.
 - ``POST /a2a/rest``                 — portal probe fallback → tasks/send.
+- ``POST /workspace/reset``         — workspace 초기화 (사용자 파일 전체 삭제).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .agent_card import _resolve_version, build_agent_card
 from .artifacts import (
     _BUNDLE_NAME,
+    reset_workspace,
     serve_workspace_file,
     stream_workspace_bundle,
 )
@@ -327,6 +329,29 @@ async def artifacts_file(path: str):
     if path == _BUNDLE_NAME:
         return await stream_workspace_bundle()
     return await serve_workspace_file(path)
+
+
+# ---------------------------------------------------------------------------
+# Workspace 초기화 — 사용자 생성 파일 전체 삭제
+# ---------------------------------------------------------------------------
+
+
+@app.post("/workspace/reset")
+async def workspace_reset() -> JSONResponse:
+    """워크스페이스 사용자 파일 전체 삭제.
+
+    에이전트 자체 실행 파일/의존성은 건드리지 않는다.
+    이미 빈 workspace 에 호출해도 200 반환 (멱등).
+
+    apt-web chat UI 의 "워크스페이스 초기화" 버튼이 이 endpoint 를 호출한다.
+    """
+    try:
+        result = await reset_workspace()
+        status_code = 200 if result["status"] == "ok" else 500
+        return JSONResponse(result, status_code=status_code)
+    except Exception as e:
+        log.error("workspace.reset.error", error=str(e))
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

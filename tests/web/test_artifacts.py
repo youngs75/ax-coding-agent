@@ -178,3 +178,48 @@ def test_agent_card_advertises_artifacts_endpoints(client: TestClient) -> None:
     assert endpoints["artifactsBundle"].endswith("/artifacts/__bundle.zip")
     assert "artifactsFile" in endpoints
     assert "{path}" in endpoints["artifactsFile"]
+
+
+def test_agent_card_advertises_workspace_reset(client: TestClient) -> None:
+    """``/.well-known/agent.json`` 의 endpoints 에 workspaceReset 이 포함."""
+    resp = client.get("/.well-known/agent.json")
+    assert resp.status_code == 200
+    endpoints = resp.json().get("endpoints", {})
+    assert "workspaceReset" in endpoints
+    assert endpoints["workspaceReset"].endswith("/workspace/reset")
+
+
+def test_workspace_reset_clears_user_files(fake_workspace, client: TestClient) -> None:
+    """POST /workspace/reset 이 사용자 파일을 삭제하고 200 반환."""
+    # 파일이 있는지 확인
+    assert (fake_workspace / "src" / "main.py").exists()
+
+    resp = client.post("/workspace/reset")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "cleared" in body["message"]
+
+    # 사용자 파일은 사라져야 함
+    assert not (fake_workspace / "src").exists()
+    assert not (fake_workspace / "README.md").exists()
+    assert not (fake_workspace / "package.json").exists()
+
+
+def test_workspace_reset_preserves_excluded_dirs(fake_workspace, client: TestClient) -> None:
+    """POST /workspace/reset 이 .git / .venv / node_modules 등은 건드리지 않음."""
+    resp = client.post("/workspace/reset")
+    assert resp.status_code == 200
+
+    # excluded dirs 는 유지
+    assert (fake_workspace / ".git").exists()
+    assert (fake_workspace / "node_modules").exists()
+    assert (fake_workspace / ".venv").exists()
+
+
+def test_workspace_reset_is_idempotent(fake_workspace, client: TestClient) -> None:
+    """이미 빈 workspace 에 재호출해도 200 반환 (멱등)."""
+    client.post("/workspace/reset")   # 1차 — 파일 삭제
+    resp = client.post("/workspace/reset")  # 2차 — 이미 비어있음
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"

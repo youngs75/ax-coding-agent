@@ -83,6 +83,8 @@ def build_agent_card(request: Request) -> dict[str, Any]:
             # Workspace 산출물 — zip 전체 + path 단위 단일 파일.
             "artifactsBundle": f"{base_url}/artifacts/__bundle.zip",
             "artifactsFile": f"{base_url}/artifacts/{{path}}",
+            # Workspace 초기화 — 사용자 생성 파일 전체 삭제.
+            "workspaceReset": f"{base_url}/workspace/reset",
         },
     }
 

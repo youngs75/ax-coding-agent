@@ -148,6 +148,52 @@ async def stream_workspace_bundle() -> StreamingResponse:
     )
 
 
+async def reset_workspace() -> dict[str, str]:
+    """워크스페이스 사용자 파일 전체 삭제 (에이전트 자체 파일 제외).
+
+    _EXCLUDE_DIRS 에 해당하는 디렉토리(패키지 캐시, VCS 등)는 건드리지 않는다.
+    이미 빈 workspace 에 호출해도 멱등 (200 반환).
+
+    Clears all user-generated files from the workspace. Excludes dirs/files
+    matched by _EXCLUDE_DIRS/_EXCLUDE_FILES/_EXCLUDE_SUFFIX. Idempotent.
+    """
+    import shutil
+
+    workspace = _resolve_workspace()
+    if not workspace.exists() or not workspace.is_dir():
+        return {"status": "ok", "message": "workspace cleared"}
+
+    removed_files = 0
+    removed_dirs = 0
+    errors: list[str] = []
+
+    # Top-level entries — delete excluded dirs as-is, recurse into rest.
+    for entry in sorted(workspace.iterdir()):
+        rel = entry.relative_to(workspace)
+        if _is_excluded_path(rel):
+            continue
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+                removed_dirs += 1
+            else:
+                entry.unlink()
+                removed_files += 1
+        except (OSError, PermissionError) as exc:
+            log.warning("workspace.reset.skip", path=str(entry), error=str(exc))
+            errors.append(str(exc))
+
+    log.info(
+        "workspace.reset.done",
+        removed_files=removed_files,
+        removed_dirs=removed_dirs,
+        errors=len(errors),
+    )
+    if errors:
+        return {"status": "error", "message": "; ".join(errors)}
+    return {"status": "ok", "message": "workspace cleared"}
+
+
 async def serve_workspace_file(path: str) -> FileResponse:
     """workspace 내 단일 파일 다운로드 (path traversal 방어 포함).
 
@@ -185,6 +231,7 @@ async def serve_workspace_file(path: str) -> FileResponse:
 __all__ = [
     "stream_workspace_bundle",
     "serve_workspace_file",
+    "reset_workspace",
     "_resolve_workspace",
     "_walk_files",
     "_is_excluded_path",
